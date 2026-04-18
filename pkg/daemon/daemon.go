@@ -105,7 +105,19 @@ const (
 )
 
 // RelayProbeInterval is how often we probe relay-flagged peers for direct connectivity.
-const RelayProbeInterval = 5 * time.Minute
+// Kept short so peers that transiently failed a direct probe (e.g. during a tunnel
+// rekey window, or while a peer was behind an ephemeral NAT stall) recover quickly
+// instead of paying the slower relay path for 5+ minutes.
+const RelayProbeInterval = 60 * time.Second
+
+// DefaultBeaconKeepaliveInterval is how often the daemon re-registers with the
+// beacon to keep its NAT UDP mapping alive. Consumer-grade NAT typically expires
+// UDP mappings after 30-60s of silence. The registry heartbeat (default 60s) is
+// too slow on its own: if the NAT mapping to the beacon dies between heartbeats,
+// the beacon's record of our endpoint goes stale and any peer attempting relay
+// through the beacon hits a dead mapping. A 25s cadence stays well under the
+// typical NAT timeout.
+const DefaultBeaconKeepaliveInterval = 25 * time.Second
 
 // EndpointCacheTTL is how long a cached endpoint is considered fresh.
 // After this, the entry is stale but still usable as a fallback.
@@ -142,9 +154,14 @@ type resolveEntry struct {
 
 type Daemon struct {
 	config     Config
-	addrMu     sync.RWMutex // protects nodeID and addr (H6 fix)
+	addrMu     sync.RWMutex // protects nodeID, addr, registrationAddr (H6 fix)
 	nodeID     uint32
 	addr       protocol.Addr
+	// registrationAddr is the host:port the daemon registered with — either
+	// -endpoint, the STUN-observed endpoint, or the resolved local address.
+	// Heartbeats echo this back to the registry so a server-side real_addr
+	// refresh can detect drift without a full re-registration round trip.
+	registrationAddr string
 	identity   *crypto.Identity
 	regConn    *registry.Client
 	tunnels    *TunnelManager
@@ -494,6 +511,11 @@ func (d *Daemon) Start() error {
 		}
 	}
 
+	// Cache for heartbeat refresh (item 2 of the client-side reliability fix).
+	d.addrMu.Lock()
+	d.registrationAddr = registrationAddr
+	d.addrMu.Unlock()
+
 	nodeIDVal, ok := resp["node_id"].(float64)
 	if !ok {
 		return fmt.Errorf("register: missing node_id in response")
@@ -601,6 +623,13 @@ func (d *Daemon) Start() error {
 
 	// 8. Start heartbeat
 	go d.heartbeatLoop()
+
+	// 8a. Start fast beacon keepalive (independent of the 60s registry heartbeat).
+	// Keeps the NAT mapping to the beacon alive for symmetric-NAT peers so relay
+	// forwarding remains reachable between heartbeats.
+	if d.config.BeaconAddr != "" {
+		go d.beaconKeepaliveLoop()
+	}
 
 	// 9. Start idle connection sweeper
 	go d.idleSweepLoop()
@@ -1380,6 +1409,15 @@ func (d *Daemon) handlePacket(pkt *protocol.Packet, from *net.UDPAddr) {
 			})
 		}
 	}
+
+	// Any successfully-routed packet from a peer is proof of life for that
+	// peer's established connections. Reset KeepaliveUnacked / refresh
+	// LastActivity so the dead-peer detector doesn't fire on a peer that's
+	// demonstrably alive but happens to be sending non-ACK traffic (e.g.
+	// key-exchange frames during a rekey, datagrams, control packets).
+	// The per-connection ACK handler (handleStreamPacket) does the same for
+	// TCP-like data paths; this covers every other path.
+	d.ports.ResetKeepaliveForNode(pkt.Src.Node)
 
 	switch pkt.Protocol {
 	case protocol.ProtoStream:
@@ -2587,6 +2625,29 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	return nil
 }
 
+// beaconKeepaliveLoop re-registers with the beacon on a short interval
+// (DefaultBeaconKeepaliveInterval) to keep the NAT UDP mapping alive. This runs
+// independently of the registry heartbeat so consumer-grade NAT (UDP timeout
+// ~30-60s) doesn't silently drop our beacon mapping between registry ticks,
+// which would make relay forwarding to us unreliable.
+func (d *Daemon) beaconKeepaliveLoop() {
+	// Small jitter so many daemons restarting at once don't hit the beacon
+	// in lockstep.
+	jitter := time.Duration(rand.Int63n(int64(2 * time.Second)))
+	time.Sleep(jitter)
+
+	ticker := time.NewTicker(DefaultBeaconKeepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			d.tunnels.RegisterWithBeacon()
+		}
+	}
+}
+
 func (d *Daemon) heartbeatLoop() {
 	// Add random jitter (0-5s) to the initial tick to prevent thundering herd
 	// when many daemons restart simultaneously after a registry restart.
@@ -2603,7 +2664,10 @@ func (d *Daemon) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			if d.regConn != nil {
-				_, err := d.regConn.Heartbeat(d.NodeID())
+				d.addrMu.RLock()
+				regAddr := d.registrationAddr
+				d.addrMu.RUnlock()
+				_, err := d.regConn.HeartbeatWithAddr(d.NodeID(), regAddr)
 				if err != nil {
 					consecutiveFailures++
 					slog.Warn("heartbeat failed", "consecutive_failures", consecutiveFailures, "error", err)
@@ -2668,6 +2732,11 @@ func (d *Daemon) reRegister() {
 		slog.Error("re-registration failed", "error", err)
 		return
 	}
+
+	// Cache the registration address for heartbeat refresh.
+	d.addrMu.Lock()
+	d.registrationAddr = registrationAddr
+	d.addrMu.Unlock()
 
 	nodeIDVal, ok := resp["node_id"].(float64)
 	if !ok {

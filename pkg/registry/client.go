@@ -417,11 +417,29 @@ func (c *Client) Deregister(nodeID uint32) (map[string]interface{}, error) {
 }
 
 func (c *Client) Heartbeat(nodeID uint32) (map[string]interface{}, error) {
+	return c.HeartbeatWithAddr(nodeID, "")
+}
+
+// HeartbeatWithAddr sends a heartbeat that optionally includes the node's
+// current Pilot listen address. If listenAddr is non-empty, the server
+// sanitizes it against the connection's observed source IP and updates the
+// node's real_addr accordingly — lets peers behind NATs whose external port
+// shifts refresh their endpoint without a full re-registration.
+// The signed challenge includes listen_addr when present, so the server
+// rejects attempts to spoof a different node's endpoint.
+func (c *Client) HeartbeatWithAddr(nodeID uint32, listenAddr string) (map[string]interface{}, error) {
 	msg := map[string]interface{}{
 		"type":    "heartbeat",
 		"node_id": nodeID,
 	}
-	if sig := c.sign(fmt.Sprintf("heartbeat:%d", nodeID)); sig != "" {
+	var challenge string
+	if listenAddr != "" {
+		msg["listen_addr"] = listenAddr
+		challenge = fmt.Sprintf("heartbeat:%d:%s", nodeID, listenAddr)
+	} else {
+		challenge = fmt.Sprintf("heartbeat:%d", nodeID)
+	}
+	if sig := c.sign(challenge); sig != "" {
 		msg["signature"] = sig
 	}
 	return c.Send(msg)

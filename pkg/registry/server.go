@@ -1740,7 +1740,7 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 	case "respond_handshake":
 		return s.handleRespondHandshake(msg)
 	case "heartbeat":
-		return s.handleHeartbeat(msg)
+		return s.handleHeartbeat(msg, remoteAddr)
 	case "punch":
 		return s.handlePunch(msg)
 	case "set_hostname":
@@ -5348,8 +5348,14 @@ func (s *Server) handleDeregister(msg map[string]interface{}) (map[string]interf
 	}, nil
 }
 
-func (s *Server) handleHeartbeat(msg map[string]interface{}) (map[string]interface{}, error) {
+func (s *Server) handleHeartbeat(msg map[string]interface{}, remoteAddr string) (map[string]interface{}, error) {
 	nodeID := jsonUint32(msg, "node_id")
+
+	// Optional listen_addr lets the client refresh its real_addr without a
+	// full re-registration — useful for peers behind NAT whose external port
+	// shifts over time. If present, the signed challenge includes it so a
+	// third party can't alter another node's endpoint.
+	clientAddr, _ := msg["listen_addr"].(string)
 
 	// Phase 1: read-lock to look up node and copy immutable fields
 	s.mu.RLock()
@@ -5374,9 +5380,19 @@ func (s *Server) handleHeartbeat(msg map[string]interface{}) (map[string]interfa
 	// at 1M nodes. Every node is still verified periodically to prevent spoofing.
 	lastVerified := node.lastVerifiedNano.Load()
 	skipVerify := lastVerified > 0 && (now.UnixNano()-lastVerified) < int64(120*time.Second)
+	// When the client is asking us to update real_addr, always verify — this
+	// is a security-sensitive change and we can't rely on the skip-verify fast
+	// path for it.
+	if clientAddr != "" {
+		skipVerify = false
+	}
 
 	if !skipVerify {
-		if err := s.verifyHeartbeatSignature(pubKey, adminToken, msg, fmt.Sprintf("heartbeat:%d", nodeID)); err != nil {
+		challenge := fmt.Sprintf("heartbeat:%d", nodeID)
+		if clientAddr != "" {
+			challenge = fmt.Sprintf("heartbeat:%d:%s", nodeID, clientAddr)
+		}
+		if err := s.verifyHeartbeatSignature(pubKey, adminToken, msg, challenge); err != nil {
 			return nil, err
 		}
 		node.lastVerifiedNano.Store(now.UnixNano())
@@ -5390,6 +5406,19 @@ func (s *Server) handleHeartbeat(msg map[string]interface{}) (map[string]interfa
 
 	// Phase 3: atomic LastSeen update — no write lock needed
 	node.lastSeenNano.Store(now.UnixNano())
+
+	// Phase 3b: real_addr refresh. The sanitizer uses the TCP source IP from
+	// remoteAddr and the port from the client-supplied listen_addr, so a
+	// client can't inject an arbitrary host but can signal a port change.
+	if clientAddr != "" && remoteAddr != "" {
+		newAddr := sanitizeListenAddr(remoteAddr, clientAddr)
+		s.mu.Lock()
+		if node.RealAddr != newAddr {
+			slog.Debug("heartbeat: refreshing real_addr", "node_id", nodeID, "old", node.RealAddr, "new", newAddr)
+			node.RealAddr = newAddr
+		}
+		s.mu.Unlock()
+	}
 
 	resp := map[string]interface{}{
 		"type": "heartbeat_ok",

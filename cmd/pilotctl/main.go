@@ -169,6 +169,23 @@ func getRegistry() string {
 	return "34.71.57.205:9000"
 }
 
+// writeConfigKey persists a single key to ~/.pilot/config.json, preserving
+// any other keys already present. Used by set-public / set-private so the
+// chosen visibility survives daemon restarts without the user having to pass
+// --public on every start.
+func writeConfigKey(key string, value interface{}) error {
+	cfg := loadConfig()
+	cfg[key] = value
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(configDir(), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(configPath(), data, 0600)
+}
+
 func loadConfig() map[string]interface{} {
 	f, err := os.Open(configPath())
 	if err != nil {
@@ -1206,6 +1223,20 @@ func cmdDaemonStart(args []string) {
 	logLevel := flagString(flags, "log-level", "info")
 	logFormat := flagString(flags, "log-format", "text")
 	public := flagBool(flags, "public")
+	if !public {
+		// Fall back to persisted visibility so restarts don't silently
+		// revert a previously-public node to private.
+		if p, ok := cfg["public"].(bool); ok {
+			public = p
+		}
+	}
+	// Persist the resolved visibility so subsequent daemon starts (without
+	// the --public flag) remember. Idempotent when config already matches.
+	if public {
+		if err := writeConfigKey("public", true); err != nil {
+			slog.Warn("daemon start: failed to persist public visibility to config", "error", err)
+		}
+	}
 	webhookURL := flagString(flags, "webhook", "")
 	if webhookURL == "" {
 		if w, ok := cfg["webhook"].(string); ok {
@@ -1912,6 +1943,10 @@ func cmdSetPublic(args []string) {
 	if err != nil {
 		fatalCode("connection_failed", "set-public: %v", err)
 	}
+	// Persist so a daemon restart doesn't silently flip us back to private.
+	if err := writeConfigKey("public", true); err != nil {
+		slog.Warn("set-public: failed to persist visibility to config", "error", err)
+	}
 	output(resp)
 }
 
@@ -1921,6 +1956,9 @@ func cmdSetPrivate(args []string) {
 	resp, err := d.SetVisibility(false)
 	if err != nil {
 		fatalCode("connection_failed", "set-private: %v", err)
+	}
+	if err := writeConfigKey("public", false); err != nil {
+		slog.Warn("set-private: failed to persist visibility to config", "error", err)
 	}
 	output(resp)
 }
