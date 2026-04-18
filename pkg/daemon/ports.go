@@ -487,16 +487,21 @@ func (pm *PortManager) IdleConnections(maxIdle time.Duration) []*Connection {
 	return idle
 }
 
-// ResetKeepaliveForNode clears KeepaliveUnacked on every ESTABLISHED connection
-// whose remote node matches nodeID. Called after a tunnel rekey so ACKs dropped
-// during the key swap don't trip dead-peer detection on otherwise healthy peers.
+// ResetKeepaliveForNode clears KeepaliveUnacked and refreshes LastActivity on
+// every ESTABLISHED connection whose remote node matches nodeID. Called after a
+// tunnel rekey so ACKs dropped during the key swap don't trip dead-peer detection
+// on otherwise healthy peers. LastActivity is also bumped so the idle-sweep
+// doesn't immediately start probing during the brief window where both sides are
+// converging on the new shared secret.
 func (pm *PortManager) ResetKeepaliveForNode(nodeID uint32) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
+	now := time.Now()
 	for _, c := range pm.connections {
 		c.Mu.Lock()
 		if c.State == StateEstablished && c.RemoteAddr.Node == nodeID {
 			c.KeepaliveUnacked = 0
+			c.LastActivity = now
 		}
 		c.Mu.Unlock()
 	}
