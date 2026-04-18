@@ -1041,6 +1041,16 @@ func (tm *TunnelManager) handlePunchCommand(data []byte) {
 	port := binary.BigEndian.Uint16(data[1+ipLen:])
 	addr := &net.UDPAddr{IP: ip, Port: int(port)}
 
+	// Skip punches to non-routable addresses. This can happen when the beacon
+	// is itself behind a NAT/LB that rewrites client source IPs (e.g. GCP Cloud
+	// NAT advertises 10.128.0.12 for every registrant), producing punch targets
+	// that are unreachable from anywhere. Mirrors the STUN-result filter in
+	// daemon.go (isPrivateAddr).
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		slog.Warn("skipping NAT punch to non-routable target", "target", addr)
+		return
+	}
+
 	// Send punch packets to create NAT mapping (send multiple for reliability)
 	punch := make([]byte, 4)
 	copy(punch, protocol.TunnelMagicPunch[:])
