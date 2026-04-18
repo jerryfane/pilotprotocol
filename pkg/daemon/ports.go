@@ -487,6 +487,21 @@ func (pm *PortManager) IdleConnections(maxIdle time.Duration) []*Connection {
 	return idle
 }
 
+// ResetKeepaliveForNode clears KeepaliveUnacked on every ESTABLISHED connection
+// whose remote node matches nodeID. Called after a tunnel rekey so ACKs dropped
+// during the key swap don't trip dead-peer detection on otherwise healthy peers.
+func (pm *PortManager) ResetKeepaliveForNode(nodeID uint32) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for _, c := range pm.connections {
+		c.Mu.Lock()
+		if c.State == StateEstablished && c.RemoteAddr.Node == nodeID {
+			c.KeepaliveUnacked = 0
+		}
+		c.Mu.Unlock()
+	}
+}
+
 // AllConnections returns all active connections.
 func (pm *PortManager) AllConnections() []*Connection {
 	pm.mu.RLock()

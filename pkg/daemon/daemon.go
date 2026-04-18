@@ -516,6 +516,11 @@ func (d *Daemon) Start() error {
 		d.tunnels.SetPeerVerifyFunc(d.lookupPeerPubKey)
 	}
 
+	// Reset keepalive counters on affected connections after a rekey, so ACKs
+	// dropped during the key swap don't trip dead-peer detection on the next
+	// idle-sweep and cause the tunnel to flap.
+	d.tunnels.SetRekeyCallback(d.ports.ResetKeepaliveForNode)
+
 	slog.Info("daemon registered", "node_id", d.nodeID, "addr", d.addr, "endpoint", registrationAddr)
 
 	// Initialize webhook client (no-op if URL is empty)

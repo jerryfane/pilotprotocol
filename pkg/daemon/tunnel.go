@@ -122,6 +122,12 @@ type TunnelManager struct {
 	beaconAddr *net.UDPAddr    // beacon address for punch/relay
 	relayPeers map[uint32]bool // peers that need relay (symmetric NAT)
 
+	// Rekey notification: invoked with peer node_id after a tunnel rekey completes.
+	// The daemon uses this to reset per-connection keepalive counters on affected
+	// connections so that ACKs dropped during the key swap don't trip dead-peer
+	// detection.
+	rekeyCallback func(uint32)
+
 	// Webhook
 	webhook *WebhookClient
 
@@ -206,6 +212,16 @@ func (tm *TunnelManager) SetIdentity(id *crypto.Identity) {
 func (tm *TunnelManager) SetPeerVerifyFunc(fn func(uint32) (ed25519.PublicKey, error)) {
 	tm.mu.Lock()
 	tm.verifyFunc = fn
+	tm.mu.Unlock()
+}
+
+// SetRekeyCallback sets a callback invoked with peer node_id after a tunnel rekey
+// completes. The daemon installs this to reset keepalive counters on connections
+// routed over the rekeying peer; without it, in-flight ACKs lost during the key
+// swap can trip dead-peer detection on the next idle-sweep and cause tunnel flap.
+func (tm *TunnelManager) SetRekeyCallback(fn func(uint32)) {
+	tm.mu.Lock()
+	tm.rekeyCallback = fn
 	tm.mu.Unlock()
 }
 
@@ -563,6 +579,22 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 	}
 
 	tm.flushPending(peerNodeID)
+
+	if keyChanged {
+		tm.notifyRekey(peerNodeID)
+	}
+}
+
+// notifyRekey invokes the installed rekey callback, if any, to let the daemon
+// reset per-connection state (keepalive counters) on connections routed over
+// this peer's tunnel.
+func (tm *TunnelManager) notifyRekey(peerNodeID uint32) {
+	tm.mu.RLock()
+	cb := tm.rekeyCallback
+	tm.mu.RUnlock()
+	if cb != nil {
+		cb(peerNodeID)
+	}
 }
 
 // handleKeyExchange processes an incoming unauthenticated key exchange packet.
@@ -632,6 +664,10 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 
 	// Flush any pending packets now that encryption is ready
 	tm.flushPending(peerNodeID)
+
+	if keyChanged {
+		tm.notifyRekey(peerNodeID)
+	}
 }
 
 // handleEncrypted decrypts an incoming encrypted packet.
