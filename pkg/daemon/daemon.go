@@ -2664,10 +2664,15 @@ func (d *Daemon) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			if d.regConn != nil {
-				d.addrMu.RLock()
-				regAddr := d.registrationAddr
-				d.addrMu.RUnlock()
-				_, err := d.regConn.HeartbeatWithAddr(d.NodeID(), regAddr)
+				// NOTE: we intentionally call Heartbeat (not HeartbeatWithAddr)
+				// against the upstream registry at 34.71.57.205, which has NOT
+				// been patched to accept the extended heartbeat:{id}:{addr}
+				// signed challenge. Sending the extended form to an unpatched
+				// server fails signature verification and trips the
+				// re-registration loop. Switch this to HeartbeatWithAddr only
+				// when the registry server is known to have the matching
+				// handleHeartbeat patch.
+				_, err := d.regConn.Heartbeat(d.NodeID())
 				if err != nil {
 					consecutiveFailures++
 					slog.Warn("heartbeat failed", "consecutive_failures", consecutiveFailures, "error", err)
