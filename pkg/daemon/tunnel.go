@@ -15,6 +15,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
@@ -133,6 +134,13 @@ type TunnelManager struct {
 	// engine will skip sending them gossip frames. See gossip.CapGossip
 	// for bit definitions.
 	peerCaps map[uint32]uint64
+
+	// lastRecoveryPILA bounds how often we emit an unsolicited PILA
+	// to a peer we have no crypto state for. See
+	// maybeSendRecoveryPILA for the full story. Rate-limited to
+	// avoid any amplification-loop concern if a peer (or attacker)
+	// keeps feeding us un-decryptable frames.
+	lastRecoveryPILA map[uint32]time.Time
 	// Our own capability bitmap, appended to outbound PILA frames so
 	// peers can learn that we support gossip. Zero when the daemon
 	// hasn't opted in (e.g. during tests, or pre-engine bootstrap).
@@ -197,9 +205,10 @@ func NewTunnelManager() *TunnelManager {
 		peerTCP:     make(map[uint32]*transport.TCPEndpoint),
 		peerConns:   make(map[uint32]transport.DialedConn),
 		crypto:      make(map[uint32]*peerCrypto),
-		peerPubKeys: make(map[uint32]ed25519.PublicKey),
-		peerCaps:    make(map[uint32]uint64),
-		pending:     make(map[uint32][][]byte),
+		peerPubKeys:      make(map[uint32]ed25519.PublicKey),
+		peerCaps:         make(map[uint32]uint64),
+		lastRecoveryPILA: make(map[uint32]time.Time),
+		pending:          make(map[uint32][][]byte),
 		relayPeers:  make(map[uint32]bool),
 		recvCh:      make(chan *IncomingPacket, RecvChSize),
 		done:        make(chan struct{}),
@@ -1001,6 +1010,16 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 
 	if pc == nil || !pc.ready {
 		slog.Warn("encrypted packet from node but no key", "peer_node_id", peerNodeID)
+		// Auto-recovery: our key state for this peer is missing
+		// (typical after a one-sided daemon restart — surviving peer
+		// retains its session keys derived from our old X25519 pubkey,
+		// we generated a new one on restart, and the peer keeps
+		// sending us un-decryptable frames indefinitely). Reply with
+		// an unsolicited PILA so the peer observes our new pubkey and
+		// re-handshakes. Rate-limited to avoid turning us into a PILA
+		// amplifier if an attacker (or a persistent misconfigured
+		// peer) spams un-decryptable frames.
+		tm.maybeSendRecoveryPILA(peerNodeID, from)
 		return
 	}
 
@@ -1200,6 +1219,55 @@ func (tm *TunnelManager) buildAuthKeyExchangeFrame() []byte {
 		copy(frame[136:], capsBuf[:capsLen])
 	}
 	return frame
+}
+
+// recoveryPILAInterval bounds how often we emit an unsolicited
+// authenticated key-exchange (PILA) frame to a peer we have no
+// crypto state for. Short enough to recover within a single gossip
+// tick after a one-sided daemon restart, long enough that a
+// spoofed nodeID can't turn us into a PILA amplifier.
+const recoveryPILAInterval = 60 * time.Second
+
+// maybeSendRecoveryPILA emits an unsolicited PILA to the observed
+// source address when we receive an encrypted packet we cannot
+// decrypt (no crypto state cached for that peer). This is the
+// auto-recovery path for the asymmetric-restart case: peer A
+// restarts and loses its per-peer X25519 keys, peer B still holds
+// stale session keys and keeps sending encrypted traffic that A
+// can't decrypt. Without this hook, A would silently drop B's
+// frames forever; B's side of the tunnel never notices because its
+// own keepalive ACKs appear to succeed at the tunnel level.
+//
+// Sending the PILA back announces A's new X25519 pubkey; B's
+// handleAuthKeyExchange detects the key mismatch, invalidates its
+// stale state, and re-handshakes. Rate-limited per peer to prevent
+// reflection abuse (a spoofed nodeID in a packet could otherwise
+// turn us into an amplifier, since PILA is ~136 bytes vs the 28+
+// bytes an attacker has to send to trigger it).
+func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	tm.mu.Lock()
+	last := tm.lastRecoveryPILA[nodeID]
+	now := time.Now()
+	if !last.IsZero() && now.Sub(last) < recoveryPILAInterval {
+		tm.mu.Unlock()
+		return
+	}
+	tm.lastRecoveryPILA[nodeID] = now
+	tm.mu.Unlock()
+
+	frame := tm.buildAuthKeyExchangeFrame()
+	if frame == nil {
+		// Identity or X25519 key isn't loaded yet — nothing to send.
+		return
+	}
+	if _, err := tm.udp.WriteToUDPAddr(frame, addr); err != nil {
+		slog.Debug("recovery PILA send failed", "peer_node_id", nodeID, "addr", addr, "error", err)
+		return
+	}
+	slog.Info("sent recovery PILA to peer with unknown key", "peer_node_id", nodeID, "addr", addr)
 }
 
 // buildKeyExchangeFrame builds an unauthenticated key exchange frame.
