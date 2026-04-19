@@ -10,6 +10,55 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.8.0-jf.1] - 2026-04-19
+
+### Added
+- Pluggable transport layer. New `pkg/daemon/transport` package with
+  `Transport`, `Endpoint`, `DialedConn`, and `InboundFrame` interfaces.
+  Every transport's `Listen` goroutine feeds a shared sink consumed by
+  `TunnelManager.dispatchLoop`; sends flow through `DialedConn`. Adding
+  a new byte-movement protocol (QUIC, WebSocket, etc.) is now purely
+  additive — the core tunnel layer is transport-agnostic.
+- `TCPTransport` implementation (`pkg/daemon/transport/tcp.go`) using
+  4-byte big-endian length-prefix framing (`internal/ipcutil`, 1 MiB
+  cap). Persistent connections are pooled by remote address; inbound
+  accepted sockets are surfaced as `InboundFrame.Reply` so peers that
+  dialled us inbound can receive replies on the same connection without
+  re-dialling. Covered by `tcp_test.go` (9 cases: round-trip,
+  multi-frame, conn reuse, dial timeout, peer disconnect, parallel
+  sends, endpoint parse, wrong network, idempotent close).
+- Registry multi-transport endpoints. Registration, lookup, and resolve
+  responses now carry an optional `endpoints: [{network, addr}, ...]`
+  array. Old registries silently drop the field — no signature
+  incompatibility, no wire break. New helpers:
+  `registry.NodeEndpoint`, `registry.Client.RegisterWithKeyAndEndpoints`,
+  `registry.EndpointsFromResponse`.
+- `daemon.Config.TCPListenAddr` and `daemon.Config.TCPEndpoint` plus
+  the `-tcp-listen` / `-tcp-endpoint` flags on `cmd/daemon` and
+  `cmd/pilotctl`. When set, the daemon listens on TCP alongside UDP
+  and advertises the TCP endpoint in the registry.
+- TCP dial fallback in `DialConnection`. After direct UDP SYN retries
+  exhaust (`DialDirectRetries`), the dialer checks whether the peer
+  advertised a TCP endpoint (`TunnelManager.HasTCPEndpoint`) and
+  attempts a TCP dial bounded by `DialTCPFallbackTimeout` (5 s) before
+  falling through to the existing beacon-relay path. The cached
+  `DialedConn` sticks for subsequent sends via `writeFrame`'s new
+  non-UDP preference — peers on UDP-hostile networks (corporate
+  firewalls, carrier-grade NAT, UDP-blocking ISPs) now establish over
+  TCP without any peer-side configuration.
+
+### Changed
+- `TunnelManager` no longer owns a `*net.UDPConn` directly. The
+  connection is held by `transport.UDPTransport`; `TunnelManager.conn`,
+  `peers map[uint32]*net.UDPAddr`, and `IncomingPacket.From
+  *net.UDPAddr` were replaced by `udp *transport.UDPTransport`,
+  `tcp *transport.TCPTransport` (optional), `peerEndpoints`,
+  `peerConns map[uint32]transport.DialedConn`, and `IncomingPacket.From
+  transport.Endpoint`. Pure refactor — wire bytes are byte-identical
+  to v1.7.2-jf.3 when only UDP is configured.
+
+## [v1.7.2-jf.3] - 2026-04-19
+
 ### Changed
 - `install.sh` now pulls from `jerryfane/pilotprotocol` releases and source
   instead of `TeoSlayer/pilotprotocol`. Header URLs updated to
