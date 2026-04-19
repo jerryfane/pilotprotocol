@@ -16,7 +16,7 @@ import (
 	"sync/atomic"
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
-	"github.com/TeoSlayer/pilotprotocol/internal/pool"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
@@ -92,15 +92,20 @@ func (pc *peerCrypto) setReplayBit(counter uint64) {
 	pc.replayBitmap[bit/64] |= 1 << (bit % 64)
 }
 
-// TunnelManager manages real UDP tunnels to peer daemons.
+// TunnelManager manages tunnels to peer daemons. Today the tunnel
+// bytes travel over UDP (via the embedded UDPTransport). The design
+// will grow additional transports (TCP, QUIC, …) in later phases; the
+// socket lifecycle lives inside pkg/daemon/transport so TunnelManager
+// does not reach for *net.UDPConn directly.
 type TunnelManager struct {
 	mu        sync.RWMutex
-	conn      *net.UDPConn
-	peers     map[uint32]*net.UDPAddr // node_id → real UDP endpoint
-	crypto    map[uint32]*peerCrypto  // node_id → encryption state
+	udp       *transport.UDPTransport         // owns the UDP socket; nil before Listen
+	inbound   chan transport.InboundFrame     // sink every transport writes to; dispatchLoop reads
+	peers     map[uint32]*net.UDPAddr         // node_id → real UDP endpoint (still UDP-only in Phase 1b)
+	crypto    map[uint32]*peerCrypto          // node_id → encryption state
 	recvCh    chan *IncomingPacket
-	done      chan struct{}  // closed on Close() to stop readLoop sends
-	readWg    sync.WaitGroup // tracks readLoop goroutine for clean shutdown
+	done      chan struct{}  // closed on Close() to stop dispatchLoop
+	readWg    sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
 	closeOnce sync.Once
 
 	// Encryption config
@@ -160,6 +165,8 @@ const RecvChSize = 8192
 
 func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
+		udp:         transport.NewUDPTransport(),
+		inbound:     make(chan transport.InboundFrame, RecvChSize),
 		peers:       make(map[uint32]*net.UDPAddr),
 		crypto:      make(map[uint32]*peerCrypto),
 		peerPubKeys: make(map[uint32]ed25519.PublicKey),
@@ -273,13 +280,13 @@ func (tm *TunnelManager) RegisterWithBeacon() {
 	tm.mu.RLock()
 	bAddr := tm.beaconAddr
 	tm.mu.RUnlock()
-	if bAddr == nil || tm.conn == nil {
+	if bAddr == nil || tm.udp == nil {
 		return
 	}
 	msg := make([]byte, 5)
 	msg[0] = protocol.BeaconMsgDiscover
 	binary.BigEndian.PutUint32(msg[1:5], tm.loadNodeID())
-	if _, err := tm.conn.WriteToUDP(msg, bAddr); err != nil {
+	if _, err := tm.udp.WriteToUDPAddr(msg, bAddr); err != nil {
 		slog.Warn("beacon registration failed", "error", err)
 	} else {
 		slog.Debug("registered with beacon", "node_id", tm.loadNodeID(), "beacon", bAddr)
@@ -291,7 +298,7 @@ func (tm *TunnelManager) RequestHolePunch(targetNodeID uint32) {
 	tm.mu.RLock()
 	bAddr := tm.beaconAddr
 	tm.mu.RUnlock()
-	if bAddr == nil || tm.conn == nil {
+	if bAddr == nil || tm.udp == nil {
 		return
 	}
 	// Format: [MsgPunchRequest(1)][ourNodeID(4)][targetNodeID(4)]
@@ -299,7 +306,7 @@ func (tm *TunnelManager) RequestHolePunch(targetNodeID uint32) {
 	msg[0] = protocol.BeaconMsgPunchRequest
 	binary.BigEndian.PutUint32(msg[1:5], tm.loadNodeID())
 	binary.BigEndian.PutUint32(msg[5:9], targetNodeID)
-	if _, err := tm.conn.WriteToUDP(msg, bAddr); err != nil {
+	if _, err := tm.udp.WriteToUDPAddr(msg, bAddr); err != nil {
 		slog.Debug("hole punch request failed", "target", targetNodeID, "error", err)
 	} else {
 		slog.Debug("hole punch requested", "target", targetNodeID)
@@ -320,7 +327,7 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 		binary.BigEndian.PutUint32(msg[1:5], tm.loadNodeID())
 		binary.BigEndian.PutUint32(msg[5:9], nodeID)
 		copy(msg[9:], frame)
-		n, err := tm.conn.WriteToUDP(msg, bAddr)
+		n, err := tm.udp.WriteToUDPAddr(msg, bAddr)
 		if err == nil {
 			atomic.AddUint64(&tm.PktsSent, 1)
 			atomic.AddUint64(&tm.BytesSent, uint64(n))
@@ -331,7 +338,7 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	if addr == nil {
 		return fmt.Errorf("no address for node %d", nodeID)
 	}
-	n, err := tm.conn.WriteToUDP(frame, addr)
+	n, err := tm.udp.WriteToUDPAddr(frame, addr)
 	if err == nil {
 		atomic.AddUint64(&tm.PktsSent, 1)
 		atomic.AddUint64(&tm.BytesSent, uint64(n))
@@ -365,123 +372,135 @@ func (tm *TunnelManager) getPeerPubKey(nodeID uint32) (ed25519.PublicKey, error)
 	return pk, nil
 }
 
-// Listen starts the UDP listener for incoming tunnel traffic.
+// Listen starts the UDP listener for incoming tunnel traffic. The
+// underlying *net.UDPConn is owned by the transport layer; this
+// method also starts the dispatchLoop goroutine that consumes frames
+// from every registered transport via the shared inbound sink.
 func (tm *TunnelManager) Listen(addr string) error {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return fmt.Errorf("resolve: %w", err)
+	if err := tm.udp.Listen(addr, tm.inbound); err != nil {
+		return err
 	}
-
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("listen udp: %w", err)
-	}
-	tm.conn = conn
 
 	tm.readWg.Add(1)
-	go tm.readLoop()
+	go tm.dispatchLoop()
 	return nil
 }
 
 func (tm *TunnelManager) Close() error {
 	var connErr error
 	tm.closeOnce.Do(func() {
-		close(tm.done) // signal readLoop to stop sending
-		if tm.conn != nil {
-			connErr = tm.conn.Close() // causes readLoop to exit on ReadFromUDP error
+		close(tm.done) // signal dispatchLoop to stop sending
+		if tm.udp != nil {
+			connErr = tm.udp.Close() // causes the UDP transport's readLoop to return;
+			// the sink channel is drained by dispatchLoop until done fires.
 		}
-		tm.readWg.Wait() // wait for readLoop to fully exit before closing recvCh
+		tm.readWg.Wait() // wait for dispatchLoop to fully exit before closing recvCh
 		close(tm.recvCh) // unblock routeLoop (H5 fix — prevents goroutine leak)
 	})
 	return connErr
 }
 
 func (tm *TunnelManager) LocalAddr() net.Addr {
-	if tm.conn != nil {
-		return tm.conn.LocalAddr()
+	if tm.udp == nil {
+		return nil
 	}
-	return nil
+	return tm.udp.LocalAddr()
 }
 
-func (tm *TunnelManager) readLoop() {
+// dispatchLoop consumes InboundFrames produced by any registered
+// transport and routes them to the per-magic handlers. It is the
+// single place where we interpret Pilot's wire format at the tunnel
+// layer; individual transports are dumb byte-movers.
+//
+// Phase 1b scope: only the UDP transport is wired in, so every frame
+// arrives with a *transport.UDPEndpoint. Handlers still take
+// *net.UDPAddr — we unwrap the concrete type here until Phase 1c
+// abstracts the handler signatures to transport.Endpoint.
+func (tm *TunnelManager) dispatchLoop() {
 	defer tm.readWg.Done()
-	bufPtr := pool.GetLarge()
-	defer pool.PutLarge(bufPtr)
-	buf := *bufPtr
 
 	for {
-		n, remote, err := tm.conn.ReadFromUDP(buf)
-		if err != nil {
-			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
-				slog.Debug("tunnel read loop stopped", "reason", "conn closed")
-			} else {
-				slog.Error("tunnel read error", "error", err)
-			}
+		select {
+		case <-tm.done:
 			return
-		}
-
-		if n < 1 {
-			continue
-		}
-
-		// Beacon messages use single-byte type codes < 0x10.
-		// All tunnel magic starts with 'P' (0x50), so no collision.
-		if buf[0] < 0x10 {
-			tm.handleBeaconMessage(buf[:n], remote)
-			continue
-		}
-
-		if n < 4 {
-			continue
-		}
-
-		magic := [4]byte{buf[0], buf[1], buf[2], buf[3]}
-
-		switch magic {
-		case protocol.TunnelMagicAuthEx:
-			// Authenticated key exchange: [PILA][4-byte nodeID][32-byte X25519][32-byte Ed25519][64-byte sig]
-			tm.handleAuthKeyExchange(buf[4:n], remote, false)
-			continue
-
-		case protocol.TunnelMagicKeyEx:
-			// Key exchange packet: [PILK][4-byte nodeID][32-byte pubkey]
-			tm.handleKeyExchange(buf[4:n], remote, false)
-			continue
-
-		case protocol.TunnelMagicSecure:
-			// Encrypted packet: [PILS][4-byte nodeID][12-byte nonce][ciphertext+tag]
-			tm.handleEncrypted(buf[4:n], remote)
-			continue
-
-		case protocol.TunnelMagicPunch:
-			// NAT punch packet — expected during hole-punching, silently acknowledged
-			slog.Debug("NAT punch received", "from", remote)
-			continue
-
-		case protocol.TunnelMagic:
-			// Plaintext packet
-			if n < 4+protocol.PacketHeaderSize() {
-				continue
-			}
-			data := make([]byte, n-4)
-			copy(data, buf[4:n])
-
-			pkt, err := protocol.Unmarshal(data)
-			if err != nil {
-				slog.Error("tunnel unmarshal error", "remote", remote, "error", err)
-				continue
-			}
-
-			atomic.AddUint64(&tm.PktsRecv, 1)
-			atomic.AddUint64(&tm.BytesRecv, uint64(n))
-			select {
-			case tm.recvCh <- &IncomingPacket{Packet: pkt, From: remote}:
-			case <-tm.done:
+		case inbound, ok := <-tm.inbound:
+			if !ok {
 				return
 			}
+			udpEP, ok := inbound.From.(*transport.UDPEndpoint)
+			if !ok {
+				slog.Warn("tunnel dispatch: unknown endpoint type",
+					"network", inbound.From.Network(),
+					"addr", inbound.From.String())
+				continue
+			}
+			remote := udpEP.Addr()
+			buf := inbound.Frame
+			n := len(buf)
 
-		default:
-			continue // unknown magic
+			if n < 1 {
+				continue
+			}
+
+			// Beacon messages use single-byte type codes < 0x10.
+			// All tunnel magic starts with 'P' (0x50), so no collision.
+			if buf[0] < 0x10 {
+				tm.handleBeaconMessage(buf[:n], remote)
+				continue
+			}
+
+			if n < 4 {
+				continue
+			}
+
+			magic := [4]byte{buf[0], buf[1], buf[2], buf[3]}
+
+			switch magic {
+			case protocol.TunnelMagicAuthEx:
+				// Authenticated key exchange: [PILA][4-byte nodeID][32-byte X25519][32-byte Ed25519][64-byte sig]
+				tm.handleAuthKeyExchange(buf[4:n], remote, false)
+				continue
+
+			case protocol.TunnelMagicKeyEx:
+				// Key exchange packet: [PILK][4-byte nodeID][32-byte pubkey]
+				tm.handleKeyExchange(buf[4:n], remote, false)
+				continue
+
+			case protocol.TunnelMagicSecure:
+				// Encrypted packet: [PILS][4-byte nodeID][12-byte nonce][ciphertext+tag]
+				tm.handleEncrypted(buf[4:n], remote)
+				continue
+
+			case protocol.TunnelMagicPunch:
+				// NAT punch packet — expected during hole-punching, silently acknowledged
+				slog.Debug("NAT punch received", "from", remote)
+				continue
+
+			case protocol.TunnelMagic:
+				// Plaintext packet
+				if n < 4+protocol.PacketHeaderSize() {
+					continue
+				}
+				data := make([]byte, n-4)
+				copy(data, buf[4:n])
+
+				pkt, err := protocol.Unmarshal(data)
+				if err != nil {
+					slog.Error("tunnel unmarshal error", "remote", remote, "error", err)
+					continue
+				}
+
+				atomic.AddUint64(&tm.PktsRecv, 1)
+				atomic.AddUint64(&tm.BytesRecv, uint64(n))
+				select {
+				case tm.recvCh <- &IncomingPacket{Packet: pkt, From: remote}:
+				case <-tm.done:
+					return
+				}
+
+			default:
+				continue // unknown magic
+			}
 		}
 	}
 }
@@ -1087,11 +1106,16 @@ func (tm *TunnelManager) handlePunchCommand(data []byte) {
 		return
 	}
 
-	// Send punch packets to create NAT mapping (send multiple for reliability)
+	// Send punch packets to create NAT mapping (send multiple for reliability).
+	// Goes via the UDP transport directly — punch is UDP-specific and
+	// bypasses the writeFrame/relay routing deliberately.
+	if tm.udp == nil {
+		return
+	}
 	punch := make([]byte, 4)
 	copy(punch, protocol.TunnelMagicPunch[:])
 	for i := 0; i < 3; i++ {
-		tm.conn.WriteToUDP(punch, addr)
+		_, _ = tm.udp.WriteToUDPAddr(punch, addr)
 	}
 	slog.Info("NAT punch sent", "target", addr)
 }
