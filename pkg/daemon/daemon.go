@@ -236,6 +236,10 @@ type Daemon struct {
 	// any other unknown control port).
 	gossipMu      sync.Mutex
 	gossipHandler func(srcNode uint32, payload []byte)
+	// gossipEngine is non-nil once Start has spawned it. Stop tears
+	// it down before the daemon's other resources so the ticker
+	// can't fire against a half-closed daemon.
+	gossipEngine *gossip.Engine
 }
 
 const perSourceSYNLimit = 10     // max SYNs per source per second
@@ -691,9 +695,77 @@ func (d *Daemon) Start() error {
 	// 11. Start network sync (refreshes memberships/policies every 5 min)
 	go d.networkSyncLoop()
 
+	// 12. Start the gossip Engine. The engine is a pure additive layer:
+	// it advertises CapGossip on outbound PILA frames and runs a 25 s
+	// anti-entropy tick against peers who advertise the same bit.
+	// Unsupported peers never see gossip frames (selector enforces
+	// the cap check). Failure to start is non-fatal: the daemon still
+	// functions exactly as pre-gossip without the engine running.
+	if err := d.startGossipEngine(); err != nil {
+		slog.Warn("gossip engine not started", "error", err)
+	}
+
 	d.startTime = time.Now()
 	slog.Info("daemon running", "node_id", d.nodeID, "addr", d.addr)
 	return nil
+}
+
+// startGossipEngine constructs and starts the Engine using the
+// daemon + tunnel manager as its collaborators. Safe to call once
+// per Daemon.Start; multiple calls would leak tickers.
+func (d *Daemon) startGossipEngine() error {
+	if d.identity == nil {
+		return fmt.Errorf("identity missing")
+	}
+	view := d.tunnels.GossipView()
+	if view == nil {
+		return fmt.Errorf("tunnel manager has no view")
+	}
+	selfFn := func() *gossip.GossipRecord {
+		return d.buildSelfGossipRecord()
+	}
+	keyLook := func(id uint32) (ed25519.PublicKey, bool) {
+		return d.tunnels.PeerPubKey(id)
+	}
+	eng := gossip.NewEngine(d.identity, view, &daemonGossipTransport{d: d}, d.tunnels, selfFn, keyLook, gossip.DefaultInterval)
+	d.gossipEngine = eng
+	d.SetGossipHandler(func(src uint32, payload []byte) {
+		eng.OnInbound(src, payload)
+	})
+	d.tunnels.SetLocalCaps(gossip.CapGossip)
+	eng.Start()
+	return nil
+}
+
+// daemonGossipTransport adapts the Daemon's SendGossipFrame to the
+// gossip.Transport interface without introducing a pkg cycle.
+type daemonGossipTransport struct{ d *Daemon }
+
+func (t *daemonGossipTransport) SendGossipFrame(dstNode uint32, payload []byte) error {
+	return t.d.SendGossipFrame(dstNode, payload)
+}
+
+// buildSelfGossipRecord returns an unsigned record describing this
+// daemon's current advertisement. The Engine stamps LastSeen and
+// signs the record on every tick.
+func (d *Daemon) buildSelfGossipRecord() *gossip.GossipRecord {
+	d.addrMu.RLock()
+	nodeID := d.nodeID
+	regAddr := d.registrationAddr
+	d.addrMu.RUnlock()
+	if nodeID == 0 || regAddr == "" {
+		return nil
+	}
+	rec := &gossip.GossipRecord{
+		NodeID:    nodeID,
+		RealAddr:  regAddr,
+		Hostname:  d.config.Hostname,
+		PublicKey: d.identity.PublicKey,
+	}
+	if tcp := d.advertisedTCPEndpoint(); tcp != "" {
+		rec.Endpoints = append(rec.Endpoints, registry.NodeEndpoint{Network: "tcp", Addr: tcp})
+	}
+	return rec
 }
 
 // discoverWithTempSocket does STUN discovery on a temporary UDP socket
@@ -870,6 +942,16 @@ func (d *Daemon) Stop() error {
 }
 
 func (d *Daemon) doStop() {
+	// Stop the gossip engine before any other teardown: the ticker
+	// will try to send on Transport, which depends on tunnel state.
+	// Bringing it down first means no tick fires into a half-torn-
+	// down stack.
+	if d.gossipEngine != nil {
+		d.SetGossipHandler(nil)
+		d.gossipEngine.Stop()
+		d.gossipEngine = nil
+	}
+
 	// Graceful close: send FIN to all active connections, then force remove
 	conns := d.ports.AllConnections()
 	for _, conn := range conns {

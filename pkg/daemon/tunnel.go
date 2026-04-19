@@ -236,6 +236,38 @@ func (tm *TunnelManager) PeerCaps(nodeID uint32) uint64 {
 	return tm.peerCaps[nodeID]
 }
 
+// GossipCapablePeers returns the set of peers with whom we have an
+// established encrypted tunnel and who have advertised CapGossip on
+// their most recent PILA frame. Used by the gossip Engine to pick
+// tick targets.
+func (tm *TunnelManager) GossipCapablePeers() []uint32 {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	out := make([]uint32, 0, len(tm.peerCaps))
+	for nodeID, caps := range tm.peerCaps {
+		if !gossip.HasCap(caps, gossip.CapGossip) {
+			continue
+		}
+		if pc := tm.crypto[nodeID]; pc == nil || !pc.ready {
+			continue
+		}
+		out = append(out, nodeID)
+	}
+	return out
+}
+
+// PeerPubKey returns the Ed25519 public key we have cached for the
+// given peer, or (nil, false) if we have not yet authenticated with
+// them. Used by the gossip Engine as a KeyLookup source so inbound
+// records are cross-checked against the identity the registry bound
+// to this node_id, not just TOFU-accepted.
+func (tm *TunnelManager) PeerPubKey(nodeID uint32) (ed25519.PublicKey, bool) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	pk, ok := tm.peerPubKeys[nodeID]
+	return pk, ok
+}
+
 // ListenTCP starts an optional TCP listener alongside the UDP tunnel.
 // When configured, peers that advertise a TCP endpoint (via the
 // registry's multi-transport endpoints list) can be reached over TCP
