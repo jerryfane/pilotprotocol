@@ -199,7 +199,7 @@ func (e *Engine) refreshSelf() {
 	if r == nil || r.NodeID == 0 {
 		return
 	}
-	r.LastSeen = time.Now().Unix()
+	r.LastSeen = time.Now().UnixMilli()
 	if len(r.PublicKey) == 0 && e.id != nil {
 		r.PublicKey = e.id.PublicKey
 	}

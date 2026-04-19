@@ -87,6 +87,12 @@ type Config struct {
 	MaxConnectionsPerPort int           // default 1024
 	MaxTotalConnections   int           // default 4096
 	TimeWaitDuration      time.Duration // default 10s
+
+	// GossipInterval overrides the gossip tick cadence (default
+	// gossip.DefaultInterval = 25s). Primarily a test knob — set to
+	// a short value for fast convergence assertions without waiting
+	// for the production cadence. Zero = use default.
+	GossipInterval time.Duration
 }
 
 // Default tuning constants (used when Config fields are zero).
@@ -727,7 +733,11 @@ func (d *Daemon) startGossipEngine() error {
 	keyLook := func(id uint32) (ed25519.PublicKey, bool) {
 		return d.tunnels.PeerPubKey(id)
 	}
-	eng := gossip.NewEngine(d.identity, view, &daemonGossipTransport{d: d}, d.tunnels, selfFn, keyLook, gossip.DefaultInterval)
+	interval := d.config.GossipInterval
+	if interval <= 0 {
+		interval = gossip.DefaultInterval
+	}
+	eng := gossip.NewEngine(d.identity, view, &daemonGossipTransport{d: d}, d.tunnels, selfFn, keyLook, interval)
 	d.gossipEngine = eng
 	d.SetGossipHandler(func(src uint32, payload []byte) {
 		eng.OnInbound(src, payload)
@@ -743,6 +753,30 @@ type daemonGossipTransport struct{ d *Daemon }
 
 func (t *daemonGossipTransport) SendGossipFrame(dstNode uint32, payload []byte) error {
 	return t.d.SendGossipFrame(dstNode, payload)
+}
+
+// GossipView exposes the daemon's membership view. Intended for
+// tests and introspection; production code should route through
+// ensureTunnel / DialConnection rather than poke the view directly.
+func (d *Daemon) GossipView() *gossip.MembershipView {
+	return d.tunnels.GossipView()
+}
+
+// Tunnels exposes the underlying TunnelManager for tests. Production
+// code should not reach through this — all tunnel-level operations
+// are surfaced via existing Daemon methods.
+func (d *Daemon) Tunnels() *TunnelManager {
+	return d.tunnels
+}
+
+// TriggerGossipTick forces a single anti-entropy round synchronously.
+// Intended for tests that want deterministic propagation without
+// waiting for the background ticker. No-op if the engine hasn't
+// been started.
+func (d *Daemon) TriggerGossipTick() {
+	if d.gossipEngine != nil {
+		d.gossipEngine.Tick()
+	}
 }
 
 // buildSelfGossipRecord returns an unsigned record describing this
@@ -2063,8 +2097,16 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 
 	localPort := d.ports.AllocEphemeralPort()
 	conn := d.ports.NewConnection(localPort, dstAddr, dstPort)
+	// Grab conn.Mu for the early field writes: NewConnection has
+	// already registered the connection in the ports map, so any
+	// concurrent sweep (PortManager.ResetKeepaliveForNode etc.) can
+	// observe conn.State before we initialize it. Without the lock
+	// the race detector flips under load from background tickers
+	// (observed with the gossip Engine's 25 s loop).
+	conn.Mu.Lock()
 	conn.LocalAddr = protocol.Addr{Network: dstAddr.Network, Node: d.NodeID()}
 	conn.State = StateSynSent
+	conn.Mu.Unlock()
 
 	// Send SYN with our receive window
 	syn := &protocol.Packet{
@@ -2851,7 +2893,7 @@ func (d *Daemon) populateGossipViewFromResolve(nodeID uint32, resp map[string]in
 		NodeID:    nodeID,
 		RealAddr:  realAddr,
 		Endpoints: endpoints,
-		LastSeen:  time.Now().Unix(),
+		LastSeen:  time.Now().UnixMilli(),
 	}
 	if hn, ok := resp["hostname"].(string); ok {
 		rec.Hostname = hn

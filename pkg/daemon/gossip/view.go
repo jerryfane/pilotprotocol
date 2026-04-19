@@ -99,9 +99,14 @@ func (v *MembershipView) Put(r *GossipRecord, source Source, fromPeer uint32) Me
 		}
 		return MergeInserted
 	}
-	if !pubKeyEqual(existing.record.PublicKey, r.PublicKey) {
-		// Key mismatch under the same NodeID — registry has to
-		// arbitrate. Refuse to overwrite silently.
+	// Only reject on a true key mismatch: both sides populated and
+	// differ. Empty PublicKey on the existing entry happens when the
+	// entry was populated from a registry response that did not
+	// include a public_key field (the upstream resolve API historically
+	// omits it). Such entries are intentionally "upgradable" — a
+	// subsequent gossip record carrying the owning node's signature
+	// pins the key for future cross-checks.
+	if len(existing.record.PublicKey) > 0 && len(r.PublicKey) > 0 && !pubKeyEqual(existing.record.PublicKey, r.PublicKey) {
 		return MergeRejected
 	}
 	if r.LastSeen <= existing.record.LastSeen {

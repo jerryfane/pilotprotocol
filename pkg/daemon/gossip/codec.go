@@ -44,8 +44,12 @@ import (
 // NodeID. The verify.go file encodes those rules.
 //
 // LastSeen is the author's own wall-clock at signing time (Unix
-// seconds). It drives the merge rule — a newer LastSeen replaces an
-// older one — and defeats stale-record replay.
+// milliseconds). It drives the merge rule — a newer LastSeen
+// replaces an older one — and defeats stale-record replay. The
+// millisecond resolution matters because registry-sourced records
+// and self-signed gossip records can land within the same
+// wall-clock second; sub-second granularity prevents the gossip
+// record from being rejected as "stale" at equal-second timestamps.
 type GossipRecord struct {
 	NodeID    uint32                  `json:"node_id"`
 	PublicKey ed25519.PublicKey       `json:"public_key"`
