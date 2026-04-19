@@ -10,6 +10,52 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.1] - 2026-04-19
+
+### Added
+- Gossip-based peer discovery overlay. New package
+  `pkg/daemon/gossip` implementing a signed-record membership view
+  (`GossipRecord`, `GossipSync`, `GossipDelta`), anti-entropy engine
+  with a 25 s tick (`gossip.Engine`), and a canonical sign-bytes
+  encoding driven by the daemon's existing Ed25519 identity. Upgraded
+  daemons exchange multi-transport endpoint advertisements directly
+  over their encrypted tunnels, breaking the coupling between fork
+  capabilities and upstream registry cooperation: the `endpoints`
+  field no longer has to be propagated through the registry for a
+  TCP-fallback peer to be discoverable. The registry remains the
+  identity root (`node_id ↔ public_key` binding) and the bootstrap
+  entry point; gossip only refreshes the reachability half of the
+  directory.
+- New protocol constants `protocol.PortGossip = 1005` (the
+  ProtoControl port gossip frames ride on) and `gossip.CapGossip =
+  0x01` (the capability bit advertised in the authenticated
+  key-exchange trailer). The PILA frame format is extended with a
+  trailing Uvarint capability bitmap — older daemons truncate at the
+  legacy 132-byte body and never see it, preserving wire
+  compatibility with unmodified upstream daemons.
+- `Daemon.SetGossipHandler`, `Daemon.SendGossipFrame`,
+  `Daemon.GossipView`, `Daemon.TriggerGossipTick`, and
+  `TunnelManager.{SetLocalCaps, PeerCaps, GossipCapablePeers,
+  PeerPubKey, GossipView}` accessors used to glue the gossip Engine
+  into the daemon lifecycle without creating a package cycle.
+- `daemon.Config.GossipInterval` overrides the default 25 s tick
+  cadence (primarily a test knob for fast convergence assertions).
+
+### Fixed
+- Registry snapshot persistence dropped the `Endpoints` field on
+  every save/load round-trip. `snapshotNode` now includes `Endpoints
+  []NodeEndpoint`, and both the save and load paths round-trip the
+  field. Without this fix, restarting a patched rendezvous reset
+  every peer's TCP endpoint advertisement to empty until peers
+  re-registered.
+- `DialConnection` wrote `conn.State = StateSynSent` without holding
+  `conn.Mu`. The connection is already reachable from the ports
+  map by that point so concurrent sweeps (e.g.
+  `PortManager.ResetKeepaliveForNode`) could observe the field
+  mid-write. Surfaced by the race detector once background gossip
+  tickers added concurrent `handlePacket` activity. Fixed with a
+  brief `conn.Mu.Lock/Unlock` around the early-init writes.
+
 ## [v1.8.0-jf.1] - 2026-04-19
 
 ### Added
