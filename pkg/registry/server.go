@@ -5631,24 +5631,25 @@ type snapshot struct {
 }
 
 type snapshotNode struct {
-	ID          uint32   `json:"id"`
-	Owner       string   `json:"owner,omitempty"`
-	PublicKey   string   `json:"public_key"`
-	RealAddr    string   `json:"real_addr,omitempty"`
-	Networks    []uint16 `json:"networks"`
-	Public      bool     `json:"public,omitempty"`
-	LastSeen    string   `json:"last_seen,omitempty"`
-	Hostname    string   `json:"hostname,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	PoloScore   int      `json:"polo_score,omitempty"`
-	TaskExec    bool     `json:"task_exec,omitempty"`
-	LANAddrs    []string `json:"lan_addrs,omitempty"`
-	KeyCreated  string   `json:"key_created,omitempty"`
-	KeyRotated  string   `json:"key_rotated,omitempty"`
-	KeyRotCount int      `json:"key_rot_count,omitempty"`
-	KeyExpires  string   `json:"key_expires,omitempty"`
-	ExternalID  string   `json:"external_id,omitempty"`
-	Version     string   `json:"version,omitempty"`
+	ID          uint32         `json:"id"`
+	Owner       string         `json:"owner,omitempty"`
+	PublicKey   string         `json:"public_key"`
+	RealAddr    string         `json:"real_addr,omitempty"`
+	Networks    []uint16       `json:"networks"`
+	Public      bool           `json:"public,omitempty"`
+	LastSeen    string         `json:"last_seen,omitempty"`
+	Hostname    string         `json:"hostname,omitempty"`
+	Tags        []string       `json:"tags,omitempty"`
+	PoloScore   int            `json:"polo_score,omitempty"`
+	TaskExec    bool           `json:"task_exec,omitempty"`
+	LANAddrs    []string       `json:"lan_addrs,omitempty"`
+	KeyCreated  string         `json:"key_created,omitempty"`
+	KeyRotated  string         `json:"key_rotated,omitempty"`
+	KeyRotCount int            `json:"key_rot_count,omitempty"`
+	KeyExpires  string         `json:"key_expires,omitempty"`
+	ExternalID  string         `json:"external_id,omitempty"`
+	Version     string         `json:"version,omitempty"`
+	Endpoints   []NodeEndpoint `json:"endpoints,omitempty"`
 }
 
 type snapshotNet struct {
@@ -5840,6 +5841,7 @@ type rawNodeCopy struct {
 	keyMeta    KeyInfo
 	externalID string
 	version    string
+	endpoints  []NodeEndpoint
 }
 
 // flushSave serializes the full registry state and writes it to disk.
@@ -5870,6 +5872,7 @@ func (s *Server) flushSave() error {
 			keyMeta:    n.KeyMeta,
 			externalID: n.ExternalID,
 			version:    n.Version,
+			endpoints:  n.Endpoints,
 		})
 	}
 
@@ -6000,6 +6003,7 @@ func (s *Server) flushSave() error {
 		}
 		sn.ExternalID = rn.externalID
 		sn.Version = rn.version
+		sn.Endpoints = rn.endpoints
 		snap.Nodes[fmt.Sprintf("%d", rn.id)] = sn
 
 		// Dashboard metrics (computed outside lock)
@@ -6277,6 +6281,7 @@ func (s *Server) load() error {
 		}
 		node.ExternalID = n.ExternalID
 		node.Version = n.Version
+		node.Endpoints = n.Endpoints
 		s.nodes[n.ID] = node
 		s.pubKeyIdx[n.PublicKey] = n.ID
 		if n.Owner != "" {

@@ -43,6 +43,13 @@ const (
 	PortEventStream  uint16 = 1002
 	PortTaskSubmit   uint16 = 1003
 	PortManagedScore uint16 = 1004
+
+	// PortGossip carries peer-membership gossip frames between daemons
+	// running the fork's gossip discovery layer. Frames travel as
+	// ProtoControl packets on established encrypted tunnels; older
+	// daemons see an unknown control port and silently drop, so
+	// advertising/consuming this port is backward-compatible.
+	PortGossip uint16 = 1005
 )
 
 // Port ranges

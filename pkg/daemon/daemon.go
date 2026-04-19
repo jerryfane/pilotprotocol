@@ -19,6 +19,7 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
 	"github.com/TeoSlayer/pilotprotocol/internal/fsutil"
 	"github.com/TeoSlayer/pilotprotocol/internal/validate"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
 	"github.com/TeoSlayer/pilotprotocol/pkg/policy"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 	"github.com/TeoSlayer/pilotprotocol/pkg/registry"
@@ -227,6 +228,14 @@ type Daemon struct {
 	// Cached member tags: netID -> local node's admin-assigned tags
 	memberTagsMu sync.RWMutex
 	memberTags   map[uint16][]string
+
+	// Gossip plumbing: handler is invoked from handleControlPacket on
+	// each inbound PortGossip payload. Registered by the gossip Engine
+	// at startup, unregistered on Stop. nil means the engine isn't
+	// running — inbound gossip frames are silently dropped (same as
+	// any other unknown control port).
+	gossipMu      sync.Mutex
+	gossipHandler func(srcNode uint32, payload []byte)
 }
 
 const perSourceSYNLimit = 10     // max SYNs per source per second
@@ -1886,7 +1895,8 @@ func (d *Daemon) handleDatagramPacket(pkt *protocol.Packet) {
 }
 
 func (d *Daemon) handleControlPacket(pkt *protocol.Packet) {
-	if pkt.DstPort == protocol.PortPing {
+	switch pkt.DstPort {
+	case protocol.PortPing:
 		// Ping request — send pong back
 		pong := &protocol.Packet{
 			Version:  protocol.Version,
@@ -1901,7 +1911,47 @@ func (d *Daemon) handleControlPacket(pkt *protocol.Packet) {
 			Payload:  pkt.Payload,
 		}
 		d.tunnels.Send(pkt.Src.Node, pong)
+	case protocol.PortGossip:
+		// Gossip frame — hand to the registered engine handler.
+		// Silent drop if no engine is wired (mirrors how unknown
+		// control ports are silently ignored on legacy daemons).
+		d.gossipMu.Lock()
+		h := d.gossipHandler
+		d.gossipMu.Unlock()
+		if h != nil {
+			h(pkt.Src.Node, pkt.Payload)
+		}
 	}
+}
+
+// SetGossipHandler registers a function that receives gossip control
+// payloads as they arrive. The handler is invoked synchronously on
+// the dispatch goroutine — it should be fast, typically just
+// enqueueing to the gossip Engine's input channel. Pass nil to
+// unregister (e.g. when shutting down the engine).
+func (d *Daemon) SetGossipHandler(h func(srcNode uint32, payload []byte)) {
+	d.gossipMu.Lock()
+	d.gossipHandler = h
+	d.gossipMu.Unlock()
+}
+
+// SendGossipFrame wraps a gossip payload in a ProtoControl packet on
+// PortGossip and dispatches it via the usual encrypted tunnel path.
+// The caller is responsible for knowing the peer supports gossip
+// (see TunnelManager.PeerCaps). Returns the error from the
+// underlying Send, if any.
+func (d *Daemon) SendGossipFrame(dstNode uint32, payload []byte) error {
+	pkt := &protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    0,
+		Protocol: protocol.ProtoControl,
+		Src:      protocol.Addr{Network: 0, Node: d.NodeID()},
+		Dst:      protocol.Addr{Network: 0, Node: dstNode},
+		SrcPort:  protocol.PortGossip,
+		DstPort:  protocol.PortGossip,
+		Payload:  payload,
+	}
+	return d.tunnels.Send(dstNode, pkt)
 }
 
 func (d *Daemon) sendRST(orig *protocol.Packet) {
@@ -2687,14 +2737,49 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	// meaningful when our daemon has a TCPTransport registered; the
 	// tunnel manager still stores the endpoint either way, letting a
 	// UDP-only daemon join multi-transport peers without changes.
-	for _, ep := range registry.EndpointsFromResponse(resp) {
+	endpoints := registry.EndpointsFromResponse(resp)
+	for _, ep := range endpoints {
 		if ep.Network == "tcp" && ep.Addr != "" {
 			if err := d.tunnels.AddPeerTCPEndpoint(nodeID, ep.Addr); err != nil {
 				slog.Debug("ignoring tcp endpoint", "node_id", nodeID, "addr", ep.Addr, "error", err)
 			}
 		}
 	}
+
+	// Mirror the resolved peer into the gossip membership view as a
+	// registry-sourced entry. Registry-sourced entries are not
+	// forwarded over gossip (no authoritative signature), but they
+	// prime the view for the Phase D tick loop and for offline
+	// fallback when the registry is later unreachable.
+	d.populateGossipViewFromResolve(nodeID, resp, realAddr, endpoints)
 	return nil
+}
+
+// populateGossipViewFromResolve best-effort-mirrors a registry resolve
+// response into the gossip membership view. Missing fields are OK:
+// the view entry is marked SourceRegistry so it won't be forwarded,
+// and the gossip Engine will overwrite it with a self-signed record
+// the first time the peer gossips.
+func (d *Daemon) populateGossipViewFromResolve(nodeID uint32, resp map[string]interface{}, realAddr string, endpoints []registry.NodeEndpoint) {
+	view := d.tunnels.GossipView()
+	if view == nil {
+		return
+	}
+	rec := &gossip.GossipRecord{
+		NodeID:    nodeID,
+		RealAddr:  realAddr,
+		Endpoints: endpoints,
+		LastSeen:  time.Now().Unix(),
+	}
+	if hn, ok := resp["hostname"].(string); ok {
+		rec.Hostname = hn
+	}
+	if pk, ok := resp["public_key"].(string); ok && pk != "" {
+		if b, err := crypto.DecodePublicKey(pk); err == nil {
+			rec.PublicKey = b
+		}
+	}
+	view.ReplaceFromRegistry(rec)
 }
 
 // advertisedTCPEndpoint returns the public TCP endpoint to advertise

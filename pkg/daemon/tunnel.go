@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
@@ -126,6 +127,17 @@ type TunnelManager struct {
 	peerPubKeys map[uint32]ed25519.PublicKey            // node_id → Ed25519 pubkey (from registry)
 	verifyFunc  func(uint32) (ed25519.PublicKey, error) // callback to fetch peer pubkey
 
+	// Per-peer capability bitmap, learned from the trailing varint
+	// appended to authenticated key-exchange (PILA) frames. Older
+	// daemons don't append anything; for them caps stays 0 and the
+	// engine will skip sending them gossip frames. See gossip.CapGossip
+	// for bit definitions.
+	peerCaps map[uint32]uint64
+	// Our own capability bitmap, appended to outbound PILA frames so
+	// peers can learn that we support gossip. Zero when the daemon
+	// hasn't opted in (e.g. during tests, or pre-engine bootstrap).
+	localCaps uint64
+
 	// Pending sends waiting for key exchange to complete
 	pendMu  sync.Mutex
 	pending map[uint32][][]byte // node_id → queued frames
@@ -139,6 +151,13 @@ type TunnelManager struct {
 	// connections so that ACKs dropped during the key swap don't trip dead-peer
 	// detection.
 	rekeyCallback func(uint32)
+
+	// Gossip: the additive peer-discovery layer's membership view.
+	// Populated as a side-effect of registry lookups (registry-sourced
+	// entries) and, once the gossip Engine is wired in (Phase C+D),
+	// by inbound gossip frames. Phase B leaves this unused by the
+	// dial path; only the populate-side plumbing lands here.
+	gossipView *gossip.MembershipView
 
 	// Webhook
 	webhook *WebhookClient
@@ -179,11 +198,42 @@ func NewTunnelManager() *TunnelManager {
 		peerConns:   make(map[uint32]transport.DialedConn),
 		crypto:      make(map[uint32]*peerCrypto),
 		peerPubKeys: make(map[uint32]ed25519.PublicKey),
+		peerCaps:    make(map[uint32]uint64),
 		pending:     make(map[uint32][][]byte),
 		relayPeers:  make(map[uint32]bool),
 		recvCh:      make(chan *IncomingPacket, RecvChSize),
 		done:        make(chan struct{}),
+		gossipView:  gossip.NewMembershipView(),
 	}
+}
+
+// GossipView returns the membership view backing the gossip overlay.
+// Callers populate it as a side-effect of registry lookups (see
+// daemon.ensureTunnel) and, once the gossip Engine is wired in, as
+// inbound frames arrive. The view is always non-nil.
+func (tm *TunnelManager) GossipView() *gossip.MembershipView {
+	return tm.gossipView
+}
+
+// SetLocalCaps sets the capability bitmap this daemon advertises in
+// its authenticated key-exchange frames. Call before the first
+// outbound PILA is sent (typically at daemon startup, once all
+// features — notably gossip — are wired up). Safe to call multiple
+// times; the new value takes effect on the next outbound PILA.
+func (tm *TunnelManager) SetLocalCaps(caps uint64) {
+	tm.mu.Lock()
+	tm.localCaps = caps
+	tm.mu.Unlock()
+}
+
+// PeerCaps returns the capability bitmap a given peer advertised in
+// its most recent authenticated key-exchange. Returns 0 if we've
+// never authenticated with this peer or if the peer didn't
+// advertise any caps (legacy daemon).
+func (tm *TunnelManager) PeerCaps(nodeID uint32) uint64 {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.peerCaps[nodeID]
 }
 
 // ListenTCP starts an optional TCP listener alongside the UDP tunnel.
@@ -721,6 +771,16 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 	peerEd25519PubKey := ed25519.PublicKey(data[36:68])
 	signature := data[68:132]
 
+	// Optional trailing varint: peer's capability bitmap. Older
+	// daemons don't emit anything after byte 132; for them peerCaps
+	// stays at its zero value and the gossip engine skips the peer.
+	var peerCaps uint64
+	if len(data) > 132 {
+		if c, n := binary.Uvarint(data[132:]); n > 0 {
+			peerCaps = c
+		}
+	}
+
 	if !tm.encrypt || tm.privKey == nil {
 		return
 	}
@@ -781,8 +841,9 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 	if !fromRelay {
 		tm.peers[peerNodeID] = from
 	}
-	// Cache the peer's Ed25519 pubkey
+	// Cache the peer's Ed25519 pubkey and advertised caps bitmap.
 	tm.peerPubKeys[peerNodeID] = peerEd25519PubKey
+	tm.peerCaps[peerNodeID] = peerCaps
 	tm.mu.Unlock()
 
 	if keyChanged {
@@ -1036,9 +1097,23 @@ func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32) {
 
 // buildAuthKeyExchangeFrame builds an authenticated key exchange frame.
 // Returns nil if identity is not available.
+//
+// Frame layout:
+//
+//	[0:4]     PILA magic
+//	[4:8]     our node ID (BE uint32)
+//	[8:40]    our X25519 pubkey (32B)
+//	[40:72]   our Ed25519 pubkey (32B)
+//	[72:136]  signature over "auth" || nodeID || X25519pub
+//	[136:]    OPTIONAL varint capability bitmap (see gossip.CapGossip)
+//
+// Older daemons truncate at byte 136 and never read the trailing
+// varint, preserving backward compatibility; newer daemons read the
+// remainder as Uvarint and treat parse errors / absent bytes as 0.
 func (tm *TunnelManager) buildAuthKeyExchangeFrame() []byte {
 	tm.mu.RLock()
 	id := tm.identity
+	caps := tm.localCaps
 	tm.mu.RUnlock()
 	if tm.pubKey == nil || id == nil {
 		return nil
@@ -1052,12 +1127,21 @@ func (tm *TunnelManager) buildAuthKeyExchangeFrame() []byte {
 
 	ed25519PubKey := []byte(id.PublicKey)
 
-	frame := make([]byte, 4+4+32+32+64)
+	base := 4 + 4 + 32 + 32 + 64
+	var capsBuf [binary.MaxVarintLen64]byte
+	var capsLen int
+	if caps != 0 {
+		capsLen = binary.PutUvarint(capsBuf[:], caps)
+	}
+	frame := make([]byte, base+capsLen)
 	copy(frame[0:4], protocol.TunnelMagicAuthEx[:])
 	binary.BigEndian.PutUint32(frame[4:8], tm.loadNodeID())
 	copy(frame[8:40], tm.pubKey)
 	copy(frame[40:72], ed25519PubKey)
 	copy(frame[72:136], signature)
+	if capsLen > 0 {
+		copy(frame[136:], capsBuf[:capsLen])
+	}
 	return frame
 }
 
