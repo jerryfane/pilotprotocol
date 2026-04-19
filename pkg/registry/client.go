@@ -207,6 +207,90 @@ func (c *Client) RegisterWithKey(listenAddr, publicKeyB64, owner string, lanAddr
 	return c.Send(msg)
 }
 
+// RegisterWithKeyAndEndpoints registers like RegisterWithKey but also
+// advertises additional transport endpoints (e.g. a TCP endpoint
+// alongside the default UDP real_addr). Pre-multi-transport registry
+// servers silently ignore the "endpoints" field — no signature
+// incompatibility. version may be empty to skip the version field.
+func (c *Client) RegisterWithKeyAndEndpoints(listenAddr, publicKeyB64, owner string, lanAddrs []string, endpoints []NodeEndpoint, version string) (map[string]interface{}, error) {
+	msg := map[string]interface{}{
+		"type":        "register",
+		"listen_addr": listenAddr,
+		"public_key":  publicKeyB64,
+	}
+	if owner != "" {
+		msg["owner"] = owner
+	}
+	if len(lanAddrs) > 0 {
+		msg["lan_addrs"] = lanAddrs
+	}
+	if version != "" {
+		msg["version"] = version
+	}
+	if wire := endpointsToWire(endpoints); wire != nil {
+		msg["endpoints"] = wire
+	}
+	return c.Send(msg)
+}
+
+// endpointsToWire converts []NodeEndpoint to the []map form used on
+// the wire. Returns nil if the input is empty so the field is
+// omitted.
+func endpointsToWire(eps []NodeEndpoint) []map[string]interface{} {
+	if len(eps) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(eps))
+	for _, e := range eps {
+		if e.Network == "" || e.Addr == "" {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"network": e.Network,
+			"addr":    e.Addr,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// EndpointsFromResponse extracts the optional "endpoints" field from
+// a lookup_ok, resolve_ok, or similar response map. Returns nil if
+// the field is absent or malformed — callers should fall back to
+// real_addr + assumed "udp" transport in that case.
+func EndpointsFromResponse(resp map[string]interface{}) []NodeEndpoint {
+	if resp == nil {
+		return nil
+	}
+	raw, ok := resp["endpoints"]
+	if !ok {
+		return nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok || len(arr) == 0 {
+		return nil
+	}
+	out := make([]NodeEndpoint, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		network, _ := m["network"].(string)
+		addr, _ := m["addr"].(string)
+		if network == "" || addr == "" {
+			continue
+		}
+		out = append(out, NodeEndpoint{Network: network, Addr: addr})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // RotateKey requests a key rotation for a node.
 // Requires a signature proving ownership of the current key and the new public key.
 func (c *Client) RotateKey(nodeID uint32, signatureB64, newPubKeyB64 string) (map[string]interface{}, error) {

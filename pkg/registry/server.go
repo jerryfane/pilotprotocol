@@ -546,11 +546,25 @@ type KeyInfo struct {
 	ExpiresAt   time.Time `json:"expires_at,omitempty"` // zero = no expiry
 }
 
+// NodeEndpoint is one "network + address" pair advertised by a node.
+// Multiple endpoints let a node expose the same identity over
+// different transports (e.g. UDP on 37736 plus TCP on 443 for peers
+// behind UDP-hostile networks). RealAddr on NodeInfo carries the
+// legacy UDP endpoint for backward compatibility with pre-multi-
+// transport clients; NodeEndpoint is the forward-looking form.
+type NodeEndpoint struct {
+	// Network is the transport identifier: "udp", "tcp", "quic", ...
+	Network string `json:"network"`
+	// Addr is the "host:port" form understood by that transport.
+	Addr string `json:"addr"`
+}
+
 type NodeInfo struct {
 	ID         uint32
 	Owner      string // email or identifier (for key rotation)
 	PublicKey  []byte
 	RealAddr   string
+	Endpoints  []NodeEndpoint // optional: multi-transport endpoints (empty → UDP-only client)
 	Networks   []uint16
 	LastSeen   time.Time // used during registration (under s.mu.Lock); heartbeat uses lastSeenNano
 	Public     bool      // if true, endpoint is visible in lookup/list_nodes
@@ -1881,6 +1895,12 @@ func (s *Server) handleRegister(msg map[string]interface{}, remoteAddr string) (
 		}
 	}
 
+	// Optional multi-transport endpoints (new in the jerryfane fork).
+	// Older clients that only speak UDP do not send this field; their
+	// registration works unchanged. Clients that do send it expose
+	// alternative transports for peers behind UDP-hostile networks.
+	endpoints := parseEndpoints(msg["endpoints"])
+
 	// Registration requires a client-generated public key
 	pubKeyB64, ok := msg["public_key"].(string)
 	if !ok || pubKeyB64 == "" {
@@ -1891,7 +1911,7 @@ func (s *Server) handleRegister(msg map[string]interface{}, remoteAddr string) (
 	if hostname != "" {
 		if err := validateHostname(hostname); err != nil {
 			// Register without hostname, return warning
-			resp, regErr := s.handleReRegister(pubKeyB64, listenAddr, owner, "", lanAddrs, clientVersion)
+			resp, regErr := s.handleReRegister(pubKeyB64, listenAddr, owner, "", lanAddrs, clientVersion, endpoints)
 			if regErr != nil {
 				return resp, regErr
 			}
@@ -1905,7 +1925,7 @@ func (s *Server) handleRegister(msg map[string]interface{}, remoteAddr string) (
 
 	// M3 fix: pass hostname into handleReRegister so registration + hostname
 	// are set atomically under a single lock acquisition.
-	resp, err := s.handleReRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, clientVersion)
+	resp, err := s.handleReRegister(pubKeyB64, listenAddr, owner, hostname, lanAddrs, clientVersion, endpoints)
 	if err == nil {
 		s.metrics.registrations.Inc()
 		resp["observed_addr"] = listenAddr
@@ -2654,7 +2674,7 @@ func (s *Server) setNodeHostname(node *NodeInfo, hostname string, resp map[strin
 // handleReRegister handles a node presenting an existing public key.
 // Returns the same node_id if the key is known, or assigns a new one.
 // M3 fix: hostname is set atomically under the same lock as registration.
-func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string, lanAddrs []string, version string) (map[string]interface{}, error) {
+func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string, lanAddrs []string, version string, endpoints []NodeEndpoint) (map[string]interface{}, error) {
 	pubKey, err := crypto.DecodePublicKey(pubKeyB64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid public key: %w", err)
@@ -2668,6 +2688,7 @@ func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 		if node, exists := s.nodes[nodeID]; exists {
 			// Node is still alive — update endpoint, reset heartbeat
 			node.RealAddr = listenAddr
+			node.Endpoints = endpoints
 			node.setLastSeen(time.Now())
 			node.LANAddrs = lanAddrs
 			if version != "" {
@@ -2713,6 +2734,7 @@ func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 			Owner:     owner,
 			PublicKey: pubKey,
 			RealAddr:  listenAddr,
+			Endpoints: endpoints,
 			Networks:  networks,
 			LastSeen:  now,
 			LANAddrs:  lanAddrs,
@@ -2760,6 +2782,7 @@ func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 				delete(s.pubKeyIdx, oldPubKeyB64)
 				existingNode.PublicKey = pubKey
 				existingNode.RealAddr = listenAddr
+				existingNode.Endpoints = endpoints
 				existingNode.setLastSeen(time.Now())
 				existingNode.LANAddrs = lanAddrs
 				if version != "" {
@@ -2790,6 +2813,7 @@ func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 				Owner:     owner,
 				PublicKey: pubKey,
 				RealAddr:  listenAddr,
+				Endpoints: endpoints,
 				Networks:  []uint16{0},
 				LastSeen:  now,
 				LANAddrs:  lanAddrs,
@@ -2837,6 +2861,7 @@ func (s *Server) handleReRegister(pubKeyB64, listenAddr, owner, hostname string,
 		Owner:     owner,
 		PublicKey: pubKey,
 		RealAddr:  listenAddr,
+		Endpoints: endpoints,
 		Networks:  []uint16{0},
 		LastSeen:  now,
 		LANAddrs:  lanAddrs,
@@ -3404,6 +3429,11 @@ func (s *Server) handleLookup(msg map[string]interface{}) (map[string]interface{
 	}
 	if node.Public {
 		resp["real_addr"] = node.RealAddr
+		// Advertise multi-transport endpoints only for public nodes,
+		// mirroring the existing real_addr visibility rule.
+		if eps := endpointsForResp(node.Endpoints); eps != nil {
+			resp["endpoints"] = eps
+		}
 	}
 	if node.ExternalID != "" {
 		resp["external_id"] = node.ExternalID
@@ -3412,6 +3442,61 @@ func (s *Server) handleLookup(msg map[string]interface{}) (map[string]interface{
 		resp["version"] = node.Version
 	}
 	return resp, nil
+}
+
+// parseEndpoints converts the JSON form of the optional "endpoints"
+// array into the typed []NodeEndpoint slice stored on NodeInfo. The
+// wire form is `[{"network":"udp","addr":"host:port"}, ...]`. Unknown
+// keys are silently ignored; malformed entries are dropped so a
+// client with partial data still registers successfully.
+//
+// Returns nil if the value is missing or not a JSON array. The
+// registry treats nil and empty-slice identically — "no multi-
+// transport endpoints advertised."
+func parseEndpoints(raw interface{}) []NodeEndpoint {
+	if raw == nil {
+		return nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok || len(arr) == 0 {
+		return nil
+	}
+	out := make([]NodeEndpoint, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		network, _ := m["network"].(string)
+		addr, _ := m["addr"].(string)
+		if network == "" || addr == "" {
+			continue
+		}
+		out = append(out, NodeEndpoint{Network: network, Addr: addr})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// endpointsForResp converts []NodeEndpoint back to the JSON wire
+// form for inclusion in lookup/resolve responses. Returns nil if
+// the slice is empty so the field is omitted from the response map
+// entirely, preserving byte-for-byte compatibility with pre-multi-
+// transport clients.
+func endpointsForResp(eps []NodeEndpoint) []map[string]interface{} {
+	if len(eps) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(eps))
+	for _, e := range eps {
+		out = append(out, map[string]interface{}{
+			"network": e.Network,
+			"addr":    e.Addr,
+		})
+	}
+	return out
 }
 
 // trustPairKey returns a canonical key for a trust pair (always sorted).
@@ -3502,6 +3587,12 @@ func (s *Server) handleResolve(msg map[string]interface{}) (map[string]interface
 		"type":      "resolve_ok",
 		"node_id":   node.ID,
 		"real_addr": node.RealAddr,
+	}
+	// Multi-transport endpoints, if the peer registered any. Older
+	// clients treat this field as unknown/unparseable and ignore it —
+	// they still get real_addr exactly as before.
+	if eps := endpointsForResp(node.Endpoints); eps != nil {
+		resp["endpoints"] = eps
 	}
 	if len(node.LANAddrs) > 0 {
 		resp["lan_addrs"] = node.LANAddrs
