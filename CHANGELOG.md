@@ -10,6 +10,26 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.3] - 2026-04-19
+
+### Fixed
+- Tunnel auto-recovery after one-sided daemon restart. When peer A
+  restarts and loses its per-peer X25519 keys, peer B retains stale
+  session keys derived from A's previous X25519 pubkey and keeps
+  sending encrypted traffic that A can no longer decrypt. Prior to
+  this fix, A would silently log `encrypted packet from node but
+  no key` indefinitely and never recover — B's side never observed
+  the mismatch because its own keepalive ACKs appeared to succeed
+  at the tunnel level. Observed live on the three-node canary
+  during the v1.9.0-jf.2 upgrade: after VPS restarted, both Phobos
+  and laptop stayed in the stale-crypto limbo until their daemons
+  were manually restarted. Fixed by emitting an unsolicited PILA
+  to the observed source address on every decrypt failure caused
+  by a missing crypto state, rate-limited to once per 60 s per
+  peer to bound reflection/amplification abuse. Recovery is now
+  automatic and typically completes within ~200-300 ms of the
+  peer's next keepalive.
+
 ## [v1.9.0-jf.2] - 2026-04-19
 
 ### Fixed
