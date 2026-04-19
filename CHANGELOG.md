@@ -10,6 +10,28 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.2] - 2026-04-19
+
+### Fixed
+- Cached peer endpoint (`TunnelManager.peers[nodeID]`) was only
+  refreshed during PILA/PILK key exchanges. On networks where the
+  peer's NAT rotates source ports between rekeys (observed live on
+  a UAE CGN ISP), VPS-initiated frames went to the stale UDP
+  address and were silently dropped by the NAT, while the peer's
+  own keepalives kept the tunnel looking alive. Manifested as
+  "dial timeout" on outbound stream SYNs even though
+  `pilotctl peers` reported the peer as encrypted + authenticated.
+  Fixed by refreshing the cached endpoint inside `handleEncrypted`
+  after a successful decrypt, guarded by an RLock pre-check so
+  data-plane packets don't churn the write lock when the cache is
+  already current.
+- `install.sh` now re-signs binaries with the host's ad-hoc codesign
+  identity and clears `com.apple.quarantine` xattrs on macOS. Under
+  macOS 26.2 Tahoe, Gatekeeper stalls interactively-launched
+  cross-compiled Go binaries at `_dyld_start` (before the Go
+  runtime runs), which manifested as `pilotctl info` hanging
+  indefinitely on Apple Silicon laptops. No-op on Linux.
+
 ## [v1.9.0-jf.1] - 2026-04-19
 
 ### Added

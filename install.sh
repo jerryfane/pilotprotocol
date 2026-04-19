@@ -205,6 +205,24 @@ fi
 chmod 755 "$BIN_DIR/pilot-daemon" "$BIN_DIR/pilotctl" "$BIN_DIR/pilot-gateway"
 [ -f "$BIN_DIR/pilot-updater" ] && chmod 755 "$BIN_DIR/pilot-updater"
 
+# --- macOS: re-sign with ad-hoc identity and clear quarantine xattrs ---
+#
+# macOS 26.2 Tahoe's Gatekeeper stalls interactively-launched ad-hoc-signed
+# binaries at _dyld_start (before the Go runtime even runs), which
+# manifests as pilotctl commands hanging indefinitely. Cross-compiled
+# Go binaries inherit an upstream ad-hoc signature that Tahoe's Gatekeeper
+# is suspicious of. Re-signing locally with the host's ad-hoc identity
+# and clearing com.apple.quarantine xattrs fixes it. Earlier macOS versions
+# and all Linux targets are unaffected — this block is a no-op there.
+if [ "$OS" = "darwin" ]; then
+    for bin in pilot-daemon pilotctl pilot-gateway pilot-updater; do
+        if [ -f "$BIN_DIR/$bin" ]; then
+            codesign --force --sign - "$BIN_DIR/$bin" 2>/dev/null || true
+        fi
+    done
+    xattr -cr "$BIN_DIR" 2>/dev/null || true
+fi
+
 # --- Symlink to /usr/local/bin if writable, otherwise skip ---
 
 LINK_DIR="/usr/local/bin"

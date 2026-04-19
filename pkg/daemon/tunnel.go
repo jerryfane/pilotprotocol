@@ -1040,6 +1040,31 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr) {
 
 	atomic.AddUint64(&tm.PktsRecv, 1)
 	atomic.AddUint64(&tm.BytesRecv, uint64(len(data)+4)) // +4 for PILS magic
+
+	// Refresh the cached peer endpoint if the inbound source has
+	// drifted. CGN-style NATs (observed live on a UAE ISP) rotate
+	// source ports aggressively between rekeys; without this refresh,
+	// the tunnel stays alive from the peer's keepalive side but any
+	// VPS-initiated packet (e.g. stream SYN on an Entmoot port) goes
+	// to the stale mapping and is silently dropped — manifesting as
+	// "dial timeout" even though `pilotctl peers` shows the peer as
+	// encrypted + authenticated. Two-phase RLock→Lock so data-plane
+	// packets don't churn the write lock when the cache is correct.
+	if from != nil {
+		tm.mu.RLock()
+		cur := tm.peers[peerNodeID]
+		stale := cur == nil || cur.Port != from.Port || !cur.IP.Equal(from.IP)
+		tm.mu.RUnlock()
+		if stale {
+			tm.mu.Lock()
+			cur2 := tm.peers[peerNodeID]
+			if cur2 == nil || cur2.Port != from.Port || !cur2.IP.Equal(from.IP) {
+				tm.peers[peerNodeID] = from
+			}
+			tm.mu.Unlock()
+		}
+	}
+
 	select {
 	case tm.recvCh <- &IncomingPacket{Packet: pkt, From: from}:
 	case <-tm.done:
