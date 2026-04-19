@@ -1,13 +1,18 @@
 #!/bin/sh
 set -e
 
-# Pilot Protocol installer
+# Pilot Protocol installer — jerryfane fork
 # Usage:
-#   Install:    curl -fsSL https://pilotprotocol.network/install.sh | sh
-#   RC build:   PILOT_RC=1 curl -fsSL https://pilotprotocol.network/install.sh | sh
-#   Uninstall:  curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall
+#   Install:    curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh
+#   RC build:   PILOT_RC=1 curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh
+#   Uninstall:  curl -fsSL https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh | sh -s uninstall
+#
+# This is a fork of github.com/TeoSlayer/pilotprotocol with client-side
+# reliability patches for NAT traversal, keepalive behaviour on rekey, and
+# visibility persistence. See CHANGELOG.md for the full list. Use this
+# installer (not pilotprotocol.network) so you get the patched binaries.
 
-REPO="TeoSlayer/pilotprotocol"
+REPO="jerryfane/pilotprotocol"
 REGISTRY="34.71.57.205:9000"
 BEACON="34.71.57.205:9001"
 PILOT_DIR="$HOME/.pilot"

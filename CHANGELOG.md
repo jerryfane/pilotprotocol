@@ -10,6 +10,12 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+### Changed
+- `install.sh` now pulls from `jerryfane/pilotprotocol` releases and source
+  instead of `TeoSlayer/pilotprotocol`. Header URLs updated to
+  `https://raw.githubusercontent.com/jerryfane/pilotprotocol/main/install.sh`
+  so SKILL-documented installs land the patched binaries by default.
+
 ### Added
 - `beaconKeepaliveLoop` running on an independent 25 s ticker
   (`DefaultBeaconKeepaliveInterval`), separate from the 60 s registry
