@@ -1198,6 +1198,18 @@ func cmdDaemonStart(args []string) {
 		}
 	}
 	listenAddr := flagString(flags, "listen", ":0")
+	tcpListen := flagString(flags, "tcp-listen", "")
+	if tcpListen == "" {
+		if v, ok := cfg["tcp_listen"].(string); ok {
+			tcpListen = v
+		}
+	}
+	tcpEndpoint := flagString(flags, "tcp-endpoint", "")
+	if tcpEndpoint == "" {
+		if v, ok := cfg["tcp_endpoint"].(string); ok {
+			tcpEndpoint = v
+		}
+	}
 	hostname := flagString(flags, "hostname", "")
 	if hostname == "" {
 		if h, ok := cfg["hostname"].(string); ok {
@@ -1261,7 +1273,7 @@ func cmdDaemonStart(args []string) {
 	if flagBool(flags, "foreground") {
 		runDaemonForeground(configFile, registryAddr, beaconAddr, listenAddr,
 			socketPath, encrypt, identityPath, email, hostname, logLevel, logFormat, public, webhookURL,
-			adminToken, networks, trustAutoApprove)
+			adminToken, networks, trustAutoApprove, tcpListen, tcpEndpoint)
 		return
 	}
 
@@ -1313,6 +1325,12 @@ func cmdDaemonStart(args []string) {
 	}
 	if trustAutoApprove {
 		daemonArgs = append(daemonArgs, "--trust-auto-approve")
+	}
+	if tcpListen != "" {
+		daemonArgs = append(daemonArgs, "--tcp-listen", tcpListen)
+	}
+	if tcpEndpoint != "" {
+		daemonArgs = append(daemonArgs, "--tcp-endpoint", tcpEndpoint)
 	}
 
 	proc := exec.Command(selfPath, daemonArgs...)
@@ -1558,16 +1576,19 @@ func runDaemonInternal(args []string) {
 	adminToken := flagString(flags, "admin-token", "")
 	networks := flagString(flags, "networks", "")
 	trustAutoApprove := flagBool(flags, "trust-auto-approve")
+	tcpListen := flagString(flags, "tcp-listen", "")
+	tcpEndpoint := flagString(flags, "tcp-endpoint", "")
 
 	runDaemonForeground(configFile, registryAddr, beaconAddr, listenAddr,
 		socketPath, encrypt, identityPath, email, hostname, logLevel, logFormat, public, webhookURL,
-		adminToken, networks, trustAutoApprove)
+		adminToken, networks, trustAutoApprove, tcpListen, tcpEndpoint)
 }
 
 func runDaemonForeground(configFile, registryAddr, beaconAddr, listenAddr,
 	socketPath string, encrypt bool, identityPath, email, hostname,
 	logLevel, logFormat string, public bool, webhookURL string,
-	adminToken, networks string, trustAutoApprove bool) {
+	adminToken, networks string, trustAutoApprove bool,
+	tcpListen, tcpEndpoint string) {
 
 	if configFile != "" {
 		cfg, err := config.Load(configFile)
@@ -1594,6 +1615,8 @@ func runDaemonForeground(configFile, registryAddr, beaconAddr, listenAddr,
 		RegistryAddr:     registryAddr,
 		BeaconAddr:       beaconAddr,
 		ListenAddr:       listenAddr,
+		TCPListenAddr:    tcpListen,
+		TCPEndpoint:      tcpEndpoint,
 		SocketPath:       socketPath,
 		Encrypt:          encrypt,
 		IdentityPath:     identityPath,

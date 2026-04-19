@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -92,17 +93,23 @@ func (pc *peerCrypto) setReplayBit(counter uint64) {
 	pc.replayBitmap[bit/64] |= 1 << (bit % 64)
 }
 
-// TunnelManager manages tunnels to peer daemons. Today the tunnel
-// bytes travel over UDP (via the embedded UDPTransport). The design
-// will grow additional transports (TCP, QUIC, …) in later phases; the
-// socket lifecycle lives inside pkg/daemon/transport so TunnelManager
-// does not reach for *net.UDPConn directly.
+// TunnelManager manages tunnels to peer daemons. Bytes travel over
+// one of several pluggable transports (UDP today, TCP as an optional
+// fallback for UDP-hostile networks, QUIC/WebSocket/… in the future).
+// The socket lifecycle for each transport lives inside
+// pkg/daemon/transport; TunnelManager picks which transport to use
+// for each peer based on the advertised endpoints and a preference
+// order.
 type TunnelManager struct {
-	mu        sync.RWMutex
-	udp       *transport.UDPTransport         // owns the UDP socket; nil before Listen
-	inbound   chan transport.InboundFrame     // sink every transport writes to; dispatchLoop reads
-	peers     map[uint32]*net.UDPAddr         // node_id → real UDP endpoint (still UDP-only in Phase 1b)
-	crypto    map[uint32]*peerCrypto          // node_id → encryption state
+	mu      sync.RWMutex
+	udp     *transport.UDPTransport     // owns the UDP socket; nil before Listen
+	tcp     *transport.TCPTransport     // optional TCP fallback; nil when `-tcp-listen` is not set
+	inbound chan transport.InboundFrame // sink every transport writes to; dispatchLoop reads
+
+	peers     map[uint32]*net.UDPAddr            // node_id → real UDP endpoint (primary / legacy)
+	peerTCP   map[uint32]*transport.TCPEndpoint  // node_id → TCP endpoint, populated from registry lookup when advertised
+	peerConns map[uint32]transport.DialedConn    // node_id → cached DialedConn (whichever transport won the last Dial)
+	crypto    map[uint32]*peerCrypto             // node_id → encryption state
 	recvCh    chan *IncomingPacket
 	done      chan struct{}  // closed on Close() to stop dispatchLoop
 	readWg    sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
@@ -168,6 +175,8 @@ func NewTunnelManager() *TunnelManager {
 		udp:         transport.NewUDPTransport(),
 		inbound:     make(chan transport.InboundFrame, RecvChSize),
 		peers:       make(map[uint32]*net.UDPAddr),
+		peerTCP:     make(map[uint32]*transport.TCPEndpoint),
+		peerConns:   make(map[uint32]transport.DialedConn),
 		crypto:      make(map[uint32]*peerCrypto),
 		peerPubKeys: make(map[uint32]ed25519.PublicKey),
 		pending:     make(map[uint32][][]byte),
@@ -175,6 +184,59 @@ func NewTunnelManager() *TunnelManager {
 		recvCh:      make(chan *IncomingPacket, RecvChSize),
 		done:        make(chan struct{}),
 	}
+}
+
+// ListenTCP starts an optional TCP listener alongside the UDP tunnel.
+// When configured, peers that advertise a TCP endpoint (via the
+// registry's multi-transport endpoints list) can be reached over TCP
+// when direct UDP dial fails. The TCP listener delivers inbound
+// frames to the same dispatchLoop as UDP — Pilot's wire format is
+// transport-agnostic.
+func (tm *TunnelManager) ListenTCP(addr string) error {
+	if tm.tcp != nil {
+		return fmt.Errorf("tcp transport already listening")
+	}
+	tm.tcp = transport.NewTCPTransport()
+	if err := tm.tcp.Listen(addr, tm.inbound); err != nil {
+		tm.tcp = nil
+		return err
+	}
+	slog.Info("tcp transport listening", "addr", tm.tcp.LocalAddr())
+	return nil
+}
+
+// TCPLocalAddr returns the bound TCP address, or nil if TCP is not
+// enabled. Used by daemon code that wants to advertise the TCP
+// endpoint in its registry registration.
+func (tm *TunnelManager) TCPLocalAddr() net.Addr {
+	if tm.tcp == nil {
+		return nil
+	}
+	return tm.tcp.LocalAddr()
+}
+
+// AddPeerTCPEndpoint records an advertised TCP endpoint for a peer so
+// subsequent sends can fall back to TCP when direct UDP fails. Call
+// this from the registry-lookup path when parsing a multi-transport
+// endpoint list.
+func (tm *TunnelManager) AddPeerTCPEndpoint(nodeID uint32, addr string) error {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("resolve tcp %q: %w", addr, err)
+	}
+	tm.mu.Lock()
+	tm.peerTCP[nodeID] = transport.NewTCPEndpoint(tcpAddr)
+	tm.mu.Unlock()
+	return nil
+}
+
+// HasTCPEndpoint reports whether we've recorded a TCP endpoint for
+// the given peer.
+func (tm *TunnelManager) HasTCPEndpoint(nodeID uint32) bool {
+	tm.mu.RLock()
+	_, ok := tm.peerTCP[nodeID]
+	tm.mu.RUnlock()
+	return ok
 }
 
 // SetWebhook configures the webhook client for event notifications.
@@ -313,11 +375,22 @@ func (tm *TunnelManager) RequestHolePunch(targetNodeID uint32) {
 	}
 }
 
-// writeFrame sends a raw frame to a peer, using relay through the beacon if needed.
+// writeFrame sends a raw frame to a peer. Route selection in order:
+//  1. Beacon relay if the peer is marked for relay (UDP-only).
+//  2. A cached non-UDP DialedConn (e.g. TCP fallback installed by
+//     DialTCPForPeer). Lets a peer stick to TCP once we've chosen it.
+//  3. Direct UDP write to the provided addr (today's default path).
+//
+// TCP fallback is a deliberate step: the caller decides when to
+// switch a peer to TCP (typically after direct UDP SYN retries
+// exhaust in DialConnection). Once switched, writeFrame keeps using
+// the cached TCP conn until it dies, at which point the cache is
+// cleared and the next writeFrame falls back to UDP.
 func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []byte) error {
 	tm.mu.RLock()
 	relay := tm.relayPeers[nodeID]
 	bAddr := tm.beaconAddr
+	cachedConn := tm.peerConns[nodeID]
 	tm.mu.RUnlock()
 
 	if relay && bAddr != nil {
@@ -335,6 +408,31 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 		return err
 	}
 
+	// Phase 4: if a cached non-UDP conn exists for this peer, use it
+	// first. The cache is populated by DialTCPForPeer (called from the
+	// daemon's dial-failure path). UDP conns are not cached here —
+	// they're effectively free to re-issue via WriteToUDPAddr.
+	if cachedConn != nil && cachedConn.RemoteEndpoint().Network() != "udp" {
+		if err := cachedConn.Send(frame); err == nil {
+			atomic.AddUint64(&tm.PktsSent, 1)
+			atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+			return nil
+		} else {
+			// Cached conn is dead (e.g. peer closed TCP). Drop it so the
+			// next sender can re-dial, and fall through to UDP.
+			tm.mu.Lock()
+			if tm.peerConns[nodeID] == cachedConn {
+				delete(tm.peerConns, nodeID)
+				_ = cachedConn.Close()
+			}
+			tm.mu.Unlock()
+			slog.Debug("cached peer conn failed, falling back",
+				"node_id", nodeID,
+				"network", cachedConn.RemoteEndpoint().Network(),
+				"error", err)
+		}
+	}
+
 	if addr == nil {
 		return fmt.Errorf("no address for node %d", nodeID)
 	}
@@ -344,6 +442,59 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 		atomic.AddUint64(&tm.BytesSent, uint64(n))
 	}
 	return err
+}
+
+// DialTCPForPeer establishes (or reuses) a TCP connection to the peer
+// and caches it so subsequent writeFrame calls for that peer route
+// via TCP. Called from the daemon's fall-back path when direct UDP
+// SYN retries exhaust but a TCP endpoint is known. Returns an error
+// if TCP is not configured on this TunnelManager, no TCP endpoint is
+// known for the peer, or the dial itself fails.
+func (tm *TunnelManager) DialTCPForPeer(ctx context.Context, nodeID uint32) error {
+	tm.mu.RLock()
+	t := tm.tcp
+	ep := tm.peerTCP[nodeID]
+	tm.mu.RUnlock()
+
+	if t == nil {
+		return fmt.Errorf("tcp transport not enabled")
+	}
+	if ep == nil {
+		return fmt.Errorf("no tcp endpoint known for node %d", nodeID)
+	}
+	conn, err := t.Dial(ctx, ep)
+	if err != nil {
+		return fmt.Errorf("tcp dial node %d: %w", nodeID, err)
+	}
+
+	tm.mu.Lock()
+	// If another goroutine already cached a conn, prefer its. Close ours
+	// to avoid leaking sockets.
+	if existing, ok := tm.peerConns[nodeID]; ok {
+		tm.mu.Unlock()
+		_ = conn.Close()
+		_ = existing // keep existing reference live for clarity
+		return nil
+	}
+	tm.peerConns[nodeID] = conn
+	tm.mu.Unlock()
+	slog.Info("peer switched to tcp", "node_id", nodeID, "remote", ep.String())
+	return nil
+}
+
+// ClearCachedConn drops any cached DialedConn for a peer. Called when
+// the daemon observes fresh UDP activity from a peer that was
+// previously on TCP, so the peer can fall back to UDP.
+func (tm *TunnelManager) ClearCachedConn(nodeID uint32) {
+	tm.mu.Lock()
+	conn, ok := tm.peerConns[nodeID]
+	if ok {
+		delete(tm.peerConns, nodeID)
+	}
+	tm.mu.Unlock()
+	if ok && conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // getPeerPubKey returns the cached Ed25519 public key for a peer, fetching from
@@ -394,6 +545,14 @@ func (tm *TunnelManager) Close() error {
 			connErr = tm.udp.Close() // causes the UDP transport's readLoop to return;
 			// the sink channel is drained by dispatchLoop until done fires.
 		}
+		if tm.tcp != nil {
+			// Close TCP last so dispatchLoop has drained whatever UDP
+			// produced first. tcp.Close tears down all pooled dialled
+			// conns + the listener and waits for its goroutines.
+			if tcpErr := tm.tcp.Close(); tcpErr != nil && connErr == nil {
+				connErr = tcpErr
+			}
+		}
 		tm.readWg.Wait() // wait for dispatchLoop to fully exit before closing recvCh
 		close(tm.recvCh) // unblock routeLoop (H5 fix — prevents goroutine leak)
 	})
@@ -405,6 +564,23 @@ func (tm *TunnelManager) LocalAddr() net.Addr {
 		return nil
 	}
 	return tm.udp.LocalAddr()
+}
+
+// extractFrameNodeID pulls the peer's nodeID out of the first 4 bytes
+// of a Pilot tunnel frame's payload (the bytes immediately after the
+// 4-byte magic). Works for PILA/PILK/PILS which all place
+// [magic(4)][nodeID(4)][...] at the front; returns false for beacon
+// messages, plaintext packets, or anything else where the nodeID
+// isn't at that offset.
+func extractFrameNodeID(frame []byte) (uint32, bool) {
+	if len(frame) < 8 {
+		return 0, false
+	}
+	switch [4]byte{frame[0], frame[1], frame[2], frame[3]} {
+	case protocol.TunnelMagicAuthEx, protocol.TunnelMagicKeyEx, protocol.TunnelMagicSecure:
+		return binary.BigEndian.Uint32(frame[4:8]), true
+	}
+	return 0, false
 }
 
 // dispatchLoop consumes InboundFrames produced by any registered
@@ -427,25 +603,51 @@ func (tm *TunnelManager) dispatchLoop() {
 			if !ok {
 				return
 			}
-			udpEP, ok := inbound.From.(*transport.UDPEndpoint)
-			if !ok {
-				slog.Warn("tunnel dispatch: unknown endpoint type",
-					"network", inbound.From.Network(),
-					"addr", inbound.From.String())
-				continue
-			}
-			remote := udpEP.Addr()
 			buf := inbound.Frame
 			n := len(buf)
-
 			if n < 1 {
 				continue
+			}
+
+			// Unwrap the concrete UDP address for handlers that still
+			// take *net.UDPAddr. For non-UDP frames (TCP/QUIC/…) we pass
+			// nil — handlers that use `from` for peer-address learning
+			// just skip that update for non-UDP, and TCP peers are
+			// tracked via peerConns (cached Reply channel) instead.
+			var remote *net.UDPAddr
+			if udpEP, ok := inbound.From.(*transport.UDPEndpoint); ok {
+				remote = udpEP.Addr()
+			}
+
+			// Phase 4: for frames that carry a peer nodeID and arrive
+			// on a connection-oriented transport (TCP), cache the Reply
+			// conn so writeFrame can route subsequent sends back through
+			// the same connection. This is essential for NAT'd peers
+			// that dialled us inbound — they have no separately-
+			// listenable endpoint we could Dial to, so replies must
+			// flow through the accepted socket.
+			if inbound.Reply != nil && inbound.Reply.RemoteEndpoint().Network() != "udp" {
+				if pid, ok := extractFrameNodeID(buf); ok {
+					tm.mu.Lock()
+					if existing, exists := tm.peerConns[pid]; !exists || existing == nil {
+						tm.peerConns[pid] = inbound.Reply
+					} else if existing.RemoteEndpoint().String() != inbound.Reply.RemoteEndpoint().String() {
+						// Peer reconnected on a different remote address (e.g. NAT
+						// mapping shifted) — prefer the newer conn. Don't close
+						// the old: the readerLoop will eventually hit EOF and
+						// clean it up.
+						tm.peerConns[pid] = inbound.Reply
+					}
+					tm.mu.Unlock()
+				}
 			}
 
 			// Beacon messages use single-byte type codes < 0x10.
 			// All tunnel magic starts with 'P' (0x50), so no collision.
 			if buf[0] < 0x10 {
-				tm.handleBeaconMessage(buf[:n], remote)
+				if remote != nil {
+					tm.handleBeaconMessage(buf[:n], remote)
+				}
 				continue
 			}
 
@@ -473,7 +675,7 @@ func (tm *TunnelManager) dispatchLoop() {
 
 			case protocol.TunnelMagicPunch:
 				// NAT punch packet — expected during hole-punching, silently acknowledged
-				slog.Debug("NAT punch received", "from", remote)
+				slog.Debug("NAT punch received", "from", inbound.From)
 				continue
 
 			case protocol.TunnelMagic:
@@ -486,7 +688,7 @@ func (tm *TunnelManager) dispatchLoop() {
 
 				pkt, err := protocol.Unmarshal(data)
 				if err != nil {
-					slog.Error("tunnel unmarshal error", "remote", remote, "error", err)
+					slog.Error("tunnel unmarshal error", "remote", inbound.From, "error", err)
 					continue
 				}
 

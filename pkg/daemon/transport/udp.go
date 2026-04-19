@@ -146,8 +146,14 @@ func (t *UDPTransport) readLoop() {
 		frame := make([]byte, n)
 		copy(frame, buf[:n])
 
+		fromEP := &UDPEndpoint{addr: remote}
+		// A reply-conn for UDP is trivially free: the shared socket
+		// plus the source address. The caller can stash it and write
+		// back without learning any transport specifics.
+		reply := &udpDialedConn{conn: conn, remote: fromEP}
+
 		select {
-		case t.sink <- InboundFrame{Frame: frame, From: &UDPEndpoint{addr: remote}}:
+		case t.sink <- InboundFrame{Frame: frame, From: fromEP, Reply: reply}:
 		case <-t.done:
 			return
 		}

@@ -83,6 +83,19 @@ type InboundFrame struct {
 	// is the datagram's source address; for TCP it's the remote end of
 	// the accepted connection.
 	From Endpoint
+
+	// Reply is a write-side handle to the specific connection the
+	// frame arrived on. For connection-oriented transports (TCP) this
+	// is the accepted socket — essential because a NAT'd peer that
+	// dialled us inbound has no separately-listenable endpoint we
+	// could Dial back to; replies must flow through the same
+	// connection. For connectionless transports (UDP) it's a trivial
+	// writer pointing at the source address via the shared socket.
+	//
+	// May be nil if a transport's Listen path can't synthesize a reply
+	// channel (e.g. one-way datagram delivery where the source can't
+	// be replied to directly).
+	Reply DialedConn
 }
 
 // DialedConn is a write-side handle to a peer. For UDP it is a thin

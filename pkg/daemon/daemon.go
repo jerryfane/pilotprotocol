@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -43,6 +44,19 @@ type Config struct {
 	Endpoint string // fixed public endpoint (host:port) — skips STUN discovery (for cloud VMs)
 	Public   bool   // make this node's endpoint publicly discoverable
 	Hostname string // hostname for discovery (empty = none)
+
+	// TCPListenAddr enables an optional TCP listener alongside the UDP
+	// tunnel. Peers on UDP-hostile networks (e.g. ISPs that drop
+	// outbound UDP) can dial this TCP endpoint instead. The address is
+	// advertised in registry registration so peers find it via lookup.
+	// Empty value = TCP disabled, UDP-only behaviour identical to
+	// earlier builds.
+	TCPListenAddr string
+
+	// TCPEndpoint is the publicly-reachable TCP endpoint advertised to
+	// peers (analogous to Endpoint for UDP). If empty and TCPListenAddr
+	// is set, the daemon advertises the bound TCPListenAddr as-is.
+	TCPEndpoint string
 
 	// Built-in services
 	DisableEcho         bool // disable built-in echo service (port 7)
@@ -96,6 +110,12 @@ const (
 	MaxRetxAttempts      = 8                      // abandon connection after this many retransmissions
 	HeartbeatReregThresh = 3                      // heartbeat failures before re-registration
 	SYNBucketAge         = 10 * time.Second       // stale per-source SYN bucket reap threshold
+
+	// DialTCPFallbackTimeout bounds the time we spend opening a TCP
+	// fallback connection when direct UDP retries have exhausted. Kept
+	// short so the dial path doesn't stall the caller if TCP is also
+	// blocked — the existing relay fallback runs next.
+	DialTCPFallbackTimeout = 5 * time.Second
 )
 
 // Zero-window probe constants.
@@ -420,6 +440,17 @@ func (d *Daemon) Start() error {
 	actualAddr := d.tunnels.LocalAddr().String()
 	slog.Info("tunnel listening", "addr", actualAddr)
 
+	// 3b. Optional TCP listener for UDP-hostile peers. Starts alongside
+	// UDP; both feed the same dispatchLoop. Nothing pre-routes to TCP
+	// until either a registry lookup surfaces a peer's advertised TCP
+	// endpoint, or a peer dials us inbound over TCP and sends an
+	// identifiable frame.
+	if d.config.TCPListenAddr != "" {
+		if err := d.tunnels.ListenTCP(d.config.TCPListenAddr); err != nil {
+			return fmt.Errorf("tcp tunnel listen: %w", err)
+		}
+	}
+
 	// Collect LAN addresses using the actual tunnel port (not config port which may be 0)
 	_, actualPort, _ := net.SplitHostPort(actualAddr)
 	if actualPort == "" || actualPort == "0" {
@@ -491,7 +522,18 @@ func (d *Daemon) Start() error {
 	}
 
 	pubKeyB64 := crypto.EncodePublicKey(d.identity.PublicKey)
-	resp, err := rc.RegisterWithKey(registrationAddr, pubKeyB64, d.config.Owner, d.lanAddrs, d.config.Version)
+	// Build optional endpoints list for multi-transport peers. Old
+	// registries ignore the field; no signature incompatibility.
+	var regEndpoints []registry.NodeEndpoint
+	if tcpEp := d.advertisedTCPEndpoint(); tcpEp != "" {
+		regEndpoints = append(regEndpoints, registry.NodeEndpoint{Network: "tcp", Addr: tcpEp})
+	}
+	var resp map[string]interface{}
+	if len(regEndpoints) > 0 {
+		resp, err = rc.RegisterWithKeyAndEndpoints(registrationAddr, pubKeyB64, d.config.Owner, d.lanAddrs, regEndpoints, d.config.Version)
+	} else {
+		resp, err = rc.RegisterWithKey(registrationAddr, pubKeyB64, d.config.Owner, d.lanAddrs, d.config.Version)
+	}
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -1952,12 +1994,29 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 		case <-timer.C:
 			retries++
 
-			// Switch to relay mode after direct retries exhaust
-			if retries == directRetries && d.config.BeaconAddr != "" && !relayActive {
-				slog.Info("direct dial timed out, switching to relay", "node_id", dstAddr.Node)
-				d.tunnels.SetRelayPeer(dstAddr.Node, true)
-				relayActive = true
-				rto = DialInitialRTO // reset backoff for relay phase
+			// Switch fallback transport after direct UDP retries exhaust.
+			// Prefer TCP direct-connect (lower latency than relay) if the
+			// peer advertised a TCP endpoint; else fall back to relay.
+			if retries == directRetries && !relayActive {
+				switched := false
+				if d.tunnels.HasTCPEndpoint(dstAddr.Node) {
+					dctx, cancel := context.WithTimeout(context.Background(), DialTCPFallbackTimeout)
+					err := d.tunnels.DialTCPForPeer(dctx, dstAddr.Node)
+					cancel()
+					if err == nil {
+						slog.Info("direct udp dial timed out, switched to tcp", "node_id", dstAddr.Node)
+						switched = true
+						rto = DialInitialRTO
+					} else {
+						slog.Debug("tcp fallback dial failed", "node_id", dstAddr.Node, "error", err)
+					}
+				}
+				if !switched && d.config.BeaconAddr != "" {
+					slog.Info("direct dial timed out, switching to relay", "node_id", dstAddr.Node)
+					d.tunnels.SetRelayPeer(dstAddr.Node, true)
+					relayActive = true
+					rto = DialInitialRTO // reset backoff for relay phase
+				}
 			}
 
 			if retries > maxRetries {
@@ -2622,7 +2681,49 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	}
 
 	d.tunnels.AddPeer(nodeID, udpAddr)
+
+	// If the peer advertised additional transport endpoints (e.g.
+	// TCP), cache them so writeFrame can fall back if UDP fails. Only
+	// meaningful when our daemon has a TCPTransport registered; the
+	// tunnel manager still stores the endpoint either way, letting a
+	// UDP-only daemon join multi-transport peers without changes.
+	for _, ep := range registry.EndpointsFromResponse(resp) {
+		if ep.Network == "tcp" && ep.Addr != "" {
+			if err := d.tunnels.AddPeerTCPEndpoint(nodeID, ep.Addr); err != nil {
+				slog.Debug("ignoring tcp endpoint", "node_id", nodeID, "addr", ep.Addr, "error", err)
+			}
+		}
+	}
 	return nil
+}
+
+// advertisedTCPEndpoint returns the public TCP endpoint to advertise
+// in the registry, or "" if no TCP listener is configured. Preference
+// order: explicit Config.TCPEndpoint > derived from Config.Endpoint's
+// host + TCP listener port > transport's LocalAddr().
+func (d *Daemon) advertisedTCPEndpoint() string {
+	if d.config.TCPListenAddr == "" {
+		return ""
+	}
+	if d.config.TCPEndpoint != "" {
+		return d.config.TCPEndpoint
+	}
+	tcpLocal := d.tunnels.TCPLocalAddr()
+	if tcpLocal == nil {
+		return ""
+	}
+	_, tcpPort, err := net.SplitHostPort(tcpLocal.String())
+	if err != nil || tcpPort == "" {
+		return tcpLocal.String()
+	}
+	// Reuse the public host we'd register for UDP if one is
+	// configured — saves the operator from repeating it.
+	if d.config.Endpoint != "" {
+		if host, _, err := net.SplitHostPort(d.config.Endpoint); err == nil && host != "" {
+			return net.JoinHostPort(host, tcpPort)
+		}
+	}
+	return tcpLocal.String()
 }
 
 // beaconKeepaliveLoop re-registers with the beacon on a short interval

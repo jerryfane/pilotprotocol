@@ -170,6 +170,13 @@ func (t *TCPTransport) acceptLoop() {
 
 // readerLoop reads length-prefixed frames from conn and delivers each
 // one on sink. Exits when conn closes or Close is called.
+//
+// Every frame delivered carries a Reply DialedConn that writes back
+// through this exact connection, which is essential for inbound
+// (accepted) conns: a NAT'd peer that dialled us has no listenable
+// TCP endpoint of its own, so replies must travel over the same
+// socket. Outbound (pooled) conns produce the same wrapper so callers
+// who receive frames on pooled conns can reply symmetrically.
 func (t *TCPTransport) readerLoop(conn net.Conn, tag string) {
 	defer t.wg.Done()
 	defer conn.Close()
@@ -180,6 +187,11 @@ func (t *TCPTransport) readerLoop(conn net.Conn, tag string) {
 	if ok {
 		ep = &TCPEndpoint{addr: epAddr}
 	}
+
+	// Build a reply conn once; reused across every frame from this
+	// connection. It does not own the underlying socket (readerLoop's
+	// deferred conn.Close does), so its Close is a bookkeeping no-op.
+	reply := &tcpInboundReplyConn{conn: conn, remote: ep}
 
 	for {
 		frame, err := ipcutil.Read(conn)
@@ -198,7 +210,7 @@ func (t *TCPTransport) readerLoop(conn net.Conn, tag string) {
 		}
 
 		select {
-		case t.sink <- InboundFrame{Frame: frame, From: ep}:
+		case t.sink <- InboundFrame{Frame: frame, From: ep, Reply: reply}:
 		case <-t.done:
 			return
 		}
@@ -349,6 +361,34 @@ func isClosedConnErr(err error) bool {
 	// Some stdlib versions wrap the message rather than exposing the
 	// sentinel — string match is the portable fallback.
 	return err.Error() == "use of closed network connection"
+}
+
+// tcpInboundReplyConn is the DialedConn we attach to InboundFrames
+// from accepted (listener-side) TCP sockets so the caller can write
+// replies back through the same connection. It does not own the
+// underlying socket — the accepting transport's readerLoop does via
+// its deferred Close — and its Close() is therefore a bookkeeping
+// no-op rather than a real teardown.
+type tcpInboundReplyConn struct {
+	sendMu sync.Mutex
+	conn   net.Conn
+	remote *TCPEndpoint
+}
+
+func (c *tcpInboundReplyConn) Send(frame []byte) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	return ipcutil.Write(c.conn, frame)
+}
+
+func (c *tcpInboundReplyConn) RemoteEndpoint() Endpoint {
+	return c.remote
+}
+
+func (c *tcpInboundReplyConn) Close() error {
+	// Lifecycle is owned by the accepting readerLoop — it Closes the
+	// underlying net.Conn when it exits. Nothing to release here.
+	return nil
 }
 
 // tcpDialedConn is the DialedConn implementation for TCPTransport.
