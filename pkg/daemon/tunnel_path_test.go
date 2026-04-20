@@ -3,6 +3,7 @@ package daemon
 import (
 	"net"
 	"testing"
+	"time"
 )
 
 // The tests below lock down the v1.9.0-jf.4 reply-on-ingress routing
@@ -165,3 +166,112 @@ func TestPeerPath_RemovePeerClearsPath(t *testing.T) {
 		t.Fatalf("peer should not exist after RemovePeer")
 	}
 }
+
+// v1.9.0-jf.5: AddPeer is authoritative — it installs a fresh direct
+// endpoint AND resets any prior relay-fallback state. The regression
+// this guards against: daemon calls SetRelayPeer(peer, true) after a
+// direct-dial timeout, later a registry lookup yields a new direct
+// addr and the daemon calls AddPeer; pre-jf.5 AddPeer left viaRelay
+// stuck on true, so writeFrame kept routing via beacon despite the
+// fresh direct addr.
+func TestPeerPath_AddPeerResetsViaRelay(t *testing.T) {
+	tm := NewTunnelManager()
+	const peer uint32 = 101
+
+	tm.SetRelayPeer(peer, true)
+	if !tm.IsRelayPeer(peer) {
+		t.Fatalf("precondition: SetRelayPeer(true) must set viaRelay")
+	}
+
+	// Now install a direct addr via AddPeer — this must clear viaRelay.
+	addr := &net.UDPAddr{IP: net.ParseIP("198.51.100.50"), Port: 37736}
+	tm.AddPeer(peer, addr)
+
+	if tm.IsRelayPeer(peer) {
+		t.Fatalf("AddPeer must reset viaRelay=false (installs authoritative direct addr)")
+	}
+	list := tm.PeerList()
+	if len(list) != 1 || list[0].Endpoint != addr.String() {
+		t.Fatalf("expected direct endpoint %s, got %+v", addr, list)
+	}
+	if list[0].Relay {
+		t.Fatalf("PeerList.Relay should be false after AddPeer")
+	}
+}
+
+// v1.9.0-jf.5: updatePathRelay must not touch path.direct. This
+// guards against the "auto-add with zero-addr marker" regression
+// path: if any caller mistakenly passed the relay-origin zero-addr
+// into updatePathDirect or AddPeer, path.direct would be set to
+// 0.0.0.0:0 and every subsequent direct-UDP send would black-hole.
+// The handlePacket guard in daemon.go skips the auto-add when
+// from.IP.IsUnspecified() — this test locks in the path-layer
+// invariant that updatePathRelay itself never creates a bad direct.
+func TestPeerPath_UpdatePathRelayPreservesDirect(t *testing.T) {
+	tm := NewTunnelManager()
+	const peer uint32 = 303
+	real := &net.UDPAddr{IP: net.ParseIP("203.0.113.77"), Port: 55501}
+
+	// First, record a direct ingress.
+	tm.mu.Lock()
+	tm.updatePathDirect(peer, real)
+	tm.mu.Unlock()
+
+	// Then a relay ingress flips viaRelay but must not touch direct.
+	tm.mu.Lock()
+	tm.updatePathRelay(peer)
+	tm.mu.Unlock()
+
+	tm.mu.RLock()
+	p := tm.paths[peer]
+	tm.mu.RUnlock()
+	if p == nil {
+		t.Fatalf("path entry missing")
+	}
+	if !p.viaRelay {
+		t.Fatalf("viaRelay must be true after updatePathRelay")
+	}
+	if p.direct == nil || p.direct.String() != real.String() {
+		t.Fatalf("direct must be preserved across relay update: got %v, want %s", p.direct, real)
+	}
+}
+
+// v1.9.0-jf.5: RemovePeer must wipe ALL per-peer state, not just
+// paths + crypto. Otherwise stale peerCaps / lastRecoveryPILA /
+// peerPubKeys / peerTCP / peerConns can leak into a re-added peer.
+func TestPeerPath_RemovePeerClearsAllState(t *testing.T) {
+	tm := NewTunnelManager()
+	const peer uint32 = 202
+
+	// Seed every per-peer map we care about.
+	tm.AddPeer(peer, &net.UDPAddr{IP: net.ParseIP("10.0.0.1"), Port: 1})
+	tm.mu.Lock()
+	tm.peerCaps[peer] = 0xff
+	tm.peerPubKeys[peer] = make([]byte, 32)
+	tm.lastRecoveryPILA[peer] = time.Now()
+	tm.mu.Unlock()
+	if err := tm.AddPeerTCPEndpoint(peer, "1.2.3.4:4443"); err != nil {
+		t.Fatalf("AddPeerTCPEndpoint: %v", err)
+	}
+
+	tm.RemovePeer(peer)
+
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if _, ok := tm.paths[peer]; ok {
+		t.Errorf("paths entry leaked after RemovePeer")
+	}
+	if _, ok := tm.peerCaps[peer]; ok {
+		t.Errorf("peerCaps entry leaked after RemovePeer")
+	}
+	if _, ok := tm.peerPubKeys[peer]; ok {
+		t.Errorf("peerPubKeys entry leaked after RemovePeer")
+	}
+	if _, ok := tm.peerTCP[peer]; ok {
+		t.Errorf("peerTCP entry leaked after RemovePeer")
+	}
+	if _, ok := tm.lastRecoveryPILA[peer]; ok {
+		t.Errorf("lastRecoveryPILA entry leaked after RemovePeer")
+	}
+}
+

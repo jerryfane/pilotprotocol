@@ -1576,7 +1576,17 @@ func (d *Daemon) handlePacket(pkt *protocol.Packet, from *net.UDPAddr) {
 	// established crypto context (proving prior key exchange). This prevents peer table
 	// poisoning from spoofed packets. In plaintext mode, auto-add is safe since
 	// there's no authentication to bypass.
-	if !d.tunnels.HasPeer(pkt.Src.Node) {
+	//
+	// v1.9.0-jf.5: guard against relay-origin zero-addr marker. When the
+	// packet arrived via beacon relay, handleRelayDeliver passes a
+	// zero-addr into the decrypt path (we don't know the peer's real UDP
+	// endpoint from the relay envelope alone). The authenticated-decrypt
+	// handlers in tunnel.go already captured the correct path state via
+	// updatePathRelay() at that point; auto-adding here with a zero-addr
+	// would only re-poison path.direct with 0.0.0.0:0. Skip the auto-add
+	// when from is the relay marker — a future direct frame from the
+	// same peer will populate path.direct via updatePathDirect.
+	if from != nil && !from.IP.IsUnspecified() && !d.tunnels.HasPeer(pkt.Src.Node) {
 		if !d.config.Encrypt || d.tunnels.HasCrypto(pkt.Src.Node) {
 			d.tunnels.AddPeer(pkt.Src.Node, from)
 			d.webhook.Emit("tunnel.peer_added", map[string]interface{}{

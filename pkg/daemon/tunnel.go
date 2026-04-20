@@ -1145,7 +1145,12 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr, fromRel
 		// re-handshakes. Rate-limited to avoid turning us into a PILA
 		// amplifier if an attacker (or a persistent misconfigured
 		// peer) spams un-decryptable frames.
-		tm.maybeSendRecoveryPILA(peerNodeID, from)
+		//
+		// Route the PILA through the same path the bad frame came in
+		// on: direct if direct (from has the peer's real UDP addr),
+		// via beacon relay if the bad frame arrived relayed (from is
+		// a zero-addr marker, so we must use the MsgRelay envelope).
+		tm.maybeSendRecoveryPILA(peerNodeID, from, fromRelay)
 		return
 	}
 
@@ -1392,8 +1397,16 @@ const recoveryPILAInterval = 60 * time.Second
 // reflection abuse (a spoofed nodeID in a packet could otherwise
 // turn us into an amplifier, since PILA is ~136 bytes vs the 28+
 // bytes an attacker has to send to trigger it).
-func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr) {
-	if addr == nil {
+// maybeSendRecoveryPILA emits an unsolicited authenticated-key-exchange
+// frame to a peer we have no crypto state for. viaRelay should be true
+// when the trigger frame arrived through the beacon — in that case we
+// wrap the PILA in a MsgRelay envelope so it travels the same path
+// back. Direct-path senders see addr = peer's actual UDP endpoint and
+// viaRelay = false.
+func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr, viaRelay bool) {
+	// For direct sends we need a real address; for relay sends we
+	// need the beacon addr. Bail early if neither makes sense.
+	if !viaRelay && addr == nil {
 		return
 	}
 	tm.mu.Lock()
@@ -1404,6 +1417,7 @@ func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr)
 		return
 	}
 	tm.lastRecoveryPILA[nodeID] = now
+	bAddr := tm.beaconAddr
 	tm.mu.Unlock()
 
 	frame := tm.buildAuthKeyExchangeFrame()
@@ -1411,6 +1425,35 @@ func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr)
 		// Identity or X25519 key isn't loaded yet — nothing to send.
 		return
 	}
+
+	// Consistency with RegisterWithBeacon / RequestHolePunch: both
+	// guard on tm.udp != nil. If the daemon is still mid-startup
+	// (Listen hasn't completed), the recovery path must not panic
+	// on a nil UDP transport.
+	if tm.udp == nil {
+		slog.Debug("recovery PILA skipped: UDP transport not listening yet", "peer_node_id", nodeID)
+		return
+	}
+
+	if viaRelay {
+		if bAddr == nil {
+			slog.Debug("recovery PILA skipped: via-relay trigger but no beacon configured", "peer_node_id", nodeID)
+			return
+		}
+		// MsgRelay wrapper: [0x05][senderID][destID][PILA frame]
+		env := make([]byte, 1+4+4+len(frame))
+		env[0] = protocol.BeaconMsgRelay
+		binary.BigEndian.PutUint32(env[1:5], tm.loadNodeID())
+		binary.BigEndian.PutUint32(env[5:9], nodeID)
+		copy(env[9:], frame)
+		if _, err := tm.udp.WriteToUDPAddr(env, bAddr); err != nil {
+			slog.Debug("recovery PILA (relay) send failed", "peer_node_id", nodeID, "error", err)
+			return
+		}
+		slog.Info("sent recovery PILA (relay) to peer with unknown key", "peer_node_id", nodeID)
+		return
+	}
+
 	if _, err := tm.udp.WriteToUDPAddr(frame, addr); err != nil {
 		slog.Debug("recovery PILA send failed", "peer_node_id", nodeID, "addr", addr, "error", err)
 		return
@@ -1548,14 +1591,24 @@ func (tm *TunnelManager) sendPlaintextToNode(nodeID uint32, addr *net.UDPAddr, d
 	return tm.writeFrame(nodeID, addr, frame)
 }
 
-// AddPeer registers a peer's real UDP endpoint. Bootstrap-only — the
-// addr is treated as a seed for the path's `direct` field. Does NOT
-// touch viaRelay, which is driven exclusively by observed ingress
-// path (or an explicit SetRelayPeer).
+// AddPeer registers a peer's real UDP endpoint. Treated as an
+// authoritative direct-endpoint installation (mirrors WireGuard's
+// `wg set peer ... endpoint`): the caller is explicitly claiming this
+// is a valid, current direct address, so any stale relay-mode bit is
+// cleared too. If the peer's path drifts back to relay-only at some
+// later point, the decrypt-side update rules in handleEncrypted will
+// flip viaRelay back on via observed ingress.
+//
+// The caller-facing contract: "install this as the best-known direct
+// path, reset any prior relay-fallback state." This prevents the
+// regression where a prior SetRelayPeer(true) (e.g. after a dial-
+// timeout fallback) persists through a subsequent AddPeer that was
+// supposed to install a fresh, known-good direct addr.
 func (tm *TunnelManager) AddPeer(nodeID uint32, addr *net.UDPAddr) {
 	tm.mu.Lock()
 	p := tm.getOrCreatePath(nodeID)
 	p.direct = addr
+	p.viaRelay = false
 	// No path.lastSeen update here — this is a seed, not an observed
 	// ingress. The first authenticated decrypt from this peer will
 	// promote the entry to "seen live".
@@ -1568,11 +1621,35 @@ func (tm *TunnelManager) AddPeer(nodeID uint32, addr *net.UDPAddr) {
 	}
 }
 
-// RemovePeer removes a peer.
+// RemovePeer removes a peer and wipes all per-peer state. Mirrors
+// WireGuard's `wg set peer ... remove` semantics: after removal, a
+// future re-add observes a fresh zero-state and cannot be surprised
+// by stale capability bits, recovery-PILA rate limiters, or cached
+// TCP endpoints belonging to a previous incarnation of this
+// nodeID.
+//
+// v1.9.0-jf.5: previously this function only cleared `paths` and
+// `crypto`, leaving `peerCaps`, `peerPubKeys`, `peerTCP`,
+// `peerConns`, and `lastRecoveryPILA` entries behind. Those could
+// silently persist across a peer rejoin and influence gossip
+// capability probing, TCP fallback routing, and recovery-PILA rate
+// limiting in ways that depended on the previous peer instance —
+// not always correct when the re-added peer is a fresh daemon at
+// the same node_id.
 func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	tm.mu.Lock()
 	delete(tm.paths, nodeID)
 	delete(tm.crypto, nodeID)
+	delete(tm.peerCaps, nodeID)
+	delete(tm.peerPubKeys, nodeID)
+	delete(tm.peerTCP, nodeID)
+	delete(tm.lastRecoveryPILA, nodeID)
+	// peerConns owns a DialedConn — close before deleting so the
+	// underlying TCP/QUIC socket is released.
+	if conn, ok := tm.peerConns[nodeID]; ok {
+		_ = conn.Close()
+		delete(tm.peerConns, nodeID)
+	}
 	tm.mu.Unlock()
 }
 

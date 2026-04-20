@@ -10,6 +10,45 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.5] - 2026-04-20
+
+### Fixed
+- `maybeSendRecoveryPILA` now routes through the beacon when the
+  un-decryptable frame that triggered it arrived via relay. Prior
+  to this fix, an auto-recovery PILA in response to a relay-
+  origin frame was written to a zero-addr marker and dropped
+  silently — so relay-only peers could not recover from
+  one-sided crypto-state desync (e.g. after a VPS restart with a
+  surviving laptop on the other side). Direct recovery path is
+  unchanged.
+- `AddPeer` now resets `path.viaRelay = false`. A prior
+  `SetRelayPeer(peer, true)` (typical after a direct-dial
+  timeout) no longer persists through a subsequent `AddPeer`
+  with a known-good direct endpoint. Matches WireGuard's
+  "explicit endpoint is authoritative" semantics. Recovered
+  the relay→direct fallback case that the reachability-probe
+  loop relies on.
+- `RemovePeer` now wipes all per-peer state: `paths`, `crypto`,
+  `peerCaps`, `peerPubKeys`, `peerTCP`, `peerConns`,
+  `lastRecoveryPILA`. Previously only `paths` + `crypto` were
+  cleared, leaving stale fields behind for a potential re-add
+  of the same `node_id`. Mirrors WireGuard's `wg set peer …
+  remove` contract of "zero all per-peer state." Cached
+  `peerConns` entries are `.Close()`'d before deletion to
+  release TCP / QUIC sockets.
+- `Daemon.handlePacket` no longer auto-calls `AddPeer` with the
+  relay-origin zero-addr marker (`0.0.0.0:0`). Guards against
+  the same class of pollution the v1.9.0-jf.4 refactor removed
+  from `handleRelayDeliver`. The authenticated-decrypt handlers
+  in `tunnel.go` already capture correct path state via
+  `updatePathRelay` during relay ingress; the daemon-level
+  auto-add was fighting that capture.
+- `maybeSendRecoveryPILA` defensively checks `tm.udp != nil`
+  before attempting the relay-wrapped write, matching the
+  existing guard in `RegisterWithBeacon` and `RequestHolePunch`.
+  Prevents a nil-deref panic if recovery fires during startup
+  before `Listen` completes.
+
 ## [v1.9.0-jf.4] - 2026-04-20
 
 ### Fixed
