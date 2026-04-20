@@ -13,6 +13,17 @@ var (
 	ErrConnRefused      = errors.New("connection refused")
 	ErrDialTimeout      = errors.New("dial timeout")
 	ErrChecksumMismatch = errors.New("checksum mismatch")
+	// ErrDialToSelf is returned when a caller attempts to establish a
+	// tunnel or stream to the local node's own NodeID. Triggered e.g.
+	// when bootstrap / roster listings contain self and the caller
+	// doesn't filter first. Mirrors go-libp2p-swarm's ErrDialToSelf
+	// guard: fail fast with a typed sentinel so the bug is visible,
+	// rather than silently discarding and masking the caller's
+	// invariant violation. Observed live as a ~5900 pps self-
+	// amplified packet loop on multi-homed hosts (docker bridge +
+	// public IP both fingerprinting as "same-LAN peer" for the local
+	// node) that consumed two CPU cores of pilot-daemon. (v1.9.0-jf.6)
+	ErrDialToSelf = errors.New("dial to self")
 )
 
 // Flags (4 bits, stored in lower nibble of first byte alongside version)

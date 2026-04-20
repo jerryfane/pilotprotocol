@@ -2103,6 +2103,14 @@ func (d *Daemon) sendRST(orig *protocol.Packet) {
 
 // DialConnection initiates a connection to a remote address:port.
 func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connection, error) {
+	// Reject self-dials before touching policy or allocating a
+	// Connection. ensureTunnel below has the same guard; this is
+	// belt-and-braces so a self-dial never leaks partial state into
+	// ports.NewConnection either. (v1.9.0-jf.6)
+	if dstAddr.Node == d.NodeID() {
+		return nil, protocol.ErrDialToSelf
+	}
+
 	// Enforce outbound port policy: prevent dialing ports blocked by the network
 	if !d.evaluatePortPolicy(policy.EventDial, dstAddr.Network, dstPort, dstAddr.Node, 0, "") {
 		return nil, fmt.Errorf("port %d not allowed by network %d policy", dstPort, dstAddr.Network)
@@ -2812,6 +2820,20 @@ func (d *Daemon) cacheResolve(nodeID uint32, resp map[string]interface{}) {
 // Uses a resolve cache (60s TTL) to avoid repeated registry calls during
 // cron bursts, and an endpoint cache as fallback when the registry is unreachable.
 func (d *Daemon) ensureTunnel(nodeID uint32) error {
+	// Reject self as early as possible. A caller that hands its own
+	// NodeID here (common when bootstrap / roster listings contain
+	// self) would otherwise reach the registry resolve + same-LAN
+	// detection branch below, which on multi-homed hosts finds BOTH
+	// a docker-bridge match and a public-IP match for the local
+	// node and establishes duplicate self-tunnels that retransmit
+	// into each other in a ~5900 pps loop — observed live,
+	// consuming 2 CPU cores of pilot-daemon and starving real peer
+	// streams. Fail fast with a typed sentinel so the caller's
+	// filtering bug is visible. Mirrors go-libp2p-swarm's
+	// ErrDialToSelf guard in dialPeer. (v1.9.0-jf.6)
+	if nodeID == d.NodeID() {
+		return protocol.ErrDialToSelf
+	}
 	if d.tunnels.HasPeer(nodeID) {
 		return nil
 	}

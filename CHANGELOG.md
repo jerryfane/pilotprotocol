@@ -10,6 +10,32 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.6] - 2026-04-21
+
+### Fixed
+- **Self-dial rejected with typed sentinel.** `ensureTunnel` and
+  `DialConnection` now reject attempts to dial the local node's
+  own NodeID, returning `protocol.ErrDialToSelf`. Previously, a
+  caller that handed its own ID here (common when bootstrap /
+  roster listings contain self — every Entmoot invite to date
+  included the issuer as a bootstrap peer) would pass through to
+  the registry resolve + same-LAN detection branch. On
+  multi-homed hosts the same-LAN matcher finds BOTH a
+  docker-bridge LAN entry (e.g. `172.17.0.1`) AND a public-IP
+  entry for the local node, which triggers establishment of
+  multiple duplicate self-tunnels. The duplicate tunnels then
+  retransmit into each other — observed live on the VPS hub as a
+  ~5,900 packets/second self-amplified loop consuming two CPU
+  cores of pilot-daemon and saturating the packet buffers,
+  starving real peer streams and reinflating gossip
+  propagation to minute-scale latencies.
+
+  Mirrors go-libp2p-swarm's canonical `ErrDialToSelf` guard in
+  `dialPeer`. Fast-fail with a typed sentinel (not a silent
+  discard) so caller-side filter violations are visible rather
+  than masked. Pairs with Entmoot v1.0.8's caller-side filter
+  in `BootstrapPeers` parse + invite mint.
+
 ## [v1.9.0-jf.5] - 2026-04-20
 
 ### Fixed
