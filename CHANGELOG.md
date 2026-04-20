@@ -10,6 +10,60 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.4] - 2026-04-20
+
+### Fixed
+- Relay-mediated tunnels could establish encrypted + authenticated
+  peer state, but stream-layer SYN dials timed out indefinitely
+  because two latent upstream-Pilot design bugs interacted badly:
+  (a) `TunnelManager.relayPeers[peer]=bool` was tracked per-daemon
+  without any symmetry guarantee, so A could flip the bit and
+  route via relay while B still thought A was direct and replied
+  to a stale `peers[A]` address; (b) `handleRelayDeliver` stored
+  the beacon's address under `peers[srcNodeID]` as a placeholder
+  when a relay frame arrived from a peer we hadn't seen before,
+  which then polluted same-LAN detection, the v1.9.0-jf.2 NAT-
+  drift refresh, and the direct-UDP fallback branch of
+  `writeFrame`. Observed live in the three-node deployment: VPS
+  ↔ laptop tunnel reported `relay=true` and keepalives flowed,
+  but every `DialConnection` from VPS to the laptop (and vice
+  versa) timed out.
+
+  Replaced `peers map[uint32]*net.UDPAddr` and
+  `relayPeers map[uint32]bool` with a single
+  `paths map[uint32]*peerPath` where each entry records the last
+  authenticated ingress path (direct addr XOR via-relay). Every
+  authenticated decrypt updates the entry; `writeFrame` routes
+  replies on the same path the request arrived on. This is the
+  reply-on-ingress pattern used by WireGuard (roaming) and
+  Tailscale DERP — symmetry falls out of per-peer observed state
+  instead of requiring cross-daemon coordination. Neither `peers`
+  nor `relayPeers` exist anymore; the `IsRelayPeer` / `HasPeer` /
+  `PeerList` accessors keep their existing signatures and are
+  now thin wrappers over `paths`.
+
+### Added
+- `DialRelayInitialRTO = 3 * time.Second`. `DialConnection`'s SYN
+  retransmission budget now starts at 3 s when the peer is in
+  relay mode, up from the direct-path default of 1 s. Relay
+  RTT is 2-3× direct (observed ~300 ms through a US-based
+  beacon between an Italian and a UAE peer, vs ~80 ms direct).
+  The 1 s budget was too tight and caused spurious dial
+  timeouts even on otherwise-healthy relay tunnels.
+- `peerPath` internal type and `updatePathDirect` /
+  `updatePathRelay` helpers on `TunnelManager` that the three
+  authenticated decrypt handlers call on every successful frame.
+
+### Known gap
+- Integration test for "A→B direct UDP blocked, beacon relay
+  works" was scoped out of this release; the existing harness
+  uses a real UDP socket and has no write-path filter for
+  simulating selective blackholes. The refactor is covered by
+  unit tests (`tunnel_path_test.go`) and by live validation on
+  the three-node deployment. A proper integration test would
+  need either root iptables or a write-path filter hook; filed
+  for Pilot v1.10.
+
 ## [v1.9.0-jf.3] - 2026-04-19
 
 ### Fixed

@@ -111,7 +111,15 @@ const (
 	DialDirectRetries    = 3                      // direct connection attempts before relay
 	DialMaxRetries       = 6                      // total attempts (direct + relay)
 	DialInitialRTO       = 1 * time.Second        // initial SYN retransmission timeout
-	DialMaxRTO           = 8 * time.Second        // max backoff for SYN retransmission
+	// DialRelayInitialRTO is the initial SYN retransmission timeout when
+	// the peer is in relay mode. Beacon-relayed traffic takes 2-3× the
+	// RTT of direct UDP (the frame must hop through a US-based beacon
+	// between, e.g., an Italian and a UAE peer — observed ~300ms vs
+	// ~80ms direct). The 1s direct-RTO budget was too tight for the
+	// relay path and caused spurious dial timeouts even when the
+	// tunnel itself was healthy.
+	DialRelayInitialRTO = 3 * time.Second
+	DialMaxRTO          = 8 * time.Second        // max backoff for SYN retransmission
 	DialCheckInterval    = 10 * time.Millisecond  // poll interval for state changes during dial
 	RetxCheckInterval    = 100 * time.Millisecond // retransmission check ticker
 	MaxRetxAttempts      = 8                      // abandon connection after this many retransmissions
@@ -2139,7 +2147,12 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	if relayActive {
 		directRetries = 0 // skip direct phase, go straight to relay
 	}
+	// Initial RTO is path-aware (v1.9.0-jf.4). Relay-mode peers get a
+	// larger initial budget because the beacon hop adds real RTT.
 	rto := DialInitialRTO
+	if relayActive {
+		rto = DialRelayInitialRTO
+	}
 	timer := time.NewTimer(rto)
 	defer timer.Stop()
 
@@ -2189,7 +2202,9 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 					slog.Info("direct dial timed out, switching to relay", "node_id", dstAddr.Node)
 					d.tunnels.SetRelayPeer(dstAddr.Node, true)
 					relayActive = true
-					rto = DialInitialRTO // reset backoff for relay phase
+					// Reset backoff but use the larger relay-specific
+					// initial RTO since beacon-relay RTT is 2-3× direct.
+					rto = DialRelayInitialRTO
 				}
 			}
 
