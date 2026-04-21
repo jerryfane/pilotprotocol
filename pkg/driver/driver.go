@@ -442,6 +442,65 @@ func (d *Driver) MemberTagsSet(networkID uint16, nodeID uint32, tags []string) (
 	return d.jsonRPC(msg, cmdManagedOK, "member-tags set")
 }
 
+// Endpoint describes one transport endpoint for a peer. Network is
+// "tcp" or "udp"; Addr is a "host:port" string resolvable by the
+// daemon's net.ResolveTCPAddr / net.ResolveUDPAddr.
+type Endpoint struct {
+	Network string
+	Addr    string
+}
+
+// SetPeerEndpoints installs externally-sourced endpoints for a peer
+// into the daemon's peerTCP map (TCP only — UDP endpoints are ignored
+// for now since they're advisory and the daemon's existing dial path
+// discovers them). Called by application-layer code when a transport
+// advertisement is accepted from out-of-band (e.g. the Entmoot gossip
+// layer in v1.2.0). Registry-sourced endpoints take precedence if they
+// exist. Safe to call repeatedly with the same nodeID; the latest call
+// wins. Returns an error only on IPC transport failure or malformed
+// input. (v1.9.0-jf.7)
+func (d *Driver) SetPeerEndpoints(nodeID uint32, endpoints []Endpoint) error {
+	if len(endpoints) > 8 {
+		return fmt.Errorf("set_peer_endpoints: too many endpoints (%d > 8)", len(endpoints))
+	}
+	// Preflight bounds so we don't hand the daemon a frame it will
+	// reject — symmetric with the daemon-side parser limits.
+	for i, ep := range endpoints {
+		if len(ep.Network) > 16 {
+			return fmt.Errorf("set_peer_endpoints: endpoint %d network too long (%d > 16)", i, len(ep.Network))
+		}
+		if len(ep.Addr) > 255 {
+			return fmt.Errorf("set_peer_endpoints: endpoint %d addr too long (%d > 255)", i, len(ep.Addr))
+		}
+	}
+
+	// Build the TLV payload.
+	size := 1 + 4 + 1
+	for _, ep := range endpoints {
+		size += 1 + len(ep.Network) + 1 + len(ep.Addr)
+	}
+	msg := make([]byte, size)
+	msg[0] = cmdSetPeerEndpoints
+	binary.BigEndian.PutUint32(msg[1:5], nodeID)
+	msg[5] = byte(len(endpoints))
+	off := 6
+	for _, ep := range endpoints {
+		msg[off] = byte(len(ep.Network))
+		off++
+		copy(msg[off:], ep.Network)
+		off += len(ep.Network)
+		msg[off] = byte(len(ep.Addr))
+		off++
+		copy(msg[off:], ep.Addr)
+		off += len(ep.Addr)
+	}
+
+	if _, err := d.ipc.sendAndWait(msg, cmdSetPeerEndpointsOK); err != nil {
+		return fmt.Errorf("set_peer_endpoints: %w", err)
+	}
+	return nil
+}
+
 // Close disconnects from the daemon.
 func (d *Driver) Close() error {
 	return d.ipc.close()

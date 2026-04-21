@@ -52,6 +52,14 @@ const (
 	CmdHealthOK          byte = 0x22
 	CmdManaged           byte = 0x23
 	CmdManagedOK         byte = 0x24
+	// CmdSetPeerEndpoints installs externally-sourced transport endpoints
+	// for a peer (currently only TCP is applied) into the tunnel manager's
+	// peerTCP map. Reuses TunnelManager.AddPeerTCPEndpoint verbatim.
+	// Target caller: application-layer transport-advertisement protocols
+	// (e.g. Entmoot v1.2.0 gossip) that distribute endpoints out-of-band
+	// from the central registry. (v1.9.0-jf.7)
+	CmdSetPeerEndpoints   byte = 0x25
+	CmdSetPeerEndpointsOK byte = 0x26
 )
 
 // Network sub-commands (second byte of CmdNetwork payload)
@@ -241,6 +249,8 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 			s.handleHealth(conn)
 		case CmdManaged:
 			s.handleManaged(conn, payload)
+		case CmdSetPeerEndpoints:
+			s.handleSetPeerEndpoints(conn, payload)
 		default:
 			s.sendError(conn, fmt.Sprintf("unknown command: 0x%02X", cmd))
 		}
@@ -1236,4 +1246,109 @@ func (s *IPCServer) findPolicyRunner(netID uint16) *PolicyRunner {
 		return pr
 	}
 	return nil
+}
+
+// setPeerEndpointsMaxCount bounds the number of endpoints accepted in a
+// single SetPeerEndpoints call; 8 covers realistic multi-transport peer
+// advertisements and keeps the IPC payload well under 2 KiB.
+const setPeerEndpointsMaxCount = 8
+
+// peerEndpoint is the parsed form of one SetPeerEndpoints TLV entry.
+type peerEndpoint struct {
+	network string
+	addr    string
+}
+
+// parseSetPeerEndpoints decodes the TLV payload of CmdSetPeerEndpoints.
+// Wire format:
+//
+//	node_id        (4 bytes, big-endian uint32)
+//	num_endpoints  (1 byte, max setPeerEndpointsMaxCount)
+//	for each endpoint:
+//	  network_len  (1 byte, <=16)
+//	  network      (network_len bytes)
+//	  addr_len     (1 byte, <=255)
+//	  addr         (addr_len bytes)
+func parseSetPeerEndpoints(payload []byte) (uint32, []peerEndpoint, error) {
+	if len(payload) < 5 {
+		return 0, nil, fmt.Errorf("set_peer_endpoints: short header (%d bytes)", len(payload))
+	}
+	nodeID := binary.BigEndian.Uint32(payload[0:4])
+	count := int(payload[4])
+	if count > setPeerEndpointsMaxCount {
+		return 0, nil, fmt.Errorf("set_peer_endpoints: too many endpoints (%d > %d)", count, setPeerEndpointsMaxCount)
+	}
+	off := 5
+	eps := make([]peerEndpoint, 0, count)
+	for i := 0; i < count; i++ {
+		if off >= len(payload) {
+			return 0, nil, fmt.Errorf("set_peer_endpoints: truncated at endpoint %d (network_len)", i)
+		}
+		nLen := int(payload[off])
+		off++
+		if nLen > 16 {
+			return 0, nil, fmt.Errorf("set_peer_endpoints: network too long (%d > 16) at endpoint %d", nLen, i)
+		}
+		if off+nLen > len(payload) {
+			return 0, nil, fmt.Errorf("set_peer_endpoints: truncated network at endpoint %d", i)
+		}
+		network := string(payload[off : off+nLen])
+		off += nLen
+		if off >= len(payload) {
+			return 0, nil, fmt.Errorf("set_peer_endpoints: truncated at endpoint %d (addr_len)", i)
+		}
+		aLen := int(payload[off])
+		off++
+		if off+aLen > len(payload) {
+			return 0, nil, fmt.Errorf("set_peer_endpoints: truncated addr at endpoint %d", i)
+		}
+		addr := string(payload[off : off+aLen])
+		off += aLen
+		eps = append(eps, peerEndpoint{network: network, addr: addr})
+	}
+	return nodeID, eps, nil
+}
+
+func (s *IPCServer) handleSetPeerEndpoints(conn *ipcConn, payload []byte) {
+	nodeID, eps, err := parseSetPeerEndpoints(payload)
+	if err != nil {
+		s.sendError(conn, err.Error())
+		return
+	}
+	// Reject self-dials — preserves the jf.6 ErrDialToSelf guard so an
+	// externally-sourced advertisement that names the local node can't
+	// install a TCP endpoint that later amplifies into a self-tunnel.
+	if nodeID == s.daemon.NodeID() {
+		s.sendError(conn, protocol.ErrDialToSelf.Error())
+		return
+	}
+	installed := 0
+	for _, ep := range eps {
+		if ep.network == "tcp" && ep.addr != "" {
+			if err := s.daemon.tunnels.AddPeerTCPEndpoint(nodeID, ep.addr); err != nil {
+				slog.Warn("ipc: SetPeerEndpoints install failed",
+					slog.Uint64("node_id", uint64(nodeID)),
+					slog.String("addr", ep.addr),
+					slog.String("err", err.Error()))
+				continue
+			}
+			installed++
+		}
+		// UDP endpoints ignored for now — advisory only; the daemon's
+		// existing dial path discovers them via registry/same-LAN probes.
+	}
+	slog.Debug("ipc: SetPeerEndpoints applied",
+		slog.Uint64("node_id", uint64(nodeID)),
+		slog.Int("installed_tcp", installed))
+
+	data, _ := json.Marshal(map[string]interface{}{
+		"node_id":       nodeID,
+		"installed_tcp": installed,
+	})
+	resp := make([]byte, 1+len(data))
+	resp[0] = CmdSetPeerEndpointsOK
+	copy(resp[1:], data)
+	if err := conn.ipcWrite(resp); err != nil {
+		slog.Debug("IPC set_peer_endpoints reply failed", "err", err)
+	}
 }

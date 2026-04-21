@@ -49,6 +49,13 @@ const (
 	cmdHealthOK          byte = 0x22
 	cmdManaged           byte = 0x23
 	cmdManagedOK         byte = 0x24
+	// cmdSetPeerEndpoints installs externally-sourced transport endpoints
+	// (currently only TCP is applied; UDP ignored) into the daemon's
+	// peerTCP map. Used by application-layer transport-advertisement
+	// protocols (e.g. Entmoot v1.2.0 gossip) that distribute endpoints
+	// out-of-band from the central registry.
+	cmdSetPeerEndpoints   byte = 0x25
+	cmdSetPeerEndpointsOK byte = 0x26
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)

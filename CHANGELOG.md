@@ -10,6 +10,33 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.7] - 2026-04-21
+
+### Added
+- **`Driver.SetPeerEndpoints(nodeID, endpoints)`** — new IPC
+  command for installing externally-sourced TCP endpoints for
+  a peer into the daemon's `peerTCP` map. Designed for
+  application-layer transport-advertisement protocols that
+  distribute endpoints through their own signed-gossip channel
+  rather than relying on the central registry (see Entmoot
+  v1.2.0, companion release). Reuses the existing
+  `TunnelManager.AddPeerTCPEndpoint` install path verbatim;
+  registry-sourced endpoints still take precedence when both
+  sources exist. Self-dials rejected via the `ErrDialToSelf`
+  guard added in jf.6.
+
+  Wire format is a simple TLV inside the existing IPC frame:
+  `[cmd][node_id u32 BE][n u8][n * (net_len u8, net, addr_len
+  u8, addr)]`. Bounds: max 8 endpoints, network ≤16 bytes,
+  addr ≤255 bytes — payload trivially under 2 KiB. UDP
+  entries are accepted on the wire but ignored by the daemon
+  (advisory only; the existing dial path rediscovers them via
+  registry + same-LAN probes).
+
+  New opcodes `CmdSetPeerEndpoints=0x25` / `CmdSetPeerEndpointsOK=0x26`.
+  No change to the wire protocol between daemons — this is a
+  NEW IPC command between driver and local daemon only.
+
 ## [v1.9.0-jf.6] - 2026-04-21
 
 ### Fixed
