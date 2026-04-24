@@ -10,6 +10,116 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11a] - 2026-04-24
+
+Half-release. The full jf.11 plan (see
+`/root/.claude/plans/tender-wondering-wombat.md`) has two parts:
+**A** — disco-style authenticated connectivity probes to structurally
+fix the same-LAN false-positive (task #85) and replace the heuristic
+tier-based `writeFrame` with ICE/Tailscale-disco-style candidate
+validation. **B** — `-outbound-turn-only` flag + `-hide-ip` preset +
+cross-layer warnings for the RFC 8828 Mode 3 "relay-only" semantic.
+Part A is 3-5 days of focused work; Part B is ~hours. jf.11a ships
+Part B so users can exercise full hide-ip today; Part A ships as a
+later release (jf.11b or jf.12) after the disco rewrite lands.
+
+### Added
+
+- **`-outbound-turn-only` daemon flag.** Forces `writeFrame` to route
+  every outbound tunnel frame through the local TURN allocation.
+  Peers observe our traffic with source IP = TURN server's assigned
+  anycast / relay address, never our real IP. Mirrors WebRTC's
+  `iceTransportPolicy='relay'` (RFC 8828 Mode 3) — the industry-
+  standard "don't leak IP to peers" switch. Fail-closed: if
+  `-turn-provider` is not set, the daemon refuses to start rather
+  than silently degrade to non-relay routing (which would leak the
+  very IP the flag exists to hide).
+
+  Semantic guarantees:
+  - Beacon relay (v1.9.0-jf.10 tier 1) is never used, even if
+    `path.viaRelay=true`.
+  - Direct UDP (v1.9.0-jf.10 tier 3) is never used, even if we have
+    a cached `pathDirect` from a prior authenticated frame.
+  - Cached non-UDP conns are used only when their underlying
+    transport is TURN or turn-relay (v1.9.0-jf.9). A stale TCP conn
+    from before the flag was enabled is evicted on next write.
+  - When no TURN path is available, writeFrame returns an explicit
+    error naming the flag; the gossiper's retry layer sees it and
+    acts as with any other dial failure.
+
+- **`-hide-ip` preset flag.** Convenience flag that expands to
+  `-no-registry-endpoint -outbound-turn-only` at startup, unless
+  either sub-flag is explicitly set by the operator (explicit value
+  wins — `-hide-ip -no-registry-endpoint=false` leaves the registry
+  publishing endpoint for debugging purposes, etc.). Requires
+  `-turn-provider`. Name intentionally matches Entmoot's app-layer
+  `-hide-ip` so users build the mental model *"set hide-ip at both
+  layers for full privacy"*; the CHANGELOG + doc string call this
+  out to eliminate surprise.
+
+- **Cross-layer startup warnings.** When the three privacy flags are
+  half-configured — `-outbound-turn-only` without `-no-registry-endpoint`
+  or vice-versa — the daemon emits a clear WARN-level log line
+  naming the specific leak channel that remains open and pointing at
+  the `-hide-ip` preset as the one-flag remedy. An informational log
+  also fires when `-turn-provider` is set but no Pilot-layer hide-ip
+  flags are, reminding operators that TURN is useful even outside
+  hide-ip contexts. No forced behaviour change — just clearer
+  feedback for a class of misconfiguration that's easy to fall into.
+
+- **`DaemonInfo.OutboundTURNOnly` + `DaemonInfo.NoRegistryEndpoint`**
+  (both `omitempty`). App-layer callers (e.g. Entmoot's `-hide-ip`
+  startup check) can query Pilot's privacy posture via the existing
+  IPC `Info` command and warn the user if the local daemon isn't in
+  the expected configuration. Wire-compatible with jf.10 and earlier
+  clients — fields simply decode as false when the daemon doesn't
+  populate them.
+
+### Behaviour
+
+- Cached peer-side address caches survive the flag flip. A peer who
+  learned our direct address before we enabled `-outbound-turn-only`
+  will continue dialling direct to the stale address until their own
+  cache expires or their daemon observes our TURN-sourced traffic
+  and updates. For a clean deployment, pair with
+  `-no-registry-endpoint` (the preset does this) so new peers don't
+  cache a direct address in the first place.
+
+- A peer who has NOT advertised TURN remains unreachable from an
+  `-outbound-turn-only` daemon. That's intentional — we refuse to
+  speak to peers via any channel that would reveal our source IP.
+  The gossiper's retry layer sees the failure as a transient error
+  and backs off.
+
+### Tests
+
+- `pkg/daemon/outbound_turn_only_test.go` (new):
+  - `TestOutboundTURNOnly_StartupFailsWithoutTurnProvider` — fail-
+    closed contract.
+  - `TestWriteFrame_OutboundTURNOnly_UsesCachedTURNConn` — happy
+    path: cached turn-relay conn wins over beacon even when
+    `viaRelay=true`.
+  - `TestWriteFrame_OutboundTURNOnly_RejectsWhenNoTURNPath` — fail-
+    closed at frame level when no TURN endpoint is known.
+  - `TestWriteFrame_OutboundTURNOnly_SkipsNonTURNCachedConn` — a
+    stale cached TCP conn does not leak source IP.
+  - `TestWriteFrame_OutboundTURNOnly_Disabled_PreservesDefaultBehavior`
+    — regression guard.
+
+### Compatibility
+
+- **No wire-format changes between daemons.** `writeFrame` still
+  emits the same frame shapes on UDP, TCP, TURN, and beacon — only
+  the selection logic changed.
+- **Privacy posture composable.** The three flags
+  (`-no-registry-endpoint`, `-outbound-turn-only`, `-hide-ip`
+  preset) layer over jf.8's `-turn-provider`. Operators can enable
+  any subset; the startup warnings name each partial state.
+- **Operator migration.** Existing deployments running plain
+  `-turn-provider=cloudflare` (no privacy flags) are unaffected.
+  Behaviour is byte-identical to jf.10 when `-outbound-turn-only`
+  is false.
+
 ## [v1.9.0-jf.10] - 2026-04-24
 
 ### Changed

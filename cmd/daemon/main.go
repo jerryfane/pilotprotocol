@@ -70,6 +70,8 @@ func main() {
 	networks := flag.String("networks", "", "comma-separated network IDs to auto-join at startup")
 	trustAutoApprove := flag.Bool("trust-auto-approve", false, "automatically approve all incoming trust handshakes")
 	noRegistryEndpoint := flag.Bool("no-registry-endpoint", false, "register identity only; do not publish UDP/TCP/LAN endpoints to the registry. Pair with -turn-provider for full hide-IP (peers reach us via TURN relay advertised out-of-band by the app layer; registry lookup returns 'endpoint unknown')")
+	outboundTurnOnly := flag.Bool("outbound-turn-only", false, "route ALL outbound tunnel traffic through our own TURN allocation (requires -turn-provider). Symmetric hide-IP — peers see our TURN-assigned address, never our real IP. Mirrors WebRTC iceTransportPolicy='relay' (RFC 8828 Mode 3). Startup fails if -turn-provider is empty.")
+	hideIP := flag.Bool("hide-ip", false, "full Pilot-layer IP privacy — preset for -no-registry-endpoint -outbound-turn-only. Requires -turn-provider. Sub-flags can be overridden individually (e.g. -hide-ip -no-registry-endpoint=false). Name intentionally matches Entmoot's app-layer -hide-ip for mental-model consistency; both layers should be set together for full privacy.")
 
 	// TURN (RFC 8656) relay — optional client-side transport for peers
 	// behind UDP-hostile NATs or running in hide-IP mode. Empty provider
@@ -101,6 +103,22 @@ func main() {
 	}
 
 	logging.Setup(*logLevel, *logFormat)
+
+	// v1.9.0-jf.11a: -hide-ip preset expands to -no-registry-endpoint +
+	// -outbound-turn-only unless those sub-flags were explicitly set.
+	// Explicit value wins (operator can compose, e.g.
+	// `-hide-ip -no-registry-endpoint=false` to get outbound-turn-only
+	// but keep registry publishing).
+	if *hideIP {
+		visited := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+		if !visited["no-registry-endpoint"] {
+			*noRegistryEndpoint = true
+		}
+		if !visited["outbound-turn-only"] {
+			*outboundTurnOnly = true
+		}
+	}
 
 	turnProv := buildTURNProvider(
 		*turnProvider,
@@ -145,6 +163,7 @@ func main() {
 		TrustAutoApprove:      *trustAutoApprove,
 		TURNProvider:          turnProv,
 		NoRegistryEndpoint:    *noRegistryEndpoint,
+		OutboundTURNOnly:      *outboundTurnOnly,
 	})
 
 	if err := d.Start(); err != nil {

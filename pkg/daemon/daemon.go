@@ -79,6 +79,21 @@ type Config struct {
 	// never published to the registry. v1.9.0-jf.10.
 	NoRegistryEndpoint bool
 
+	// OutboundTURNOnly, when true, forces writeFrame to route every
+	// outbound tunnel frame through our own TURN allocation. Peers
+	// observe our traffic with source IP = TURN server's anycast
+	// address, never our real IP. Mirrors WebRTC
+	// iceTransportPolicy='relay' (RFC 8828 Mode 3) — the industry-
+	// standard "don't leak IP to peers" switch. Requires TURNProvider
+	// to be non-nil; Start() fails fast otherwise.
+	//
+	// This closes the last IP-leak gap after NoRegistryEndpoint: even
+	// if a peer has cached our address from before, our outbound
+	// frames no longer reveal source IP. Peers retrying direct to a
+	// stale cached addr see failure; their daemon eventually learns
+	// the TURN-source addr and caches it instead. v1.9.0-jf.11a.
+	OutboundTURNOnly bool
+
 	// Built-in services
 	DisableEcho         bool // disable built-in echo service (port 7)
 	DisableDataExchange bool // disable built-in data exchange service (port 1001)
@@ -423,6 +438,41 @@ func (d *Daemon) reapPerSrcSYN() {
 }
 
 func (d *Daemon) Start() error {
+	// v1.9.0-jf.11a: fail-closed validation on the privacy flags. The
+	// OutboundTURNOnly semantic is "peers see only our TURN-assigned
+	// address." Without TURNProvider, that semantic is impossible; we
+	// refuse to start rather than silently degrade to non-relay
+	// routing (which would leak the very IP the flag exists to hide).
+	if d.config.OutboundTURNOnly && d.config.TURNProvider == nil {
+		return fmt.Errorf("-outbound-turn-only requires -turn-provider " +
+			"(static or cloudflare) — refusing to start in a configuration " +
+			"that would silently leak source IP")
+	}
+
+	// Cross-layer consistency warnings. The three privacy flags are
+	// orthogonal but pair-wise meaningful; each half-config leaves a
+	// specific leak channel open that the operator should know about.
+	if d.config.OutboundTURNOnly && !d.config.NoRegistryEndpoint {
+		slog.Warn("outbound-turn-only without no-registry-endpoint: " +
+			"outbound traffic now routes via TURN, but peers can still " +
+			"learn your IP via registry.Lookup. Pair with " +
+			"-no-registry-endpoint for full privacy, or use the -hide-ip " +
+			"preset.")
+	}
+	if d.config.NoRegistryEndpoint && !d.config.OutboundTURNOnly {
+		slog.Warn("no-registry-endpoint without outbound-turn-only: " +
+			"registry lookups won't reveal your IP, but direct outbound " +
+			"writes from this daemon still will. Pair with " +
+			"-outbound-turn-only for full privacy, or use the -hide-ip " +
+			"preset.")
+	}
+	if d.config.TURNProvider != nil && !d.config.OutboundTURNOnly && !d.config.NoRegistryEndpoint {
+		slog.Info("turn-provider configured but no Pilot-layer hide-ip " +
+			"flags enabled. TURN is available as a fallback; set -hide-ip " +
+			"for the full privacy preset if you want outbound traffic to " +
+			"route via TURN and the registry to hide your endpoint.")
+	}
+
 	// 0. Resolve email: flag > owner (deprecated) > account file
 	email := d.config.Email
 	if email == "" && d.config.Owner != "" {
@@ -507,6 +557,14 @@ func (d *Daemon) Start() error {
 		if err := d.tunnels.ListenTURN(d.config.TURNProvider); err != nil {
 			return fmt.Errorf("turn tunnel listen: %w", err)
 		}
+	}
+
+	// v1.9.0-jf.11a: latch OutboundTURNOnly into the TunnelManager so
+	// writeFrame sees it on every subsequent outbound frame.
+	d.tunnels.SetOutboundTURNOnly(d.config.OutboundTURNOnly)
+	if d.config.OutboundTURNOnly {
+		slog.Info("outbound-turn-only enabled: all outbound tunnel " +
+			"traffic routes through local TURN allocation")
 	}
 
 	// Collect LAN addresses using the actual tunnel port (not config port which may be 0)
@@ -1535,6 +1593,15 @@ type DaemonInfo struct {
 	// TURN is disabled or pending; omitempty so jf.7 clients see the
 	// same wire shape when TURN is off.
 	TURNEndpoint string `json:"turn_endpoint,omitempty"`
+
+	// OutboundTURNOnly and NoRegistryEndpoint mirror the daemon's
+	// Config flags of the same name (v1.9.0-jf.11a / jf.10). Expose
+	// them so app-layer callers (e.g. Entmoot's -hide-ip check) can
+	// verify the local Pilot is in the expected privacy posture and
+	// WARN the operator if not. omitempty so jf.10 and earlier
+	// clients decode cleanly (fields default to false).
+	OutboundTURNOnly   bool `json:"outbound_turn_only,omitempty"`
+	NoRegistryEndpoint bool `json:"no_registry_endpoint,omitempty"`
 }
 
 // Info returns current daemon status.
@@ -1620,6 +1687,8 @@ func (d *Daemon) Info() *DaemonInfo {
 		PeerList:              peerList,
 		ConnList:              d.ports.ConnectionList(),
 		TURNEndpoint:          turnEndpoint,
+		OutboundTURNOnly:      d.config.OutboundTURNOnly,
+		NoRegistryEndpoint:    d.config.NoRegistryEndpoint,
 	}
 }
 

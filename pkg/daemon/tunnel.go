@@ -138,6 +138,13 @@ type TunnelManager struct {
 	// turnPermittedPeerEvictTTL of no re-observation so the set stays
 	// bounded under peer churn. Only populated when tm.turn != nil.
 	turnPermittedPeers map[string]time.Time
+
+	// outboundTURNOnly, when true, forces writeFrame to route EVERY
+	// outbound frame through the local TURN allocation. Set from
+	// Config.OutboundTURNOnly in daemon.Start() before any frames
+	// flow. Read-mostly thereafter; guarded by tm.mu because
+	// writeFrame reads it under RLock alongside other fields. v1.9.0-jf.11a.
+	outboundTURNOnly bool
 	crypto    map[uint32]*peerCrypto            // node_id → encryption state
 	recvCh    chan *IncomingPacket
 	done      chan struct{}  // closed on Close() to stop dispatchLoop
@@ -480,6 +487,17 @@ func (tm *TunnelManager) ListenTURN(provider turncreds.Provider) error {
 	tm.startTURNPermissionEviction()
 	slog.Info("turn transport listening", "relay", t.LocalAddr())
 	return nil
+}
+
+// SetOutboundTURNOnly latches the OutboundTURNOnly flag. Called once
+// from daemon.Start() before any frames flow. When true, writeFrame
+// routes every outbound frame through the local TURN allocation
+// (fail-closed: if no TURN cached conn is available, returns an error
+// rather than falling back to beacon or direct UDP). v1.9.0-jf.11a.
+func (tm *TunnelManager) SetOutboundTURNOnly(b bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.outboundTURNOnly = b
 }
 
 // TURNLocalAddr returns the server-assigned relay address, or nil if
@@ -871,7 +889,66 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	bAddr := tm.beaconAddr
 	cachedConn := tm.peerConns[nodeID]
 	hasTURNEp := tm.peerTURN[nodeID] != nil
+	turnOnly := tm.outboundTURNOnly
 	tm.mu.RUnlock()
+
+	// v1.9.0-jf.11a: OutboundTURNOnly mode — force all outbound frames
+	// through the local TURN allocation. Reject every tier that would
+	// route via beacon (leaks metadata to beacon operator) or direct
+	// UDP (leaks our source IP to the peer). Fail-closed: if no TURN
+	// path exists, return an error rather than silently falling back.
+	if turnOnly {
+		// Use cached turn/turn-relay conn if present (populated by
+		// DialTURNForPeer or DialTURNRelayForPeer).
+		if cachedConn != nil {
+			net := cachedConn.RemoteEndpoint().Network()
+			if net == "turn" || net == "turn-relay" {
+				if err := cachedConn.Send(frame); err == nil {
+					atomic.AddUint64(&tm.PktsSent, 1)
+					atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+					return nil
+				} else {
+					// Cached TURN conn failed. Evict and fall through to dial.
+					tm.mu.Lock()
+					if tm.peerConns[nodeID] == cachedConn {
+						delete(tm.peerConns, nodeID)
+						_ = cachedConn.Close()
+					}
+					tm.mu.Unlock()
+					slog.Debug("outbound-turn-only: cached turn conn failed, re-dialling",
+						"node_id", nodeID, "network", net, "error", err)
+				}
+			}
+		}
+		// Lazily dial turn-relay if the peer advertised a TURN endpoint.
+		// The jf.9 fallback path; reuses DialTURNRelayForPeer which in
+		// turn uses the local TURN client's allocation (or raw UDP if
+		// tm.turn is nil, per jf.9's asymmetric mode).
+		if hasTURNEp {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			dialErr := tm.DialTURNRelayForPeer(ctx, nodeID)
+			cancel()
+			if dialErr == nil {
+				tm.mu.RLock()
+				cc := tm.peerConns[nodeID]
+				tm.mu.RUnlock()
+				if cc != nil {
+					if err := cc.Send(frame); err == nil {
+						atomic.AddUint64(&tm.PktsSent, 1)
+						atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+						return nil
+					}
+				}
+			} else {
+				slog.Debug("outbound-turn-only: turn-relay dial failed",
+					"node_id", nodeID, "error", dialErr)
+			}
+		}
+		return fmt.Errorf("outbound-turn-only: no TURN path for node %d "+
+			"(peer advertised no TURN endpoint, or local TURN allocation "+
+			"failed; tunnel traffic refused rather than leak source IP "+
+			"via direct UDP or beacon)", nodeID)
+	}
 
 	// Tier 1 (beacon relay) — SKIPPED when this peer advertised a
 	// TURN endpoint (v1.9.0-jf.10). A TURN advertisement is an
