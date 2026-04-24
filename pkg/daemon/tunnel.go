@@ -800,6 +800,74 @@ func (tm *TunnelManager) IsRelayPeer(nodeID uint32) bool {
 	return p != nil && p.viaRelay
 }
 
+// SendViaBeacon writes a pre-encoded tunnel frame through the beacon
+// relay toward nodeID without mutating path.viaRelay for that peer.
+//
+// Used by the racing dial path in DialConnection (v1.9.0-jf.11a.3):
+// a relay SYN retransmission goroutine runs alongside direct UDP
+// retries with a 200 ms RFC 8305 head-start. Whichever path first
+// elicits an authenticated reply flips viaRelay naturally via
+// updatePathRelay()/updatePathDirect() on ingress, so the sender
+// side does NOT call SetRelayPeer during the race. Calling
+// SetRelayPeer from a losing relay retry would poison the path for
+// the next dial — SendViaBeacon sidesteps that by bypassing path
+// state entirely.
+//
+// The encoding matches writeFrame's tier-1 beacon-relay envelope:
+// [BeaconMsgRelay][senderNodeID(4)][destNodeID(4)][frame...].
+//
+// Returns an error if no beacon is configured (the racing dial's
+// relay goroutine no-ops in that case instead of propagating).
+func (tm *TunnelManager) SendViaBeacon(nodeID uint32, frame []byte) error {
+	tm.mu.RLock()
+	bAddr := tm.beaconAddr
+	tm.mu.RUnlock()
+	if bAddr == nil {
+		return fmt.Errorf("beacon not configured")
+	}
+	msg := make([]byte, 1+4+4+len(frame))
+	msg[0] = protocol.BeaconMsgRelay
+	binary.BigEndian.PutUint32(msg[1:5], tm.loadNodeID())
+	binary.BigEndian.PutUint32(msg[5:9], nodeID)
+	copy(msg[9:], frame)
+	n, err := tm.udp.WriteToUDPAddr(msg, bAddr)
+	if err == nil {
+		atomic.AddUint64(&tm.PktsSent, 1)
+		atomic.AddUint64(&tm.BytesSent, uint64(n))
+	}
+	return err
+}
+
+// SendPacketViaBeacon is the marshaled-packet variant of SendViaBeacon:
+// marshals pkt, wraps it in the appropriate tunnel frame (encrypted if
+// a key exchange has completed, plaintext otherwise), and ships the
+// frame through the beacon relay envelope without touching viaRelay.
+// Mirrors SendTo's encrypt/plaintext branching so the relay-retry
+// goroutine in DialConnection doesn't have to duplicate that logic.
+func (tm *TunnelManager) SendPacketViaBeacon(nodeID uint32, pkt *protocol.Packet) error {
+	data, err := pkt.Marshal()
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if tm.encrypt {
+		tm.mu.RLock()
+		pc := tm.crypto[nodeID]
+		tm.mu.RUnlock()
+		if pc != nil && pc.ready {
+			frame := tm.encryptFrame(pc, data)
+			return tm.SendViaBeacon(nodeID, frame)
+		}
+		// No key yet — let the normal Send path handle queueing;
+		// the racing relay goroutine shouldn't kick off a key
+		// exchange (that's the primary dial's job).
+		return fmt.Errorf("no ready key for node %d", nodeID)
+	}
+	frame := make([]byte, 4+len(data))
+	copy(frame[0:4], protocol.TunnelMagic[:])
+	copy(frame[4:], data)
+	return tm.SendViaBeacon(nodeID, frame)
+}
+
 // RelayPeerIDs returns the node IDs of all peers whose last
 // authenticated path is via relay.
 func (tm *TunnelManager) RelayPeerIDs() []uint32 {

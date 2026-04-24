@@ -166,6 +166,24 @@ const (
 	// short so the dial path doesn't stall the caller if TCP is also
 	// blocked — the existing relay fallback runs next.
 	DialTCPFallbackTimeout = 5 * time.Second
+
+	// DialRelayHeadStart is the RFC 8305 Happy-Eyeballs delay applied
+	// to the parallel relay-retry goroutine in DialConnection (v1.9.0-
+	// jf.11a.3). When direct UDP is reachable, direct typically wins
+	// at ~50 ms — well before the head-start expires — so the relay
+	// goroutine never fires a single beacon frame and the happy path
+	// is unchanged. When the cached direct endpoint is stale,
+	// relay lands in ~head-start + beacon-RTT (~300 ms) instead of
+	// paying the full 7 s phase-1 retry exhaustion. 200 ms matches the
+	// RFC 8305 / libp2p / HTTP dialer convention.
+	DialRelayHeadStart = 200 * time.Millisecond
+
+	// DialRelayRetries is the number of SYN retransmissions the
+	// racing-relay goroutine issues before giving up (v1.9.0-jf.11a.3).
+	// Matches DialDirectRetries so that if neither path establishes
+	// after both budgets exhaust, the existing phase-2 "SetRelayPeer
+	// + serial retries" block in the main dial loop still runs.
+	DialRelayRetries = 3
 )
 
 // Zero-window probe constants.
@@ -2292,6 +2310,35 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	if relayActive {
 		directRetries = 0 // skip direct phase, go straight to relay
 	}
+
+	// v1.9.0-jf.11a.3: Race direct + relay concurrently. While the
+	// main retry loop drives direct UDP retransmissions (phase 1),
+	// a parallel goroutine re-transmits the same SYN through the
+	// beacon relay with an RFC 8305-style 200 ms head-start. When
+	// the cached direct endpoint is stale, the relay copy lands in
+	// ~300 ms instead of waiting out the 7 s phase-1 exhaustion.
+	// Whichever path elicits an authenticated reply first flips
+	// viaRelay via updatePathDirect()/updatePathRelay() on ingress —
+	// we deliberately do NOT call SetRelayPeer here, so a losing
+	// relay goroutine can't poison future dials.
+	//
+	// Skipped when: (a) the peer is already relay-sticky (the main
+	// loop's serial relay retries will drive it; no race needed);
+	// (b) no beacon is configured (typical for -hide-ip peers that
+	// route exclusively via TURN).
+	raceStop := make(chan struct{})
+	defer close(raceStop)
+	if !relayActive && d.config.BeaconAddr != "" {
+		// Copy the SYN so the racing goroutine's Marshal is
+		// race-free against the main loop's `syn.Seq = …` write.
+		// Packet is a value-struct and SYN's Payload is nil, so a
+		// shallow copy is safe. Capture under conn.Mu for clean
+		// synchronization with the initial SendSeq++ above.
+		conn.Mu.Lock()
+		synForRelay := *syn
+		conn.Mu.Unlock()
+		go d.racingRelaySYN(dstAddr.Node, &synForRelay, raceStop)
+	}
 	// Initial RTO is path-aware (v1.9.0-jf.4). Relay-mode peers get a
 	// larger initial budget because the beacon hop adds real RTT.
 	rto := DialInitialRTO
@@ -2367,6 +2414,48 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 				rto = DialMaxRTO
 			}
 			timer.Reset(rto)
+		}
+	}
+}
+
+// racingRelaySYN re-transmits the SYN packet through the beacon relay
+// in parallel with DialConnection's main direct-retry loop (v1.9.0-
+// jf.11a.3). Waits DialRelayHeadStart first so direct wins
+// unobstructed when reachable, then issues up to DialRelayRetries
+// beacon-wrapped retransmissions with exponential backoff starting at
+// DialRelayInitialRTO.
+//
+// The goroutine uses SendPacketViaBeacon, which does NOT mutate
+// path.viaRelay — the peer's authenticated SYN-ACK reply will update
+// the path state naturally via updatePathRelay()/updatePathDirect()
+// on ingress. Exits immediately when stop is closed (DialConnection
+// returning for any reason).
+//
+// Errors from SendPacketViaBeacon are swallowed: the goroutine is
+// best-effort and must never take down the main dial. The caller
+// observes success only through conn.State flipping to Established.
+//
+// The caller is responsible for passing a SYN pointer that is NOT
+// shared with the main dial loop (e.g. a local copy taken under
+// conn.Mu before this goroutine launches). Otherwise the main loop's
+// `syn.Seq = …` writes would race with our Marshal.
+func (d *Daemon) racingRelaySYN(nodeID uint32, syn *protocol.Packet, stop <-chan struct{}) {
+	select {
+	case <-stop:
+		return
+	case <-time.After(DialRelayHeadStart):
+	}
+	rto := DialRelayInitialRTO
+	for i := 0; i < DialRelayRetries; i++ {
+		_ = d.tunnels.SendPacketViaBeacon(nodeID, syn)
+		select {
+		case <-stop:
+			return
+		case <-time.After(rto):
+		}
+		rto = rto * 2
+		if rto > DialMaxRTO {
+			rto = DialMaxRTO
 		}
 	}
 }

@@ -10,6 +10,102 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11a.3] - 2026-04-25
+
+### Fixed
+
+- **7-second `DialConnection` stall when the cached direct endpoint
+  is stale.** `DialConnection` was strictly serial: 3 direct-UDP
+  retries at 1 s → 2 s → 4 s RTO (~7 s total), THEN flip the peer to
+  relay-sticky and run 3 more beacon retries. Every new
+  tunnel/stream whose cached direct address was unreachable paid
+  the full 7 s relay-kickover tax. Live evidence from phobos
+  2026-04-24:
+
+  ```
+  21:54:11.570  same-LAN peer detected, using LAN address
+                node_id=45491 lan_addr=192.168.1.201:61618
+  21:54:18.573  direct dial timed out, switching to relay
+                node_id=45491
+  ```
+
+  Compounded by Entmoot's per-transport-ad fanout retry budget —
+  each stale address cost 7 s, chaining across retries to 49 s
+  before giving up.
+
+  The fix applies the universal cross-industry pattern (RFC 8305
+  Happy-Eyeballs / Tailscale magicsock / iroh / WebRTC ICE /
+  libp2p): race direct + relay from `t=0` with a 200 ms head-start
+  for direct. When direct is reachable, direct wins at ~50 ms — well
+  before the head-start expires — and the relay goroutine never
+  fires a single beacon frame (zero-cost on the happy path). When
+  direct is stale, relay lands in `head-start + beacon RTT` ≈ 300 ms
+  instead of the old 7 s. ~23× speedup on the stale-cache case.
+
+### Added
+
+- **`TunnelManager.SendViaBeacon(nodeID, frame)`** — new primitive
+  that writes a pre-encoded tunnel frame through the beacon relay
+  WITHOUT mutating `path.viaRelay` for the peer. Used by the racing
+  dial path: a losing relay-retry goroutine must not poison
+  `viaRelay` for the next dial, and the receiver's side flips
+  `viaRelay` naturally via `updatePathRelay()` on ingress.
+  Complementary `SendPacketViaBeacon` marshals a packet and routes
+  it through the same envelope.
+
+- **`Daemon.racingRelaySYN`** — DialConnection goroutine that
+  re-transmits the SYN through beacon with `DialRelayHeadStart` =
+  200 ms head-start and up to `DialRelayRetries` = 3 retries at
+  `DialRelayInitialRTO` exponential backoff. Cancelled via a
+  `raceStop` channel closed by `DialConnection`'s defer on any
+  return path (success, timeout, or error).
+
+### Behaviour
+
+- **Privacy is preserved, by construction.** Both paths funnel
+  through `writeFrame` (direct path) or `SendViaBeacon` (relay
+  path). `-outbound-turn-only` still errors on every non-TURN send,
+  so `-hide-ip` peers see no new behavior — their dials collapse to
+  the existing TURN-relay path, which was already the only route.
+  Non-hide-ip peers get the speedup.
+- **No state mutation during the race.** The racing code never
+  calls `SetRelayPeer(true)`. Only authenticated-ingress frames
+  update `path.viaRelay`, so a losing relay retry cannot flip the
+  peer into relay-sticky mode. The existing phase-2 retry loop
+  (the serial `SetRelayPeer + 3 retries` block) still runs if both
+  racing budgets exhaust — behavior identical to pre-jf.11a.3 for
+  peers that are genuinely unreachable via either path.
+- **No wire changes, no IPC changes.** The beacon envelope emitted
+  by `SendViaBeacon` is identical to `writeFrame`'s tier-1 relay
+  encoding (`[0x05][senderID(4)][destID(4)][frame...]`). Existing
+  beacon servers accept it unchanged.
+
+### Tests
+
+- `pkg/daemon/dial_race_test.go`:
+  - `TestSendViaBeacon_EncodesRelayEnvelope` — wire format matches
+    `writeFrame` tier-1 encoding.
+  - `TestSendViaBeacon_DoesNotMutateViaRelay` — Gotcha-B guard:
+    the primitive must not flip `path.viaRelay`.
+  - `TestSendViaBeacon_ErrorsWhenBeaconUnset` — returns error when
+    `beaconAddr` is nil (racing goroutine short-circuits).
+  - `TestSendPacketViaBeacon_Plaintext` — marshaled-packet variant
+    wraps in PILT frame correctly.
+  - `TestRacingRelaySYN_WaitsForHeadStart` — no beacon traffic in
+    the first 150 ms (direct gets an exclusive early window).
+  - `TestRacingRelaySYN_ExitsOnStop` — goroutine returns promptly
+    on `close(stop)`, with no leaked frames.
+
+### Deferred
+
+- **Disco-style authenticated probes (#92 / jf.11b / jf.12)** — the
+  proper structural answer for authenticated path selection,
+  peer-reflexive learning, and MTU discovery. jf.11a.3 is
+  scaffolding; disco plugs into the same racing frame later.
+- **Same-LAN matcher (#85)** — jf.11a.3 eliminates the 7 s tax,
+  making the occasional same-LAN false-positive cosmetic rather
+  than painful. Keep #85 queued for log cleanliness.
+
 ## [v1.9.0-jf.11a.2] - 2026-04-24
 
 ### Fixed
