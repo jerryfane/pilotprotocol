@@ -1,24 +1,44 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/pkg/config"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/turncreds"
 	"github.com/TeoSlayer/pilotprotocol/pkg/logging"
 )
 
 var version = "dev"
 
 func main() {
+	// Subcommand dispatch. Must happen before flag.Parse() so subcommand
+	// runners see their own args in os.Args[2:]. Only a couple of
+	// subcommands exist; everything else falls through to the normal
+	// daemon-start path.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "turn-setup":
+			os.Exit(runTurnSetup(os.Args[2:]))
+		case "turn-test":
+			os.Exit(runTurnTest(os.Args[2:]))
+		case "version":
+			fmt.Println(version)
+			os.Exit(0)
+		}
+	}
+
 	configPath := flag.String("config", "", "path to config file (JSON)")
 	registryAddr := flag.String("registry", "34.71.57.205:9000", "registry server address")
 	beaconAddr := flag.String("beacon", "34.71.57.205:9001", "beacon server address")
@@ -49,6 +69,18 @@ func main() {
 	adminToken := flag.String("admin-token", "", "admin token for network operations")
 	networks := flag.String("networks", "", "comma-separated network IDs to auto-join at startup")
 	trustAutoApprove := flag.Bool("trust-auto-approve", false, "automatically approve all incoming trust handshakes")
+
+	// TURN (RFC 8656) relay — optional client-side transport for peers
+	// behind UDP-hostile NATs or running in hide-IP mode. Empty provider
+	// = disabled. See pkg/daemon/turncreds for credential backends.
+	turnProvider := flag.String("turn-provider", "", `TURN credential provider ("" disables TURN; "static"=long-lived creds; "cloudflare"=short-lived Cloudflare Realtime TURN)`)
+	turnServer := flag.String("turn-server", "", "TURN server host:port (required when -turn-provider=static)")
+	turnTransport := flag.String("turn-transport", "udp", "TURN client→server transport: udp|tcp|tls")
+	turnStaticUser := flag.String("turn-static-user", "", "TURN username (required when -turn-provider=static)")
+	turnStaticPass := flag.String("turn-static-pass", "", "TURN password (required when -turn-provider=static; insecure — prefer `pilot-daemon turn-setup static`)")
+	cloudflareTurnCredsFile := flag.String("cloudflare-turn-creds-file", defaultCloudflareTurnCredsFile(), "path to Cloudflare TURN credentials JSON (turn_token_id + api_token)")
+	cloudflareTurnTTL := flag.Duration("cloudflare-turn-ttl", 1*time.Hour, "Cloudflare TURN credential TTL (60s ≤ value ≤ 48h)")
+
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	logFormat := flag.String("log-format", "text", "log format (text, json)")
@@ -68,6 +100,16 @@ func main() {
 	}
 
 	logging.Setup(*logLevel, *logFormat)
+
+	turnProv := buildTURNProvider(
+		*turnProvider,
+		*turnServer,
+		*turnTransport,
+		*turnStaticUser,
+		*turnStaticPass,
+		*cloudflareTurnCredsFile,
+		*cloudflareTurnTTL,
+	)
 
 	d := daemon.New(daemon.Config{
 		RegistryAddr:          *registryAddr,
@@ -100,6 +142,7 @@ func main() {
 		Networks:              parseNetworkIDs(*networks),
 		Version:               version,
 		TrustAutoApprove:      *trustAutoApprove,
+		TURNProvider:          turnProv,
 	})
 
 	if err := d.Start(); err != nil {
@@ -113,6 +156,80 @@ func main() {
 
 	slog.Info("shutting down")
 	d.Stop()
+}
+
+// defaultCloudflareTurnCredsFile returns the default path for the
+// Cloudflare TURN credentials file, resolving "~/.pilot/..." against
+// the current user's home. Falls back to a literal "~" expansion if
+// os.UserHomeDir fails.
+func defaultCloudflareTurnCredsFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "~/.pilot/cloudflare-turn.json"
+	}
+	return filepath.Join(home, ".pilot", "cloudflare-turn.json")
+}
+
+// cloudflareTurnCredsFile is the on-disk format for the Cloudflare
+// TURN token: { "turn_token_id": "...", "api_token": "..." }.
+type cloudflareTurnCredsFile struct {
+	TurnTokenID string `json:"turn_token_id"`
+	APIToken    string `json:"api_token"`
+}
+
+// buildTURNProvider constructs a turncreds.Provider from the
+// -turn-provider family of flags. On any validation or file I/O error
+// it calls log.Fatalf — the daemon should not start with a
+// half-configured TURN backend.
+func buildTURNProvider(
+	kind, server, transport, staticUser, staticPass, cfFile string,
+	cfTTL time.Duration,
+) turncreds.Provider {
+	switch kind {
+	case "":
+		return nil
+
+	case "static":
+		p, err := turncreds.NewStaticProvider(server, transport, staticUser, staticPass)
+		if err != nil {
+			log.Fatalf("turn-provider=static: %v", err)
+		}
+		if staticPass != "" {
+			slog.Warn("turn-static-pass on command line is insecure; " +
+				"prefer `pilot-daemon turn-setup static` which reads the password from stdin")
+		}
+		return p
+
+	case "cloudflare":
+		if cfFile == "" {
+			log.Fatalf("turn-provider=cloudflare: -cloudflare-turn-creds-file is required")
+		}
+		data, err := os.ReadFile(cfFile)
+		if err != nil {
+			log.Fatalf("turn-provider=cloudflare: read %s: %v", cfFile, err)
+		}
+		var creds cloudflareTurnCredsFile
+		if err := json.Unmarshal(data, &creds); err != nil {
+			log.Fatalf("turn-provider=cloudflare: parse %s: %v", cfFile, err)
+		}
+		if creds.TurnTokenID == "" || creds.APIToken == "" {
+			log.Fatalf("turn-provider=cloudflare: %s is missing turn_token_id or api_token", cfFile)
+		}
+		p, err := turncreds.NewCloudflareProvider(turncreds.CloudflareOptions{
+			TokenID:   creds.TurnTokenID,
+			APIToken:  creds.APIToken,
+			TTL:       cfTTL,
+			Transport: transport,
+		})
+		if err != nil {
+			log.Fatalf("turn-provider=cloudflare: %v", err)
+		}
+		return p
+
+	default:
+		log.Fatalf(`turn-provider: unknown value %q (want "", "static", or "cloudflare")`, kind)
+		return nil
+	}
 }
 
 // parseNetworkIDs parses a comma-separated string of network IDs into a uint16 slice.

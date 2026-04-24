@@ -1323,10 +1323,12 @@ func (s *IPCServer) handleSetPeerEndpoints(conn *ipcConn, payload []byte) {
 		return
 	}
 	installed := 0
+	installedTURN := 0
 	for _, ep := range eps {
 		if ep.network == "tcp" && ep.addr != "" {
 			if err := s.daemon.tunnels.AddPeerTCPEndpoint(nodeID, ep.addr); err != nil {
 				slog.Warn("ipc: SetPeerEndpoints install failed",
+					slog.String("network", "tcp"),
 					slog.Uint64("node_id", uint64(nodeID)),
 					slog.String("addr", ep.addr),
 					slog.String("err", err.Error()))
@@ -1334,16 +1336,29 @@ func (s *IPCServer) handleSetPeerEndpoints(conn *ipcConn, payload []byte) {
 			}
 			installed++
 		}
+		if ep.network == "turn" && ep.addr != "" {
+			if err := s.daemon.tunnels.AddPeerTURNEndpoint(nodeID, ep.addr); err != nil {
+				slog.Warn("ipc: SetPeerEndpoints install failed",
+					slog.String("network", "turn"),
+					slog.Uint64("node_id", uint64(nodeID)),
+					slog.String("addr", ep.addr),
+					slog.String("err", err.Error()))
+				continue
+			}
+			installedTURN++
+		}
 		// UDP endpoints ignored for now — advisory only; the daemon's
 		// existing dial path discovers them via registry/same-LAN probes.
 	}
 	slog.Debug("ipc: SetPeerEndpoints applied",
 		slog.Uint64("node_id", uint64(nodeID)),
-		slog.Int("installed_tcp", installed))
+		slog.Int("installed_tcp", installed),
+		slog.Int("installed_turn", installedTURN))
 
 	data, _ := json.Marshal(map[string]interface{}{
-		"node_id":       nodeID,
-		"installed_tcp": installed,
+		"node_id":        nodeID,
+		"installed_tcp":  installed,
+		"installed_turn": installedTURN,
 	})
 	resp := make([]byte, 1+len(data))
 	resp[0] = CmdSetPeerEndpointsOK

@@ -2,8 +2,11 @@ package daemon
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 )
 
 // The tests below lock down the v1.9.0-jf.4 reply-on-ingress routing
@@ -236,6 +239,105 @@ func TestPeerPath_UpdatePathRelayPreservesDirect(t *testing.T) {
 	}
 }
 
+// stubDialedConn is a transport.DialedConn fake that records every
+// Send and never errors. Used to validate writeFrame's cached-conn
+// path without standing up a real transport.
+type stubDialedConn struct {
+	network string
+	remote  string
+	sends   atomic.Int32
+	last    atomic.Value // []byte
+}
+
+func (s *stubDialedConn) Send(frame []byte) error {
+	s.sends.Add(1)
+	buf := make([]byte, len(frame))
+	copy(buf, frame)
+	s.last.Store(buf)
+	return nil
+}
+
+type stubEndpoint struct{ network, addr string }
+
+func (e *stubEndpoint) Network() string { return e.network }
+func (e *stubEndpoint) String() string  { return e.addr }
+
+func (s *stubDialedConn) RemoteEndpoint() transport.Endpoint {
+	return &stubEndpoint{network: s.network, addr: s.remote}
+}
+
+func (s *stubDialedConn) Close() error { return nil }
+
+// TestWriteFrame_UsesCachedTURNConn validates that once a TURN
+// DialedConn is installed in peerConns (as Part A2 does for TURN via
+// DialTURNForPeer → writeFrame's cached-conn slot), writeFrame routes
+// frames through it rather than UDP. Mirrors the existing invariant
+// TCP relies on — this is why TURN needs no writeFrame changes.
+func TestWriteFrame_UsesCachedTURNConn(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	const peer uint32 = 4242
+
+	stub := &stubDialedConn{network: "turn", remote: "198.51.100.77:3478"}
+
+	tm.mu.Lock()
+	tm.peerConns[peer] = stub
+	tm.mu.Unlock()
+
+	// writeFrame requires tm.udp to be non-nil for the fallback branch,
+	// but never reaches it here because the cached non-UDP conn wins.
+	payload := []byte{0x01, 0x02, 0x03, 0x04}
+	if err := tm.writeFrame(peer, nil, payload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if got := stub.sends.Load(); got != 1 {
+		t.Fatalf("stub.sends=%d, want 1", got)
+	}
+	last := stub.last.Load().([]byte)
+	if string(last) != string(payload) {
+		t.Fatalf("payload mismatch: %x vs %x", last, payload)
+	}
+}
+
+// TestAddPeerTURNEndpoint_MapPopulated locks in that the setter lands
+// the endpoint in peerTURN and HasTURNEndpoint reflects it. The
+// integration with SetPeerEndpoints is exercised in ipc_test.go.
+func TestAddPeerTURNEndpoint_MapPopulated(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	const peer uint32 = 7
+
+	if tm.HasTURNEndpoint(peer) {
+		t.Fatalf("fresh peer should not have a TURN endpoint")
+	}
+	if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.7:3478"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
+	if !tm.HasTURNEndpoint(peer) {
+		t.Fatalf("after AddPeerTURNEndpoint, HasTURNEndpoint must be true")
+	}
+
+	// RemovePeer must wipe peerTURN too (Part A2 contract — mirrors peerTCP).
+	tm.RemovePeer(peer)
+	if tm.HasTURNEndpoint(peer) {
+		t.Fatalf("RemovePeer must clear peerTURN")
+	}
+}
+
+// TestAddPeerTURNEndpoint_Invalid checks that malformed addrs don't
+// silently land in the map.
+func TestAddPeerTURNEndpoint_Invalid(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	if err := tm.AddPeerTURNEndpoint(1, "not-a-host-port"); err == nil {
+		t.Fatalf("malformed addr should error")
+	}
+	if err := tm.AddPeerTURNEndpoint(1, ""); err == nil {
+		t.Fatalf("empty addr should error")
+	}
+}
+
 // v1.9.0-jf.5: RemovePeer must wipe ALL per-peer state, not just
 // paths + crypto. Otherwise stale peerCaps / lastRecoveryPILA /
 // peerPubKeys / peerTCP / peerConns can leak into a re-added peer.
@@ -253,6 +355,9 @@ func TestPeerPath_RemovePeerClearsAllState(t *testing.T) {
 	if err := tm.AddPeerTCPEndpoint(peer, "1.2.3.4:4443"); err != nil {
 		t.Fatalf("AddPeerTCPEndpoint: %v", err)
 	}
+	if err := tm.AddPeerTURNEndpoint(peer, "5.6.7.8:3478"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
 
 	tm.RemovePeer(peer)
 
@@ -269,6 +374,9 @@ func TestPeerPath_RemovePeerClearsAllState(t *testing.T) {
 	}
 	if _, ok := tm.peerTCP[peer]; ok {
 		t.Errorf("peerTCP entry leaked after RemovePeer")
+	}
+	if _, ok := tm.peerTURN[peer]; ok {
+		t.Errorf("peerTURN entry leaked after RemovePeer")
 	}
 	if _, ok := tm.lastRecoveryPILA[peer]; ok {
 		t.Errorf("lastRecoveryPILA entry leaked after RemovePeer")

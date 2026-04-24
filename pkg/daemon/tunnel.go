@@ -20,6 +20,7 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/turncreds"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
@@ -106,6 +107,7 @@ type TunnelManager struct {
 	mu      sync.RWMutex
 	udp     *transport.UDPTransport     // owns the UDP socket; nil before Listen
 	tcp     *transport.TCPTransport     // optional TCP fallback; nil when `-tcp-listen` is not set
+	turn    *transport.TURNTransport    // optional TURN relay; nil when `-turn-provider` is empty
 	inbound chan transport.InboundFrame // sink every transport writes to; dispatchLoop reads
 
 	// paths is the single source of truth for how to reach each peer.
@@ -126,6 +128,7 @@ type TunnelManager struct {
 	// needed; symmetry falls out of the per-peer state.
 	paths     map[uint32]*peerPath              // node_id → last-authenticated ingress path
 	peerTCP   map[uint32]*transport.TCPEndpoint // node_id → TCP endpoint, populated from registry lookup when advertised
+	peerTURN  map[uint32]*transport.TURNEndpoint // node_id → TURN relayed endpoint, populated from SetPeerEndpoints
 	peerConns map[uint32]transport.DialedConn   // node_id → cached DialedConn (whichever transport won the last Dial)
 	crypto    map[uint32]*peerCrypto            // node_id → encryption state
 	recvCh    chan *IncomingPacket
@@ -254,6 +257,7 @@ func NewTunnelManager() *TunnelManager {
 		inbound:          make(chan transport.InboundFrame, RecvChSize),
 		paths:            make(map[uint32]*peerPath),
 		peerTCP:          make(map[uint32]*transport.TCPEndpoint),
+		peerTURN:         make(map[uint32]*transport.TURNEndpoint),
 		peerConns:        make(map[uint32]transport.DialedConn),
 		crypto:           make(map[uint32]*peerCrypto),
 		peerPubKeys:      make(map[uint32]ed25519.PublicKey),
@@ -411,6 +415,97 @@ func (tm *TunnelManager) HasTCPEndpoint(nodeID uint32) bool {
 	_, ok := tm.peerTCP[nodeID]
 	tm.mu.RUnlock()
 	return ok
+}
+
+// ListenTURN starts the TURN transport using provider to mint (and, for
+// short-lived creds, rotate) credentials. Mirrors ListenTCP: builds the
+// transport lazily, delivers inbound relay frames to the same
+// dispatchLoop as UDP/TCP. Returns an error if TURN is already
+// listening or the initial allocation fails.
+func (tm *TunnelManager) ListenTURN(provider turncreds.Provider) error {
+	if tm.turn != nil {
+		return fmt.Errorf("turn transport already listening")
+	}
+	if provider == nil {
+		return fmt.Errorf("turn transport: nil provider")
+	}
+	t := transport.NewTURNTransport(provider, tm.inbound)
+	if err := t.Listen("", tm.inbound); err != nil {
+		return err
+	}
+	tm.turn = t
+	slog.Info("turn transport listening", "relay", t.LocalAddr())
+	return nil
+}
+
+// TURNLocalAddr returns the server-assigned relay address, or nil if
+// TURN is not enabled. Used by daemon code that wants to advertise the
+// relay endpoint in DaemonInfo / gossip.
+func (tm *TunnelManager) TURNLocalAddr() net.Addr {
+	if tm.turn == nil {
+		return nil
+	}
+	return tm.turn.LocalAddr()
+}
+
+// AddPeerTURNEndpoint records a peer's advertised TURN relay address so
+// subsequent sends can route through the TURN transport. Call from
+// handleSetPeerEndpoints when peering advertises a "turn" endpoint.
+func (tm *TunnelManager) AddPeerTURNEndpoint(nodeID uint32, addr string) error {
+	ep, err := transport.NewTURNEndpoint(addr)
+	if err != nil {
+		return fmt.Errorf("turn endpoint %q: %w", addr, err)
+	}
+	tm.mu.Lock()
+	tm.peerTURN[nodeID] = ep
+	tm.mu.Unlock()
+	return nil
+}
+
+// HasTURNEndpoint reports whether we've recorded a TURN endpoint for
+// the given peer.
+func (tm *TunnelManager) HasTURNEndpoint(nodeID uint32) bool {
+	tm.mu.RLock()
+	_, ok := tm.peerTURN[nodeID]
+	tm.mu.RUnlock()
+	return ok
+}
+
+// DialTURNForPeer establishes a turnDialedConn for the peer and caches
+// it so subsequent writeFrame calls route via TURN. Mirrors
+// DialTCPForPeer: called from the fall-back path once UDP retries +
+// TCP fallback have both exhausted but a TURN relay endpoint is known
+// (or explicitly in hide-IP mode where TURN is the only advertised
+// path).
+func (tm *TunnelManager) DialTURNForPeer(ctx context.Context, nodeID uint32) error {
+	tm.mu.RLock()
+	t := tm.turn
+	ep := tm.peerTURN[nodeID]
+	tm.mu.RUnlock()
+
+	if t == nil {
+		return fmt.Errorf("turn transport not enabled")
+	}
+	if ep == nil {
+		return fmt.Errorf("no turn endpoint known for node %d", nodeID)
+	}
+	conn, err := t.Dial(ctx, ep)
+	if err != nil {
+		return fmt.Errorf("turn dial node %d: %w", nodeID, err)
+	}
+
+	tm.mu.Lock()
+	// Prefer any earlier winner (matches DialTCPForPeer's race handling).
+	if existing, ok := tm.peerConns[nodeID]; ok {
+		tm.mu.Unlock()
+		_ = conn.Close()
+		_ = existing
+		return nil
+	}
+	tm.peerConns[nodeID] = conn
+	tm.mu.Unlock()
+	slog.Info("peer switched to turn", "node_id", nodeID, "remote", ep.String())
+	return nil
 }
 
 // SetWebhook configures the webhook client for event notifications.
@@ -756,6 +851,14 @@ func (tm *TunnelManager) Close() error {
 			// conns + the listener and waits for its goroutines.
 			if tcpErr := tm.tcp.Close(); tcpErr != nil && connErr == nil {
 				connErr = tcpErr
+			}
+		}
+		if tm.turn != nil {
+			// Close TURN after TCP so the relay sends its Refresh(lifetime=0)
+			// before the process exits, returning the allocation to the
+			// server promptly.
+			if turnErr := tm.turn.Close(); turnErr != nil && connErr == nil {
+				connErr = turnErr
 			}
 		}
 		tm.readWg.Wait() // wait for dispatchLoop to fully exit before closing recvCh
@@ -1643,6 +1746,7 @@ func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	delete(tm.peerCaps, nodeID)
 	delete(tm.peerPubKeys, nodeID)
 	delete(tm.peerTCP, nodeID)
+	delete(tm.peerTURN, nodeID)
 	delete(tm.lastRecoveryPILA, nodeID)
 	// peerConns owns a DialedConn — close before deleting so the
 	// underlying TCP/QUIC socket is released.

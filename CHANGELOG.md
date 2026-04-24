@@ -10,6 +10,89 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.8] - 2026-04-24
+
+### Added
+
+- **TURN (RFC 8656) client transport.** A third transport alongside
+  UDP hole-punch and TCP fallback. The daemon can now allocate a
+  relay via a standards-compliant TURN server and route peer traffic
+  through it, enabling relay-only operation for peers who want to
+  hide their source IP from the mesh. Two credential providers ship:
+
+  - **static** — long-lived username/password for self-hosted
+    `coturn` or any RFC-8656-compliant TURN server.
+  - **cloudflare** — Cloudflare Realtime TURN (1 TB/mo free tier).
+    Mints short-lived ICE credentials by `POST` to
+    `https://rtc.live.cloudflare.com/v1/turn/keys/{TURN_KEY_ID}/credentials/generate-ice-servers`
+    with `Authorization: Bearer {API_TOKEN}`. A background refresh
+    loop re-mints at `TTL/2` and rotates the allocation in place
+    (new pion client + Allocate, swap under mutex, close old).
+
+  New package `pkg/daemon/turncreds/` (independent of pion/turn)
+  defines the `Provider` interface + the two implementations.
+  New file `pkg/daemon/transport/turn.go` implements the
+  `Transport` interface using `github.com/pion/turn/v5` (MIT). The
+  daemon's `writeFrame` dial-priority chain is unchanged — TURN
+  rides the existing `peerConns` cached-conn slot, populated via
+  the new `DialTURNForPeer`. `IPCServer.handleSetPeerEndpoints`
+  gains a `"turn"` case routing to `AddPeerTURNEndpoint`; wire
+  format is unchanged (the `network` string was already free-form
+  in jf.7). `DaemonInfo` grows `TURNEndpoint string,omitempty` so
+  Entmoot (or any other driver) can discover the relay address to
+  advertise.
+
+  Seven new CLI flags: `-turn-provider`, `-turn-server`,
+  `-turn-transport`, `-turn-static-user`, `-turn-static-pass`,
+  `-cloudflare-turn-creds-file`, `-cloudflare-turn-ttl`.
+
+- **Three new subcommands:**
+  - `pilot-daemon turn-setup cloudflare -token-id=X` — prompts
+    for the API token on stdin (never flags, keeps it out of
+    `ps` + shell history), test-mints once, writes
+    `~/.pilot/cloudflare-turn.json` with mode 0600.
+  - `pilot-daemon turn-setup static -server=X -user=U
+    -pass-stdin` — reads password from stdin, performs a live
+    TURN allocation to verify, writes `~/.pilot/static-turn.json`
+    with mode 0600.
+  - `pilot-daemon turn-test` — auto-detects the configured
+    provider, runs one mint + connect + allocate + close cycle,
+    prints step-by-step progress:
+    ```
+    turn-test: minting Cloudflare credentials... ok (ttl=1h0m0s)
+    turn-test: connecting to turn.cloudflare.com:3478 (udp)... ok
+    turn-test: allocating relay... ok
+    turn-test: relayed address: 141.101.90.15:52341
+    turn-test: closing... ok
+    turn-test: PASS
+    ```
+    Exits 0 on PASS, 1 on any step failure, 2 if no config found.
+
+  These fit the existing Entmoot subcommand pattern (`entmootd
+  group create`, `invite create`, `roster add`). `main()` grows a
+  small subcommand dispatcher at the top of `main.go`; normal
+  daemon invocation (no subcommand) is unchanged.
+
+### Compatibility
+
+- Wire format between daemons: unchanged. jf.8 daemons interop
+  with jf.7 peers as today.
+- `SetPeerEndpoints` IPC: unchanged wire, new dispatch target.
+  jf.7 drivers (entmootd v1.2.0-v1.3.0) work unchanged against a
+  jf.8 daemon; they just won't advertise TURN endpoints.
+- `DaemonInfo` gains `turn_endpoint` via JSON `omitempty`; jf.7
+  drivers decoding it see the empty string.
+- TURN is disabled by default (`-turn-provider=""`). Existing
+  deployments are unaffected until TURN is explicitly configured.
+
+### Dependencies
+
+- Added `github.com/pion/turn/v5` v5.0.3 (MIT). Pulls pion/stun,
+  pion/logging, pion/transport, pion/dtls, pion/randutil,
+  wlynxg/anet, and `golang.org/x/crypto` transitively.
+- Added `golang.org/x/term` for TTY-aware password prompts in
+  `turn-setup`.
+
 ## [v1.9.0-jf.7] - 2026-04-21
 
 ### Added

@@ -20,6 +20,7 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/internal/fsutil"
 	"github.com/TeoSlayer/pilotprotocol/internal/validate"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/turncreds"
 	"github.com/TeoSlayer/pilotprotocol/pkg/policy"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 	"github.com/TeoSlayer/pilotprotocol/pkg/registry"
@@ -58,6 +59,13 @@ type Config struct {
 	// peers (analogous to Endpoint for UDP). If empty and TCPListenAddr
 	// is set, the daemon advertises the bound TCPListenAddr as-is.
 	TCPEndpoint string
+
+	// TURNProvider supplies credentials for an optional TURN (RFC 8656)
+	// relay transport. When non-nil the daemon starts a TURN client at
+	// startup, allocates a relay socket, and includes the relay address
+	// in DaemonInfo.TURNEndpoint so downstream callers (e.g. Entmoot's
+	// hide-IP mode) can advertise it. nil = TURN disabled.
+	TURNProvider turncreds.Provider
 
 	// Built-in services
 	DisableEcho         bool // disable built-in echo service (port 7)
@@ -475,6 +483,17 @@ func (d *Daemon) Start() error {
 	if d.config.TCPListenAddr != "" {
 		if err := d.tunnels.ListenTCP(d.config.TCPListenAddr); err != nil {
 			return fmt.Errorf("tcp tunnel listen: %w", err)
+		}
+	}
+
+	// 3c. Optional TURN relay transport. Pilot acts as a TURN client
+	// here; there is no inbound listener socket to bind. The provider
+	// (static or cloudflare) supplies credentials; the transport
+	// allocates a relay socket and broadcasts its assigned address
+	// via DaemonInfo so higher layers (Entmoot) can advertise it.
+	if d.config.TURNProvider != nil {
+		if err := d.tunnels.ListenTURN(d.config.TURNProvider); err != nil {
+			return fmt.Errorf("turn tunnel listen: %w", err)
 		}
 	}
 
@@ -1483,6 +1502,12 @@ type DaemonInfo struct {
 	Networks              []NetworkMembership
 	PeerList              []PeerInfo
 	ConnList              []ConnectionInfo
+
+	// TURNEndpoint is the server-assigned relay address when TURN is
+	// enabled and the initial allocation succeeded. Empty string when
+	// TURN is disabled or pending; omitempty so jf.7 clients see the
+	// same wire shape when TURN is off.
+	TURNEndpoint string `json:"turn_endpoint,omitempty"`
 }
 
 // Info returns current daemon status.
@@ -1537,6 +1562,11 @@ func (d *Daemon) Info() *DaemonInfo {
 		})
 	}
 
+	turnEndpoint := ""
+	if a := d.tunnels.TURNLocalAddr(); a != nil {
+		turnEndpoint = a.String()
+	}
+
 	return &DaemonInfo{
 		NodeID:                nid,
 		Address:               addrStr,
@@ -1562,6 +1592,7 @@ func (d *Daemon) Info() *DaemonInfo {
 		Networks:              networks,
 		PeerList:              peerList,
 		ConnList:              d.ports.ConnectionList(),
+		TURNEndpoint:          turnEndpoint,
 	}
 }
 
