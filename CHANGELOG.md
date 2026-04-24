@@ -10,6 +10,66 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11a.5] - 2026-04-25
+
+### Fixed
+
+- **`matchLANSubnet` produced same-LAN false positives across
+  unrelated networks.** Pre-jf.11a.5, two peers whose RFC1918 LAN
+  addresses shared a /24 subnet were treated as same-LAN —
+  regardless of whether they were actually on the same physical
+  network. Default consumer routers ship with `192.168.1.0/24`, so
+  every laptop, phobos, and home server worldwide trivially
+  collided. Live evidence 2026-04-25:
+
+  ```
+  laptop log:
+    same-LAN peer detected, using LAN address
+      node_id=45460 lan_addr=192.168.1.126:55234
+  laptop public IP: 5.30.217.114 (UAE)
+  phobos public IP: 37.27.59.89   (IT)
+  ```
+
+  Laptop in UAE picked phobos's Italian-LAN `192.168.1.126`
+  address as a "same-LAN shortcut", routed outbound to a
+  non-routable address, and stalled 7 s before falling back.
+
+  Fix: `matchLANSubnet` now requires both peers to share the same
+  public IP (same NAT egress) before honoring a /24 collision.
+  Either public address being empty short-circuits the check (no
+  LAN shortcut) — the right default when `-hide-ip` /
+  `-no-registry-endpoint` elide the public IP, since hide-ip
+  peers route via TURN regardless and the LAN shortcut is moot.
+  CGNAT remains a possible source of false positives (peers under
+  the same carrier-grade NAT share a public IP), but jf.11a.3's
+  racing dial catches the failure in <300 ms instead of the old
+  7 s — bounded blast radius.
+
+### Tests
+
+- `pkg/daemon/match_lan_subnet_test.go`:
+  - `TestMatchLANSubnet_SamePublicIPMatches` — true same-LAN: same
+    /24 + same public IP → returns the LAN address.
+  - `TestMatchLANSubnet_DifferentPublicIPNoMatch` — the
+    phobos↔laptop reproducer: same /24 + different public IPs →
+    returns "" (the regression guard for the live FP).
+  - `TestMatchLANSubnet_EmptyOurPublicSkips` — fail-closed when
+    we don't know our own public address.
+  - `TestMatchLANSubnet_EmptyTheirPublicSkips` — fail-closed
+    when peer's public address is empty (hide-ip peer).
+  - `TestMatchLANSubnet_SamePublicIPDifferentSubnetNoMatch` —
+    public matches but RFC1918 subnets differ → no shortcut.
+  - `TestMatchLANSubnet_MalformedPublicAddrSkips` — parse
+    failures fail closed.
+
+### Compat
+
+No wire changes. No new flags. Pure logic refinement of the
+internal `matchLANSubnet` helper. Callers in `ensureTunnel`
+already have access to `d.registrationAddr` (our public addr,
+under `addrMu`) and `realAddr` (peer's public addr from registry
+resolve), so the new arguments are free to pass.
+
 ## [v1.9.0-jf.11a.4] - 2026-04-25
 
 ### Fixed

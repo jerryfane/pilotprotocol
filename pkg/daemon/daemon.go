@@ -1002,9 +1002,50 @@ func collectLANAddrs(listenPort string) []string {
 	return addrs
 }
 
-// matchLANSubnet checks if any of our LAN IPs share a /24 subnet with any peer LAN IP.
-// Returns the matching peer LAN address, or empty string if no match.
-func matchLANSubnet(ours []string, theirs []interface{}) string {
+// matchLANSubnet checks if any of our LAN IPs share a /24 subnet with
+// any peer LAN IP. Returns the matching peer LAN address, or "" if no
+// match.
+//
+// v1.9.0-jf.11a.5: requires ourPublic and theirPublic to resolve to
+// the same public IP (same NAT egress) before honoring a /24
+// collision. RFC1918 subnets routinely collide across unrelated
+// networks (every consumer router defaults to 192.168.1.0/24), so
+// pure /24 matching produced false positives between geographically
+// separate peers — observed live 2026-04-25 with phobos
+// (192.168.1.201/IT) and laptop (192.168.1.126/UAE) "matching" each
+// other and stalling 7 s on a direct dial to a non-routable LAN
+// address.
+//
+// Either public address being empty means the precheck cannot run;
+// we fail-closed and refuse the same-LAN shortcut. This is the right
+// default when -hide-ip / -no-registry-endpoint elide the public
+// address — same-LAN reachability is moot in that posture anyway
+// (the hide-ip peer routes via TURN regardless).
+//
+// CGNAT note: peers behind the same carrier-grade NAT share a
+// public IP but typically aren't on the same physical LAN. The
+// /24-on-RFC1918 follow-up filter still prevents /24-different
+// subnets from matching, so the worst case is a same-LAN attempt
+// to a peer that's not actually reachable directly — caught by
+// jf.11a.3's racing dial in <300 ms instead of the old 7 s stall.
+func matchLANSubnet(ours []string, theirs []interface{}, ourPublic, theirPublic string) string {
+	if ourPublic == "" || theirPublic == "" {
+		return ""
+	}
+	ourPubHost, _, err := net.SplitHostPort(ourPublic)
+	if err != nil {
+		return ""
+	}
+	theirPubHost, _, err := net.SplitHostPort(theirPublic)
+	if err != nil {
+		return ""
+	}
+	ourPubIP := net.ParseIP(ourPubHost)
+	theirPubIP := net.ParseIP(theirPubHost)
+	if ourPubIP == nil || theirPubIP == nil || !ourPubIP.Equal(theirPubIP) {
+		return ""
+	}
+
 	for _, theirRaw := range theirs {
 		theirAddr, ok := theirRaw.(string)
 		if !ok {
@@ -3093,7 +3134,10 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	isLoopback := realIP != nil && realIP.IsLoopback()
 	if !isLoopback {
 		if lanAddrs, ok := resp["lan_addrs"].([]interface{}); ok && len(lanAddrs) > 0 {
-			if lanAddr := matchLANSubnet(d.lanAddrs, lanAddrs); lanAddr != "" {
+			d.addrMu.RLock()
+			ourPublic := d.registrationAddr
+			d.addrMu.RUnlock()
+			if lanAddr := matchLANSubnet(d.lanAddrs, lanAddrs, ourPublic, realAddr); lanAddr != "" {
 				if !d.addrFamilyMismatch(lanAddr) {
 					targetAddr = lanAddr
 					slog.Info("same-LAN peer detected, using LAN address", "node_id", nodeID, "lan_addr", lanAddr)
