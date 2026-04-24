@@ -10,6 +10,101 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.9] - 2026-04-24
+
+### Added
+
+- **Asymmetric TURN.** A peer that opts into `-hide-ip` runs TURN
+  locally; the rest of the mesh can now reach it without configuring
+  their own TURN provider. Before jf.9, every mesh member needed a
+  TURN allocation (Cloudflare API token + pion client) to dial a
+  hide-ip peer — `DialTURNForPeer` hard-errored with `"turn transport
+  not enabled"` when the local daemon had no allocation. That forced
+  the wrong deployment model: *"everyone on the mesh pays for
+  Cloudflare to talk to one hide-ip peer."* The new **`turn-relay`**
+  transport shares the daemon's existing UDP socket and sends raw
+  datagrams to the peer's advertised relay address. The TURN server
+  accepts these frames because the hide-ip peer has proactively
+  issued a `CreatePermission` for the sender's source IP.
+
+  Implementation summary:
+
+  - **Hide-ip side** (`pkg/daemon/transport/turn.go`):
+    - New `TURNTransport.CreatePermission(addr string) error` wraps
+      pion's `Client.CreatePermission` with address parsing and
+      tracks the permitted set in a new `permittedAddrs` map.
+    - New background goroutine `permissionRefreshLoop` re-issues
+      CreatePermission for every permitted address every 4 minutes
+      (RFC 8656 §9.2 says 5-minute idle expiry; 4 leaves headroom
+      for clock skew + server-side timing). Test hook
+      `setPermissionRefreshInterval` for deterministic tests.
+    - Credential rotation now re-permits every permitted address
+      against the new pion client before closing the old one.
+      Without this, every rotation (every TTL/2 on Cloudflare —
+      typically 5–15 min) would silently invalidate every peer's
+      permission until the next full dial cycle.
+
+  - **Dialer side** (`pkg/daemon/transport/turn.go`):
+    - New `turnRelayDialedConn` implements `DialedConn` with
+      `Name() == "turn-relay"`. `Send` reuses
+      `UDPTransport.WriteToUDPAddr` — the same escape-hatch the NAT
+      punch and beacon registration paths already use. No new
+      socket code; the dialer holds no pion state.
+    - New free function `DialTURNRelayViaUDP(udp, ep)` validates
+      inputs and returns the conn. Errors on nil `udp`/`ep` or an
+      un-listened UDP transport.
+
+  - **TunnelManager integration** (`pkg/daemon/tunnel.go`):
+    - New `DialTURNRelayForPeer(ctx, nodeID)` mirrors
+      `DialTURNForPeer`'s fetch→dial→cache sequence but chooses raw
+      UDP when `tm.turn == nil`. Delegation guard: if the local
+      daemon has its own TURN allocation it still prefers the full
+      pion path (lets two hide-ip peers talk to each other
+      symmetrically). Result is cached in `peerConns[nodeID]` with
+      the same first-writer-wins race handling as `DialTCPForPeer`.
+    - New `PermitTURNPeer(addr)` validates the address and calls
+      `tm.turn.CreatePermission` when a local TURN allocation
+      exists; no-op otherwise. Bookkeeping lives in
+      `turnPermittedPeers map[string]time.Time`; a goroutine
+      launched at `ListenTURN` evicts entries past 30 minutes of no
+      refresh.
+    - Auto-permission hook in `updatePathDirect`: every
+      authenticated direct-UDP ingress fires an async
+      `PermitTURNPeer(from)` — zero-addr and unspecified-IP
+      markers (relay-sourced frames) are skipped. First time a
+      peer direct-UDPs us, we permit them; the permission survives
+      rotation + refresh so their later TURN-relay dials land.
+    - `writeFrame` grows a final fallback tier: when no direct UDP
+      addr is known and the peer has advertised a TURN endpoint,
+      synchronously dial via `DialTURNRelayForPeer` and retry the
+      cached-conn path. Mirrors how `DialTCPForPeer` is called from
+      `DialConnection`'s retry loop today.
+
+  No wire-format changes. Entmoot's v1.4.0 `SetPeerEndpoints` flow
+  still delivers TURN endpoints unchanged (jf.7 wire format is
+  unchanged). Existing symmetric TURN-to-TURN (both peers have
+  `-turn-provider`) keeps jf.8's `turnDialedConn` path bit-for-bit
+  identical — the new path only fires when the local daemon has no
+  TURN allocation.
+
+  No new dependencies.
+
+### Behaviour notes
+
+- **Pre-jf.9 dialers without TURN still can't reach hide-ip peers.**
+  Only jf.9+ daemons unlock the asymmetric path; the jf.8 behaviour
+  is preserved for users who haven't rolled the daemon out yet.
+- **Permission bootstrap for brand-new peers.** The auto-permission
+  hook in `updatePathDirect` fires on every authenticated direct
+  ingress, so a peer who ever direct-UDP's us is permitted for
+  subsequent TURN-relay dials. A peer whose very first packet is a
+  TURN-relay attempt (never direct-UDP'd us) will see its first few
+  frames dropped by the server. Pilot's existing retry cadence
+  (dial → UDP → TCP → TURN-relay) makes this self-healing within
+  ~1s under normal conditions. Future work (deferred): drive
+  permissions from Pilot's trust-store so roster members are
+  permitted at startup.
+
 ## [v1.9.0-jf.8] - 2026-04-24
 
 ### Added

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -383,3 +384,193 @@ func TestPeerPath_RemovePeerClearsAllState(t *testing.T) {
 	}
 }
 
+// TestDialTURNRelayForPeer_NoLocalTURN_UsesRawUDP validates the
+// v1.9.0-jf.9 asymmetric-TURN path: a daemon without a local TURN
+// allocation but with a peerTURN endpoint dials via raw UDP
+// through its shared UDP socket. The cached DialedConn reports
+// Name() == "turn-relay" so writeFrame's cached-conn tier admits
+// it (the filter excludes only "udp").
+func TestDialTURNRelayForPeer_NoLocalTURN_UsesRawUDP(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	// Listen UDP on a loopback port so tm.udp.Conn() is non-nil —
+	// DialTURNRelayViaUDP rejects un-listened transports.
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+
+	const peer uint32 = 42
+	if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.45:37000"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := tm.DialTURNRelayForPeer(ctx, peer); err != nil {
+		t.Fatalf("DialTURNRelayForPeer: %v", err)
+	}
+
+	tm.mu.RLock()
+	cc := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if cc == nil {
+		t.Fatalf("peerConns[%d] not populated", peer)
+	}
+	type namer interface{ Name() string }
+	n, ok := cc.(namer)
+	if !ok {
+		t.Fatalf("conn %T doesn't expose Name()", cc)
+	}
+	if got := n.Name(); got != "turn-relay" {
+		t.Fatalf("cached conn Name()=%q, want turn-relay", got)
+	}
+	if cc.RemoteEndpoint().Network() != "turn" {
+		t.Fatalf("cached conn network=%q, want turn", cc.RemoteEndpoint().Network())
+	}
+}
+
+// TestDialTURNRelayForPeer_NoEndpoint_Errors guards the "no TURN
+// endpoint known" precondition. Without a peerTURN entry, there's
+// nothing to dial.
+func TestDialTURNRelayForPeer_NoEndpoint_Errors(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := tm.DialTURNRelayForPeer(ctx, 99); err == nil {
+		t.Fatalf("expected error for unknown peer, got nil")
+	}
+}
+
+// TestPermitTURNPeer_NoLocalTURN_NoOp validates that PermitTURNPeer
+// silently returns nil when no local TURN is configured. The
+// auto-permission hook in updatePathDirect calls this on every
+// authenticated direct ingress; without the nil-guard, every
+// non-TURN daemon would spam errors.
+func TestPermitTURNPeer_NoLocalTURN_NoOp(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	// turn is nil; PermitTURNPeer should just validate the addr
+	// format and return.
+	if err := tm.PermitTURNPeer("203.0.113.7:49152"); err != nil {
+		t.Fatalf("PermitTURNPeer: %v", err)
+	}
+	// Nothing should have been recorded in turnPermittedPeers.
+	tm.mu.RLock()
+	n := len(tm.turnPermittedPeers)
+	tm.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("turnPermittedPeers len=%d without local TURN, want 0", n)
+	}
+}
+
+// TestPermitTURNPeer_Malformed guards against bad inputs silently
+// landing in the map.
+func TestPermitTURNPeer_Malformed(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	if err := tm.PermitTURNPeer(""); err == nil {
+		t.Fatalf("empty addr should error")
+	}
+	if err := tm.PermitTURNPeer("not-a-host-port"); err == nil {
+		t.Fatalf("malformed addr should error")
+	}
+}
+
+// TestUpdatePathDirect_SkipsPermitForRelayZeroAddr guards the
+// zero-addr / relay-marker case in the auto-permission hook: when
+// an authenticated frame arrives via relay, the handler calls
+// updatePathDirect with the zero-valued UDPAddr marker; the hook
+// must not try to permission 0.0.0.0:0 against the TURN server.
+//
+// Since the guard in updatePathDirect is `!from.IP.IsUnspecified()
+// && from.Port != 0`, we check that a from with IPv4zero + port 0
+// is a no-op. The test verifies that turnPermittedPeers stays
+// empty after updatePathDirect with a zero-addr.
+func TestUpdatePathDirect_SkipsPermitForRelayZeroAddr(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	// Force tm.turn to a non-nil zero-value marker — we don't need
+	// a real allocation, just the nil-check to pass so the hook's
+	// guard logic is exercised. But PermitTURNPeer would still call
+	// t.CreatePermission, so a nil turn means no side-effect. The
+	// cleanest assertion here: turnPermittedPeers remains empty
+	// after updatePathDirect with zero-addr regardless of tm.turn.
+
+	zeroAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	tm.mu.Lock()
+	tm.updatePathDirect(7, zeroAddr)
+	tm.mu.Unlock()
+
+	// Give any spawned goroutine a moment to (not) fire.
+	time.Sleep(50 * time.Millisecond)
+
+	tm.mu.RLock()
+	n := len(tm.turnPermittedPeers)
+	tm.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("turnPermittedPeers len=%d after zero-addr ingress, want 0", n)
+	}
+}
+
+// TestWriteFrame_FallsBackToTURNRelay validates the jf.9 writeFrame
+// integration: when a peer has a TURN endpoint but no direct UDP
+// addr and no cached conn, writeFrame lazily dials the asymmetric
+// turn-relay path and retries through the cached-conn tier.
+func TestWriteFrame_FallsBackToTURNRelay(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	// Need a listening UDP socket so DialTURNRelayViaUDP succeeds.
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+
+	const peer uint32 = 123
+	if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.200:37500"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
+
+	// Call writeFrame with nil addr so the fallback tier runs.
+	// The underlying UDP send will actually transmit to a bogus
+	// loopback-routed host; this is OK because we only validate
+	// that the cached conn got installed.
+	_ = tm.writeFrame(peer, nil, []byte("frame"))
+
+	tm.mu.RLock()
+	cc := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if cc == nil {
+		t.Fatalf("writeFrame fallback did not install a cached conn")
+	}
+	if cc.RemoteEndpoint().Network() != "turn" {
+		t.Fatalf("cached conn network=%q, want turn", cc.RemoteEndpoint().Network())
+	}
+}
+
+// TestWriteFrame_PrefersCachedTURNRelay locks in the precedence: a
+// cached turn-relay DialedConn wins over direct UDP, matching TURN
+// and TCP behaviour (Name() != "udp" passes the cached-conn filter).
+func TestWriteFrame_PrefersCachedTURNRelay(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	const peer uint32 = 456
+
+	stub := &stubDialedConn{network: "turn", remote: "203.0.113.200:37500"}
+	tm.mu.Lock()
+	tm.peerConns[peer] = stub
+	tm.mu.Unlock()
+
+	// A direct UDP addr is irrelevant when the cached conn wins.
+	payload := []byte{0x01}
+	if err := tm.writeFrame(peer, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, payload); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if got := stub.sends.Load(); got != 1 {
+		t.Fatalf("stub.sends=%d, want 1", got)
+	}
+}

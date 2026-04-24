@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/logging"
@@ -26,6 +27,13 @@ const defaultTURNGetTimeout = 30 * time.Second
 // turnReadBufSize is the per-loop read buffer for the TURN relay socket.
 // Matches pion's internal default for Allocate'd conns.
 const turnReadBufSize = 1500
+
+// defaultPermissionRefreshInterval is how often the permission refresh
+// loop re-issues CreatePermission for every address in permittedAddrs.
+// TURN permissions expire after 5 minutes of idle (RFC 8656 §9.2); we
+// refresh at 4 minutes to keep permissions live with comfortable
+// headroom against clock skew and server-side timing.
+const defaultPermissionRefreshInterval = 4 * time.Minute
 
 // TURNEndpoint wraps a peer's relayed "host:port" address and satisfies
 // the Endpoint interface. Endpoints for this transport identify the
@@ -100,6 +108,18 @@ type TURNTransport struct {
 	closed  bool
 
 	getTimeout time.Duration
+
+	// permittedAddrs records host:port strings for which we have
+	// issued a CreatePermission against the current pion client.
+	// Value is the wall-clock of the last refresh attempt; used only
+	// for diagnostics / future eviction. Protected by mu.
+	permittedAddrs map[string]time.Time
+
+	// permissionRefreshInterval controls how often the refresh loop
+	// re-issues CreatePermission for every address in permittedAddrs.
+	// Default 4 minutes; overridable via setPermissionRefreshInterval
+	// for tests.
+	permissionRefreshInterval time.Duration
 }
 
 // NewTURNTransport constructs a TURNTransport. The provider lifetime is
@@ -108,11 +128,26 @@ type TURNTransport struct {
 // Listen's sink argument, mirroring tcp.go's convention.
 func NewTURNTransport(provider turncreds.Provider, sink chan<- InboundFrame) *TURNTransport {
 	return &TURNTransport{
-		provider:   provider,
-		sink:       sink,
-		closeCh:    make(chan struct{}),
-		getTimeout: defaultTURNGetTimeout,
+		provider:                  provider,
+		sink:                      sink,
+		closeCh:                   make(chan struct{}),
+		getTimeout:                defaultTURNGetTimeout,
+		permittedAddrs:            make(map[string]time.Time),
+		permissionRefreshInterval: defaultPermissionRefreshInterval,
 	}
+}
+
+// setPermissionRefreshInterval is a test-only hook that overrides how
+// often the refresh loop re-issues CreatePermission. Must be called
+// before Listen. The runtime invariant is [>= 1ms]; zero or negative
+// values keep the default.
+func (t *TURNTransport) setPermissionRefreshInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.permissionRefreshInterval = d
+	t.mu.Unlock()
 }
 
 // Name returns "turn".
@@ -183,6 +218,9 @@ func (t *TURNTransport) Listen(addr string, sink chan<- InboundFrame) error {
 	t.wg.Add(1)
 	go t.rotationLoop()
 
+	t.wg.Add(1)
+	go t.permissionRefreshLoop()
+
 	return nil
 }
 
@@ -196,6 +234,142 @@ func (t *TURNTransport) LocalAddr() net.Addr {
 		return nil
 	}
 	return t.relay.LocalAddr()
+}
+
+// CreatePermission proactively installs a TURN permission for addr
+// (host:port) on the current allocation so inbound datagrams from
+// that address are admitted by the server. Returns an error if the
+// transport isn't listening, the address is malformed, or pion's
+// CreatePermission errors.
+//
+// Idempotent: calling twice with the same addr refreshes the
+// permission by re-issuing CreatePermission against the current
+// client and updating the last-refreshed timestamp. A background
+// refresh loop (Listen-scoped) re-issues permissions every
+// permissionRefreshInterval so idle permissions don't silently
+// expire; rotations transparently re-permit every known address
+// against the new client.
+//
+// This is the "hide-ip side" of the asymmetric-TURN flow: a daemon
+// running TURN with -hide-ip calls CreatePermission (via
+// TunnelManager.PermitTURNPeer) for every peer that might dial its
+// relayed address, so the peer's first unsolicited datagram isn't
+// dropped for lack of permission.
+func (t *TURNTransport) CreatePermission(addr string) error {
+	if addr == "" {
+		return errors.New("turn transport: empty permission address")
+	}
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return fmt.Errorf("turn transport: resolve %q: %w", addr, err)
+	}
+
+	t.mu.RLock()
+	client := t.client
+	closed := t.closed
+	t.mu.RUnlock()
+	if closed {
+		return errors.New("turn transport: closed")
+	}
+	if client == nil {
+		return errors.New("turn transport: not listening")
+	}
+
+	if err := client.CreatePermission(ua); err != nil {
+		return fmt.Errorf("turn create permission %s: %w", addr, err)
+	}
+
+	t.mu.Lock()
+	if t.permittedAddrs == nil {
+		t.permittedAddrs = make(map[string]time.Time)
+	}
+	t.permittedAddrs[addr] = time.Now()
+	t.mu.Unlock()
+	return nil
+}
+
+// PermittedAddrs returns a snapshot of the addresses for which we
+// have an active CreatePermission recorded. Exposed for diagnostics
+// and for TunnelManager's bookkeeping; the slice is a copy and safe
+// to mutate.
+func (t *TURNTransport) PermittedAddrs() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]string, 0, len(t.permittedAddrs))
+	for a := range t.permittedAddrs {
+		out = append(out, a)
+	}
+	return out
+}
+
+// permissionRefreshLoop periodically re-issues CreatePermission for
+// every address in permittedAddrs against the current pion client.
+// Without this, permissions expire after ~5 minutes of idle and the
+// TURN server begins dropping inbound datagrams from that peer. The
+// loop exits on closeCh.
+func (t *TURNTransport) permissionRefreshLoop() {
+	defer t.wg.Done()
+
+	t.mu.RLock()
+	interval := t.permissionRefreshInterval
+	t.mu.RUnlock()
+	if interval <= 0 {
+		interval = defaultPermissionRefreshInterval
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.closeCh:
+			return
+		case <-ticker.C:
+			t.refreshAllPermissions()
+		}
+	}
+}
+
+// refreshAllPermissions re-issues CreatePermission for every
+// permitted address against the current pion client. Each failed
+// refresh is logged at WARN but does not interrupt the loop; the
+// next tick (or the next rotation) will retry. Snapshots addresses
+// under RLock and calls pion without the mutex so the refresh can't
+// serialize behind a concurrent rotate/swap.
+func (t *TURNTransport) refreshAllPermissions() {
+	t.mu.RLock()
+	client := t.client
+	addrs := make([]string, 0, len(t.permittedAddrs))
+	for a := range t.permittedAddrs {
+		addrs = append(addrs, a)
+	}
+	t.mu.RUnlock()
+	if client == nil || len(addrs) == 0 {
+		return
+	}
+
+	now := time.Now()
+	for _, addr := range addrs {
+		ua, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			slog.Warn("turn: permission refresh resolve failed; dropping",
+				"addr", addr, "error", err)
+			t.mu.Lock()
+			delete(t.permittedAddrs, addr)
+			t.mu.Unlock()
+			continue
+		}
+		if err := client.CreatePermission(ua); err != nil {
+			slog.Warn("turn: permission refresh failed",
+				"addr", addr, "error", err)
+			continue
+		}
+		t.mu.Lock()
+		if _, ok := t.permittedAddrs[addr]; ok {
+			t.permittedAddrs[addr] = now
+		}
+		t.mu.Unlock()
+	}
 }
 
 // Dial returns a DialedConn that writes to ep via the current relay
@@ -400,7 +574,33 @@ func (t *TURNTransport) rotate(newCreds *turncreds.Credentials) {
 	t.relay = newRelay
 	t.client = newClient
 	t.peerSock = newSock
+	// Snapshot the permitted addresses while we still hold the lock so
+	// the re-permission pass below sees a consistent set. We re-issue
+	// CreatePermission on the new client BEFORE closing the old one so
+	// any in-flight inbound datagrams aren't dropped during the swap.
+	repermit := make([]string, 0, len(t.permittedAddrs))
+	for a := range t.permittedAddrs {
+		repermit = append(repermit, a)
+	}
 	t.mu.Unlock()
+
+	// Re-issue permissions on the new client. Failures are logged but
+	// non-fatal; the permission refresh loop will retry at the next
+	// tick. Do this outside the mutex so a slow pion transaction
+	// doesn't block concurrent Sends / Dials.
+	for _, addr := range repermit {
+		ua, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			slog.Warn("turn: rotate re-permission resolve failed",
+				"addr", addr, "error", err)
+			continue
+		}
+		if err := newClient.CreatePermission(ua); err != nil {
+			slog.Warn("turn: rotate re-permission failed",
+				"addr", addr, "error", err)
+			continue
+		}
+	}
 
 	// Spawn a reader for the new relay BEFORE closing the old one, so
 	// we don't miss frames in the swap window. The old reader will
@@ -567,4 +767,92 @@ func (c *turnDialedConn) RemoteEndpoint() Endpoint {
 // to the same peer refreshes as a side effect.
 func (c *turnDialedConn) Close() error {
 	return nil
+}
+
+// turnRelayDialedConn is the DialedConn implementation for the
+// asymmetric-TURN path: a dialer without its own TURN allocation
+// sends raw UDP through the shared UDP socket to the peer's TURN
+// relay address. The TURN server accepts these datagrams when the
+// hide-ip peer has proactively issued a CreatePermission for the
+// sender's source IP (see TURNTransport.CreatePermission).
+//
+// There is no pion client on this side of the link — just the
+// shared *UDPTransport and the peer's resolved relay address.
+// Send reuses UDPTransport.WriteToUDPAddr, the same escape-hatch
+// used by NAT punch and beacon registration.
+//
+// Identified by Name() == "turn-relay" so writeFrame's cached-conn
+// filter (which excludes "udp") lets it through.
+type turnRelayDialedConn struct {
+	udp      *UDPTransport
+	peerAddr *net.UDPAddr
+	remote   *TURNEndpoint
+	sendMu   sync.Mutex
+	closed   atomic.Bool
+}
+
+// Name returns "turn-relay". Distinguishes this conn from the pion-
+// backed "turn" conn in writeFrame's cached-conn precedence logic.
+func (c *turnRelayDialedConn) Name() string { return "turn-relay" }
+
+// Send writes frame to the peer's TURN relay address via the shared
+// UDP socket. Serialized behind sendMu so concurrent callers don't
+// interleave with an observable error from the underlying
+// WriteToUDPAddr (matching turnDialedConn's serialization).
+// Returns an error if the conn has been closed.
+func (c *turnRelayDialedConn) Send(frame []byte) error {
+	if c.closed.Load() {
+		return errors.New("turn-relay: closed")
+	}
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if _, err := c.udp.WriteToUDPAddr(frame, c.peerAddr); err != nil {
+		return fmt.Errorf("turn-relay write to %s: %w", c.peerAddr, err)
+	}
+	return nil
+}
+
+// RemoteEndpoint returns the peer's TURN endpoint. Stable for the
+// lifetime of the conn.
+func (c *turnRelayDialedConn) RemoteEndpoint() Endpoint {
+	return c.remote
+}
+
+// Close marks the conn as closed; subsequent Sends fail. No-op on
+// the wire — UDP is connectionless and the shared socket belongs
+// to the UDPTransport, not this conn. Idempotent via atomic CAS.
+func (c *turnRelayDialedConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+// DialTURNRelayViaUDP returns a DialedConn that sends raw UDP frames
+// to ep's relay address using udp as the outbound socket. No pion
+// client is required on the caller side — this is the "I don't have
+// TURN locally, but I need to reach a peer who does" path.
+//
+// The caller (TunnelManager.DialTURNRelayForPeer) is responsible for
+// choosing between this path and the symmetric turnDialedConn path
+// when both daemons have local TURN allocations.
+//
+// Errors: nil endpoint, endpoint with no underlying UDPAddr, or a
+// non-listening UDP transport.
+func DialTURNRelayViaUDP(udp *UDPTransport, ep *TURNEndpoint) (*turnRelayDialedConn, error) {
+	if udp == nil {
+		return nil, errors.New("turn-relay: nil udp transport")
+	}
+	if ep == nil {
+		return nil, errors.New("turn-relay: nil endpoint")
+	}
+	if ep.addr == nil {
+		return nil, errors.New("turn-relay: endpoint has nil addr")
+	}
+	if udp.Conn() == nil {
+		return nil, errors.New("turn-relay: udp transport not listening")
+	}
+	return &turnRelayDialedConn{
+		udp:      udp,
+		peerAddr: ep.addr,
+		remote:   ep,
+	}, nil
 }

@@ -130,6 +130,14 @@ type TunnelManager struct {
 	peerTCP   map[uint32]*transport.TCPEndpoint // node_id → TCP endpoint, populated from registry lookup when advertised
 	peerTURN  map[uint32]*transport.TURNEndpoint // node_id → TURN relayed endpoint, populated from SetPeerEndpoints
 	peerConns map[uint32]transport.DialedConn   // node_id → cached DialedConn (whichever transport won the last Dial)
+
+	// turnPermittedPeers records host:port strings for which we have
+	// issued CreatePermission on the local TURN allocation (via
+	// PermitTURNPeer). Value is the wall-clock of the first
+	// observation. Entries are evicted after
+	// turnPermittedPeerEvictTTL of no re-observation so the set stays
+	// bounded under peer churn. Only populated when tm.turn != nil.
+	turnPermittedPeers map[string]time.Time
 	crypto    map[uint32]*peerCrypto            // node_id → encryption state
 	recvCh    chan *IncomingPacket
 	done      chan struct{}  // closed on Close() to stop dispatchLoop
@@ -238,6 +246,18 @@ type peerPath struct {
 	lastSeen time.Time
 }
 
+// turnPermittedPeerEvictTTL is how long an entry stays in
+// turnPermittedPeers after its last refresh. A peer that goes silent
+// for longer than this is assumed gone; we drop the bookkeeping so the
+// set doesn't grow unbounded under churn. The underlying pion
+// permission will expire on the server side shortly after we stop
+// refreshing it (RFC 8656 §9.2 — 5 minute idle expiry).
+const turnPermittedPeerEvictTTL = 30 * time.Minute
+
+// turnPermittedPeerEvictInterval is how often the eviction goroutine
+// wakes up to scan turnPermittedPeers for entries past TTL.
+const turnPermittedPeerEvictInterval = 5 * time.Minute
+
 // maxPendingPerPeer limits how many packets can be queued per peer
 // while waiting for key exchange to complete. Prevents unbounded growth
 // if key exchange is slow or fails.
@@ -253,20 +273,21 @@ const RecvChSize = 8192
 
 func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
-		udp:              transport.NewUDPTransport(),
-		inbound:          make(chan transport.InboundFrame, RecvChSize),
-		paths:            make(map[uint32]*peerPath),
-		peerTCP:          make(map[uint32]*transport.TCPEndpoint),
-		peerTURN:         make(map[uint32]*transport.TURNEndpoint),
-		peerConns:        make(map[uint32]transport.DialedConn),
-		crypto:           make(map[uint32]*peerCrypto),
-		peerPubKeys:      make(map[uint32]ed25519.PublicKey),
-		peerCaps:         make(map[uint32]uint64),
-		lastRecoveryPILA: make(map[uint32]time.Time),
-		pending:          make(map[uint32][][]byte),
-		recvCh:           make(chan *IncomingPacket, RecvChSize),
-		done:             make(chan struct{}),
-		gossipView:       gossip.NewMembershipView(),
+		udp:                transport.NewUDPTransport(),
+		inbound:            make(chan transport.InboundFrame, RecvChSize),
+		paths:              make(map[uint32]*peerPath),
+		peerTCP:            make(map[uint32]*transport.TCPEndpoint),
+		peerTURN:           make(map[uint32]*transport.TURNEndpoint),
+		peerConns:          make(map[uint32]transport.DialedConn),
+		turnPermittedPeers: make(map[string]time.Time),
+		crypto:             make(map[uint32]*peerCrypto),
+		peerPubKeys:        make(map[uint32]ed25519.PublicKey),
+		peerCaps:           make(map[uint32]uint64),
+		lastRecoveryPILA:   make(map[uint32]time.Time),
+		pending:            make(map[uint32][][]byte),
+		recvCh:             make(chan *IncomingPacket, RecvChSize),
+		done:               make(chan struct{}),
+		gossipView:         gossip.NewMembershipView(),
 	}
 }
 
@@ -284,6 +305,15 @@ func (tm *TunnelManager) getOrCreatePath(nodeID uint32) *peerPath {
 // updatePathDirect records that a direct authenticated frame arrived
 // from `from` for this peer. Always updates the direct address and
 // clears viaRelay. Caller must hold tm.mu.Lock.
+//
+// Side effect: if the local daemon is running TURN (tm.turn != nil)
+// and `from` is a real UDP address (not a relay marker or the
+// unspecified zero-addr), track it in turnPermittedPeers so a later
+// pion CreatePermission can admit this peer's datagrams on our
+// relay. The actual pion call is deferred out of the locked
+// critical section by recording the address and issuing the
+// permission asynchronously via permitTURNPeerAsync; this keeps the
+// auth-fast-path free of RTT-bound network I/O.
 func (tm *TunnelManager) updatePathDirect(nodeID uint32, from *net.UDPAddr) {
 	p := tm.getOrCreatePath(nodeID)
 	if from != nil {
@@ -291,6 +321,16 @@ func (tm *TunnelManager) updatePathDirect(nodeID uint32, from *net.UDPAddr) {
 	}
 	p.viaRelay = false
 	p.lastSeen = time.Now()
+
+	// Auto-permission hook: only meaningful when we are running TURN.
+	// Best-effort and guarded against relay/zero markers.
+	if tm.turn != nil && from != nil && !from.IP.IsUnspecified() && from.Port != 0 {
+		// Fire the permission asynchronously so the lock holder
+		// (auth-path callers) isn't blocked on a pion STUN round
+		// trip. The goroutine does its own lock handling.
+		addr := from.String()
+		go tm.permitTURNPeerAsync(addr)
+	}
 }
 
 // updatePathRelay records that a relayed authenticated frame arrived
@@ -434,6 +474,10 @@ func (tm *TunnelManager) ListenTURN(provider turncreds.Provider) error {
 		return err
 	}
 	tm.turn = t
+	// Start the permitted-peer eviction goroutine. Only meaningful
+	// when we are running TURN — no other code path populates
+	// turnPermittedPeers.
+	tm.startTURNPermissionEviction()
 	slog.Info("turn transport listening", "relay", t.LocalAddr())
 	return nil
 }
@@ -469,6 +513,143 @@ func (tm *TunnelManager) HasTURNEndpoint(nodeID uint32) bool {
 	_, ok := tm.peerTURN[nodeID]
 	tm.mu.RUnlock()
 	return ok
+}
+
+// DialTURNRelayForPeer is the asymmetric-TURN (v1.9.0-jf.9) analogue
+// of DialTURNForPeer for daemons without a local TURN allocation.
+// It sends raw UDP through the shared UDP socket to the peer's
+// advertised TURN relay address, bypassing pion on our side. The
+// hide-ip peer's pion allocation accepts these datagrams when it
+// has proactively permissioned our source IP (see
+// TURNTransport.CreatePermission).
+//
+// Precedence:
+//   - If this daemon has its own TURN allocation (tm.turn != nil),
+//     delegate to DialTURNForPeer. Two hide-ip peers talking to each
+//     other prefer the full pion → pion path (channel-binding, TURN
+//     ChannelData framing) over raw-UDP-to-relay.
+//   - Otherwise, build a turnRelayDialedConn over tm.udp and cache
+//     it in peerConns under first-writer-wins semantics (mirrors
+//     DialTCPForPeer + DialTURNForPeer).
+//
+// Returns an error if no TURN endpoint is known for the node or if
+// building the conn fails (e.g. UDP transport not listening).
+func (tm *TunnelManager) DialTURNRelayForPeer(ctx context.Context, nodeID uint32) error {
+	tm.mu.RLock()
+	localTURN := tm.turn
+	ep := tm.peerTURN[nodeID]
+	udpT := tm.udp
+	tm.mu.RUnlock()
+
+	if ep == nil {
+		return fmt.Errorf("no turn endpoint known for node %d", nodeID)
+	}
+	// Prefer the full pion path when we have a local allocation —
+	// lets two hide-ip peers talk to each other over symmetric TURN.
+	if localTURN != nil {
+		return tm.DialTURNForPeer(ctx, nodeID)
+	}
+	if udpT == nil {
+		return fmt.Errorf("turn-relay: no udp transport")
+	}
+	conn, err := transport.DialTURNRelayViaUDP(udpT, ep)
+	if err != nil {
+		return fmt.Errorf("turn-relay dial node %d: %w", nodeID, err)
+	}
+
+	tm.mu.Lock()
+	if existing, ok := tm.peerConns[nodeID]; ok {
+		tm.mu.Unlock()
+		_ = conn.Close()
+		_ = existing
+		return nil
+	}
+	tm.peerConns[nodeID] = conn
+	tm.mu.Unlock()
+	slog.Info("peer switched to turn-relay", "node_id", nodeID, "remote", ep.String())
+	return nil
+}
+
+// PermitTURNPeer proactively installs a CreatePermission on the
+// local TURN allocation for the given host:port so the TURN server
+// admits inbound datagrams from that address. No-op when tm.turn
+// is nil (nothing to permit against). Idempotent: repeated calls
+// refresh both the internal timestamp and the permission itself.
+//
+// Validates the input is parseable as a UDP address; an empty or
+// malformed address returns an error.
+//
+// Intended call sites:
+//   - updatePathDirect (auto-permission on authenticated direct
+//     ingress — best-effort).
+//   - Explicit caller (e.g. Entmoot roster seeding, if wired in
+//     later) for peers who might never direct-UDP us before they
+//     try the TURN relay path.
+func (tm *TunnelManager) PermitTURNPeer(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("permit turn peer: empty address")
+	}
+	if _, err := net.ResolveUDPAddr("udp", addr); err != nil {
+		return fmt.Errorf("permit turn peer %q: %w", addr, err)
+	}
+
+	tm.mu.RLock()
+	t := tm.turn
+	tm.mu.RUnlock()
+	if t == nil {
+		return nil
+	}
+
+	if err := t.CreatePermission(addr); err != nil {
+		return fmt.Errorf("permit turn peer %q: %w", addr, err)
+	}
+
+	tm.mu.Lock()
+	if tm.turnPermittedPeers == nil {
+		tm.turnPermittedPeers = make(map[string]time.Time)
+	}
+	tm.turnPermittedPeers[addr] = time.Now()
+	tm.mu.Unlock()
+	return nil
+}
+
+// permitTURNPeerAsync is the goroutine target used by
+// updatePathDirect to issue a CreatePermission out of the locked
+// auth-path. Logs any error at DEBUG; this is best-effort.
+func (tm *TunnelManager) permitTURNPeerAsync(addr string) {
+	if err := tm.PermitTURNPeer(addr); err != nil {
+		slog.Debug("auto-permit turn peer failed", "addr", addr, "error", err)
+	}
+}
+
+// startTURNPermissionEviction launches a background goroutine that
+// periodically prunes turnPermittedPeers entries whose last refresh
+// is older than turnPermittedPeerEvictTTL. Keeps the permitted-peer
+// set bounded under churn. Exits when tm.done is closed.
+//
+// Called from ListenTURN (only meaningful when we are running TURN).
+func (tm *TunnelManager) startTURNPermissionEviction() {
+	tm.readWg.Add(1)
+	go func() {
+		defer tm.readWg.Done()
+		ticker := time.NewTicker(turnPermittedPeerEvictInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-tm.done:
+				return
+			case <-ticker.C:
+				cutoff := time.Now().Add(-turnPermittedPeerEvictTTL)
+				tm.mu.Lock()
+				for a, ts := range tm.turnPermittedPeers {
+					if ts.Before(cutoff) {
+						delete(tm.turnPermittedPeers, a)
+					}
+				}
+				tm.mu.Unlock()
+			}
+		}
+	}()
 }
 
 // DialTURNForPeer establishes a turnDialedConn for the peer and caches
@@ -661,16 +842,23 @@ func (tm *TunnelManager) RequestHolePunch(targetNodeID uint32) {
 //     both sides symmetric by construction: each side independently
 //     replies on the path it received from.
 //  2. A cached non-UDP DialedConn (e.g. TCP fallback installed by
-//     DialTCPForPeer). Lets a peer stick to TCP once we've chosen it.
+//     DialTCPForPeer, or a TURN conn from DialTURNForPeer, or the
+//     v1.9.0-jf.9 asymmetric turn-relay conn from
+//     DialTURNRelayForPeer). Lets a peer stick to the alternate
+//     transport once we've chosen it.
 //  3. Direct UDP write, preferring the path's recorded direct addr
 //     over the caller-supplied addr (handles NAT drift; the decrypt-
 //     side refresh in handleEncrypted keeps path.direct current).
+//  4. v1.9.0-jf.9 asymmetric-TURN fallback: if no UDP destination is
+//     known and the peer has advertised a TURN endpoint, lazily dial
+//     it via DialTURNRelayForPeer and retry the cached-conn path.
+//     Lets a daemon without local TURN still reach a hide-ip peer.
 //
-// TCP fallback is a deliberate step: the caller decides when to
-// switch a peer to TCP (typically after direct UDP SYN retries
-// exhaust in DialConnection). Once switched, writeFrame keeps using
-// the cached TCP conn until it dies, at which point the cache is
-// cleared and the next writeFrame falls back to UDP.
+// TCP / TURN fallback are deliberate steps: the caller decides when
+// to switch a peer off direct UDP (typically after direct UDP SYN
+// retries exhaust in DialConnection). Once switched, writeFrame
+// keeps using the cached conn until it dies, at which point the
+// cache is cleared and the next writeFrame falls back to UDP.
 func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []byte) error {
 	tm.mu.RLock()
 	p := tm.paths[nodeID]
@@ -682,6 +870,7 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	}
 	bAddr := tm.beaconAddr
 	cachedConn := tm.peerConns[nodeID]
+	hasTURNEp := tm.peerTURN[nodeID] != nil
 	tm.mu.RUnlock()
 
 	if relay && bAddr != nil {
@@ -709,9 +898,9 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	}
 
 	// Phase 4: if a cached non-UDP conn exists for this peer, use it
-	// first. The cache is populated by DialTCPForPeer (called from the
-	// daemon's dial-failure path). UDP conns are not cached here —
-	// they're effectively free to re-issue via WriteToUDPAddr.
+	// first. The cache is populated by DialTCPForPeer, DialTURNForPeer,
+	// and (v1.9.0-jf.9) DialTURNRelayForPeer. UDP conns are not cached
+	// here — they're effectively free to re-issue via WriteToUDPAddr.
 	if cachedConn != nil && cachedConn.RemoteEndpoint().Network() != "udp" {
 		if err := cachedConn.Send(frame); err == nil {
 			atomic.AddUint64(&tm.PktsSent, 1)
@@ -734,6 +923,32 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	}
 
 	if addr == nil {
+		// v1.9.0-jf.9: last-resort asymmetric-TURN fallback. If the peer
+		// advertised a TURN endpoint and we have no UDP destination,
+		// lazily build a turn-relay conn and retry the cached-conn
+		// path. Avoids re-dialling if a conn was installed by a racing
+		// writer between our initial read and this tier.
+		if hasTURNEp {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			dialErr := tm.DialTURNRelayForPeer(ctx, nodeID)
+			cancel()
+			if dialErr == nil {
+				tm.mu.RLock()
+				cc := tm.peerConns[nodeID]
+				tm.mu.RUnlock()
+				if cc != nil && cc.RemoteEndpoint().Network() != "udp" {
+					if err := cc.Send(frame); err == nil {
+						atomic.AddUint64(&tm.PktsSent, 1)
+						atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+						return nil
+					} else {
+						return fmt.Errorf("turn-relay send after dial: %w", err)
+					}
+				}
+			} else {
+				slog.Debug("turn-relay fallback dial failed", "node_id", nodeID, "error", dialErr)
+			}
+		}
 		return fmt.Errorf("no address for node %d", nodeID)
 	}
 	n, err := tm.udp.WriteToUDPAddr(frame, addr)
