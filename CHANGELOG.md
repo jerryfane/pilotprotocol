@@ -10,6 +10,96 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.10] - 2026-04-24
+
+### Changed
+
+- **`writeFrame` no longer routes via PILA beacon when a TURN
+  endpoint is advertised for the peer.** Before jf.10, once
+  `path.viaRelay` latched to true (typical when the direct-UDP
+  attempt failed and Pilot fell back to beacon), writeFrame's
+  tier 1 always routed through the beacon operator — even for
+  peers that had subsequently advertised a TURN relay. The v1.9.0-
+  jf.9 asymmetric-TURN dialer (tier 4) sat at the bottom of the
+  chain and never got a chance to engage in real deployments.
+
+  Live evidence 2026-04-24: phobos installed laptop's TURN
+  endpoint (`104.30.149.4:20414`) via Entmoot v1.4.2's multi-hop
+  refanout. `SetPeerEndpoints applied node_id=45491
+  installed_turn=1` fired. Yet every frame phobos sent to laptop
+  still traversed the VPS as a PILA beacon relay. The VPS operator
+  saw every phobos ↔ laptop routing event — exactly the metadata
+  `-hide-ip` exists to hide.
+
+  jf.10 adds a single guard to tier 1: when `peerTURN[nodeID]` is
+  populated, skip beacon and fall through to the cached-conn tier
+  (which picks up a cached `turnRelayDialedConn` if one exists) or
+  to tier 4 (which lazily dials turn-relay via `DialTURNRelayViaUDP`).
+  A tier-3 guard zeroes any stale `pathDirect` so direct UDP also
+  defers to turn-relay for hide-ip peers whose direct addr
+  predated their opt-in to TURN routing.
+
+  Fallback on TURN failure: when `DialTURNRelayViaUDP` errors
+  (Cloudflare outage, creds expired), writeFrame returns "no
+  address for node" rather than silently re-routing through the
+  beacon. Operators who want beacon as a fallback should stop
+  advertising TURN for that peer; routing through a channel the
+  peer didn't choose defeats the hide-ip semantic.
+
+### Added
+
+- **`-no-registry-endpoint` CLI flag + `Config.NoRegistryEndpoint`
+  field.** Pairs with Entmoot v1.4.0's `-hide-ip` to close the
+  registry-layer IP leak that the gossip-layer suppression alone
+  can't cover. When set, the daemon registers its identity
+  (node ID + pubkey) with the registry but **uploads no UDP
+  endpoint, no TCP endpoint, and no LAN addresses**. Peers
+  resolving this node via `registry.Lookup` see "endpoint
+  unknown" and must learn routing from an out-of-band channel
+  (e.g. Entmoot's signed transport-ad, which pushes the peer's
+  TURN relay into `peerTURN` via `SetPeerEndpoints`). `writeFrame`
+  tier 4 then engages.
+
+  STUN discovery still runs at startup when TURN is enabled
+  (needed for TURN itself), but the discovered endpoint is never
+  sent to the registry. `reRegister` on heartbeat failure also
+  honours the flag — recovery doesn't accidentally re-leak the
+  endpoint after a connection hiccup.
+
+  Trade-off: drivers that don't have an out-of-band routing
+  channel will fail to establish tunnels to hide-endpoint peers
+  (registry lookup returns no `real_addr`, resolver errors).
+  Entmoot v1.4.2+ is equipped (via transport-ad → `peerTURN`);
+  other drivers may need equivalent plumbing.
+
+### Privacy impact
+
+- **After jf.10 + restarting all three nodes**, phobos↔laptop
+  traffic bypasses the VPS entirely — the relay path becomes
+  Cloudflare TURN. VPS operator sees no metadata on that
+  conversation. With `-no-registry-endpoint` on laptop, new
+  peers that try to resolve laptop via registry also learn no
+  IP — only Cloudflare's anycast relay address (via Entmoot
+  transport-ad).
+
+### Wire compatibility
+
+- **No wire-format changes between daemons.** `writeFrame` still
+  emits the same beacon-relay, cached-conn, direct-UDP, and
+  turn-relay payloads; only the selection logic changed.
+- **No registry wire change.** Existing `RegisterWithKey` / `
+  RegisterWithKeyAndEndpoints` are called with empty endpoint
+  strings and nil LAN / TCP slices when the flag is set. Registry
+  returns no `real_addr` for that node; resolvers on the other
+  end see the existing "node has no real address" error path.
+- Operational note: existing peer-side caches of a previously-
+  public endpoint survive until eviction. For a clean flip,
+  coordinate a fleet restart.
+
+### Dependencies
+
+- No new dependencies.
+
 ## [v1.9.0-jf.9] - 2026-04-24
 
 ### Added

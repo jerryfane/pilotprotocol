@@ -69,6 +69,7 @@ func main() {
 	adminToken := flag.String("admin-token", "", "admin token for network operations")
 	networks := flag.String("networks", "", "comma-separated network IDs to auto-join at startup")
 	trustAutoApprove := flag.Bool("trust-auto-approve", false, "automatically approve all incoming trust handshakes")
+	noRegistryEndpoint := flag.Bool("no-registry-endpoint", false, "register identity only; do not publish UDP/TCP/LAN endpoints to the registry. Pair with -turn-provider for full hide-IP (peers reach us via TURN relay advertised out-of-band by the app layer; registry lookup returns 'endpoint unknown')")
 
 	// TURN (RFC 8656) relay — optional client-side transport for peers
 	// behind UDP-hostile NATs or running in hide-IP mode. Empty provider
@@ -143,6 +144,7 @@ func main() {
 		Version:               version,
 		TrustAutoApprove:      *trustAutoApprove,
 		TURNProvider:          turnProv,
+		NoRegistryEndpoint:    *noRegistryEndpoint,
 	})
 
 	if err := d.Start(); err != nil {

@@ -873,7 +873,15 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	hasTURNEp := tm.peerTURN[nodeID] != nil
 	tm.mu.RUnlock()
 
-	if relay && bAddr != nil {
+	// Tier 1 (beacon relay) — SKIPPED when this peer advertised a
+	// TURN endpoint (v1.9.0-jf.10). A TURN advertisement is an
+	// explicit "route me through TURN, not via any third-party
+	// relay" signal from the peer, typically paired with -hide-ip.
+	// Honouring beacon would leak routing metadata to the beacon's
+	// operator (defeating the hide-ip purpose). Fall through to the
+	// cached-conn tier → turn-relay fallback tier instead. Beacon
+	// stays the default for all peers that did NOT advertise TURN.
+	if relay && bAddr != nil && !hasTURNEp {
 		// MsgRelay: [0x05][senderNodeID(4)][destNodeID(4)][frame...]
 		msg := make([]byte, 1+4+4+len(frame))
 		msg[0] = protocol.BeaconMsgRelay
@@ -893,7 +901,14 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	// keeps v1.9.0-jf.2's NAT-drift refresh effective: writeFrame
 	// follows the last-known-good endpoint even if the caller
 	// snapshotted a stale one before a NAT rotation.
-	if pathDirect != nil {
+	//
+	// v1.9.0-jf.10: skip direct UDP too when peerTURN is advertised.
+	// Otherwise a stale pathDirect (from before the peer went
+	// -hide-ip) would bypass turn-relay and leak the peer's IP back
+	// to them. Honour the "route me via TURN" signal strictly.
+	if hasTURNEp {
+		addr = nil
+	} else if pathDirect != nil {
 		addr = pathDirect
 	}
 

@@ -67,6 +67,18 @@ type Config struct {
 	// hide-IP mode) can advertise it. nil = TURN disabled.
 	TURNProvider turncreds.Provider
 
+	// NoRegistryEndpoint, when true, instructs the daemon to register
+	// its identity with the registry without uploading any endpoint
+	// (UDP, TCP, or LAN). Peers discovering us via registry.Lookup see
+	// "endpoint unknown" and must learn routing from an out-of-band
+	// channel (e.g. a group-gossip transport-ad that pushes the peer's
+	// TURN relay into peerTURN via SetPeerEndpoints). Paired with
+	// Entmoot's -hide-ip, this closes the registry-level IP leak that
+	// Entmoot alone can't prevent. STUN discovery at startup still
+	// runs (useful for TURN itself), but the discovered endpoint is
+	// never published to the registry. v1.9.0-jf.10.
+	NoRegistryEndpoint bool
+
 	// Built-in services
 	DisableEcho         bool // disable built-in echo service (port 7)
 	DisableDataExchange bool // disable built-in data exchange service (port 1001)
@@ -574,11 +586,26 @@ func (d *Daemon) Start() error {
 	if tcpEp := d.advertisedTCPEndpoint(); tcpEp != "" {
 		regEndpoints = append(regEndpoints, registry.NodeEndpoint{Network: "tcp", Addr: tcpEp})
 	}
+	// v1.9.0-jf.10: NoRegistryEndpoint publishes identity (pubkey,
+	// node ID) only — no UDP, no TCP, no LAN addrs. Peers looking us
+	// up via registry.Lookup get "endpoint unknown" and must learn
+	// our routing from an out-of-band channel (e.g. Entmoot transport-
+	// ad carrying a TURN relay). Intended for hide-ip deployments.
+	regAddrToSend := registrationAddr
+	regLANToSend := d.lanAddrs
+	regTCPToSend := regEndpoints
+	if d.config.NoRegistryEndpoint {
+		regAddrToSend = ""
+		regLANToSend = nil
+		regTCPToSend = nil
+		slog.Info("registering identity only (no endpoint published)",
+			"reason", "-no-registry-endpoint")
+	}
 	var resp map[string]interface{}
-	if len(regEndpoints) > 0 {
-		resp, err = rc.RegisterWithKeyAndEndpoints(registrationAddr, pubKeyB64, d.config.Owner, d.lanAddrs, regEndpoints, d.config.Version)
+	if len(regTCPToSend) > 0 {
+		resp, err = rc.RegisterWithKeyAndEndpoints(regAddrToSend, pubKeyB64, d.config.Owner, regLANToSend, regTCPToSend, d.config.Version)
 	} else {
-		resp, err = rc.RegisterWithKey(registrationAddr, pubKeyB64, d.config.Owner, d.lanAddrs, d.config.Version)
+		resp, err = rc.RegisterWithKey(regAddrToSend, pubKeyB64, d.config.Owner, regLANToSend, d.config.Version)
 	}
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
@@ -3120,7 +3147,16 @@ func (d *Daemon) reRegister() {
 
 	// Always re-register with client-generated key
 	pubKeyB64 := crypto.EncodePublicKey(d.identity.PublicKey)
-	resp, err := d.regConn.RegisterWithKey(registrationAddr, pubKeyB64, d.config.Owner, d.lanAddrs, d.config.Version)
+	// v1.9.0-jf.10: honour NoRegistryEndpoint on re-register too, so
+	// a recovering daemon doesn't leak its endpoint after the initial
+	// registration suppressed it.
+	regAddrToSend := registrationAddr
+	regLANToSend := d.lanAddrs
+	if d.config.NoRegistryEndpoint {
+		regAddrToSend = ""
+		regLANToSend = nil
+	}
+	resp, err := d.regConn.RegisterWithKey(regAddrToSend, pubKeyB64, d.config.Owner, regLANToSend, d.config.Version)
 	if err != nil {
 		slog.Error("re-registration failed", "error", err)
 		return

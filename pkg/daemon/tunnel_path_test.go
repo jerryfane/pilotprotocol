@@ -552,6 +552,99 @@ func TestWriteFrame_FallsBackToTURNRelay(t *testing.T) {
 	}
 }
 
+// TestWriteFrame_SkipsBeaconWhenTURNAdvertised locks in the v1.9.0-jf.10
+// priority change. Before jf.10, once path.viaRelay latched to true, tier 1
+// of writeFrame always routed via the beacon relay — even when a peer had
+// subsequently advertised a TURN endpoint. That meant hide-ip peers'
+// actual data still traversed the beacon operator (the VPS), leaking
+// routing metadata that Entmoot's -hide-ip couldn't hide. jf.10 makes
+// tier 1 defer to the turn-relay tier when peerTURN is populated, so
+// "I advertised TURN" is honoured over any third-party beacon.
+func TestWriteFrame_SkipsBeaconWhenTURNAdvertised(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	// UDP socket so the turn-relay path's underlying WriteToUDPAddr
+	// actually has somewhere to send. The destination is a loopback
+	// port nothing is listening on; we only validate control flow.
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+
+	const peer uint32 = 789
+
+	// Latch viaRelay=true to simulate the PILA beacon path being
+	// active (jf.9's production observation — once beacon starts
+	// working it sticks).
+	tm.mu.Lock()
+	tm.paths[peer] = &peerPath{viaRelay: true}
+	tm.beaconAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}
+	tm.mu.Unlock()
+
+	// Advertise a TURN endpoint for this peer. From v1.9.0-jf.10 this
+	// MUST cause writeFrame to bypass the beacon tier and engage the
+	// turn-relay tier instead.
+	if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.200:37500"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
+
+	// Call writeFrame with no direct addr so the only reachable tiers
+	// are: tier 1 (beacon, skipped by jf.10 guard), tier 2 (no cached
+	// conn), tier 3 (addr nil — skipped), tier 4 (turn-relay dial).
+	_ = tm.writeFrame(peer, nil, []byte("jf.10-probe"))
+
+	tm.mu.RLock()
+	cc := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if cc == nil {
+		t.Fatalf("writeFrame did not install turn-relay cached conn; beacon probably fired instead")
+	}
+	if got := cc.RemoteEndpoint().Network(); got != "turn" {
+		t.Fatalf("cached conn network=%q, want turn (turn-relay path); beacon bypass likely didn't engage", got)
+	}
+}
+
+// TestWriteFrame_UsesBeaconWhenNoTURNAdvertised is the regression guard
+// for TestWriteFrame_SkipsBeaconWhenTURNAdvertised: without peerTURN, the
+// beacon tier must still fire (default routing for every peer that hasn't
+// opted into TURN). Any change that unconditionally skips beacon would
+// break resilience against direct-path failures.
+func TestWriteFrame_UsesBeaconWhenNoTURNAdvertised(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	// Listen so WriteToUDPAddr has a working socket. The beacon
+	// destination is a loopback port nothing listens on; we validate
+	// by checking that no turn-relay dial was attempted (the jf.10
+	// code path is NOT taken), not by observing the beacon packet.
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+
+	const peer uint32 = 791
+
+	tm.mu.Lock()
+	tm.paths[peer] = &peerPath{viaRelay: true}
+	tm.beaconAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}
+	tm.mu.Unlock()
+
+	// No AddPeerTURNEndpoint — peerTURN stays empty.
+
+	_ = tm.writeFrame(peer, nil, []byte("non-hide-ip-probe"))
+
+	tm.mu.RLock()
+	cc := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	// If the beacon tier correctly fired, there's no turn-relay cached
+	// conn. jf.10's skip condition (`hasTURNEp`) is false, tier 1
+	// wins, no turn-relay dial, no peerConns entry.
+	if cc != nil {
+		t.Fatalf("peerConns installed when it shouldn't have been: conn.Network=%q — "+
+			"beacon-relay tier (tier 1) was expected to fire since no TURN endpoint is known",
+			cc.RemoteEndpoint().Network())
+	}
+}
+
 // TestWriteFrame_PrefersCachedTURNRelay locks in the precedence: a
 // cached turn-relay DialedConn wins over direct UDP, matching TURN
 // and TCP behaviour (Name() != "udp" passes the cached-conn filter).
