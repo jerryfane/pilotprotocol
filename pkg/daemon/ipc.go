@@ -455,6 +455,19 @@ func (s *IPCServer) handleInfo(conn *ipcConn) {
 		"networks":                  info.Networks,
 		"peer_list":                 peers,
 		"conn_list":                 conns,
+		// v1.9.0-jf.11a.1: expose hide-ip config fields in the IPC
+		// JSON so app-layer cross-layer checks (e.g. Entmoot v1.4.3's
+		// hide-ip startup warning) can actually observe them. The
+		// fields were added to DaemonInfo in jf.8 (turn_endpoint) and
+		// jf.11a (outbound_turn_only, no_registry_endpoint) but the
+		// manual JSON builder never included them, so entmootd's
+		// Driver.InfoStruct always saw zero values and falsely
+		// reported half-configured. Same omitempty policy as the
+		// struct tags: empty/false fields produce empty-string /
+		// zero in the JSON, which decodes compatibly everywhere.
+		"turn_endpoint":        info.TURNEndpoint,
+		"outbound_turn_only":   info.OutboundTURNOnly,
+		"no_registry_endpoint": info.NoRegistryEndpoint,
 	})
 	if err != nil {
 		s.sendError(conn, fmt.Sprintf("info marshal: %v", err))

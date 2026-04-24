@@ -10,6 +10,57 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11a.1] - 2026-04-24
+
+### Fixed
+
+- **IPC `Info` reply now includes hide-ip config fields on the wire.**
+  The JSON builder in `IPCServer.handleInfo` (ipc.go:388) manually
+  constructed its response map and never included `turn_endpoint`
+  (added to `DaemonInfo` in jf.8), `outbound_turn_only`, or
+  `no_registry_endpoint` (both added in jf.11a). Struct-tagged
+  `json:"..."` only applies when `json.Marshal` walks the struct —
+  the handler passes a `map[string]interface{}` literal, so tags
+  were inert.
+
+  Visible symptom from the 2026-04-24 live test: laptop upgraded to
+  pilot-daemon v1.9.0-jf.11a with `-hide-ip` (full mode). pilot-
+  daemon's startup logs correctly showed TURN allocation,
+  `outbound-turn-only enabled`, and `registering identity only
+  (no endpoint published)`. `pilotctl lookup 45491` confirmed no
+  `real_addr`. But Entmoot v1.4.3's cross-layer check via
+  `Driver.InfoStruct` saw all three fields as zero values and
+  falsely reported pilot-daemon was half-configured.
+
+  Pre-existing from jf.8 for `turn_endpoint`; latent for the jf.10
+  / jf.11a fields because they were added with the assumption the
+  struct tags would make the fields transparent. Closed by adding
+  the three fields to the manual JSON builder at ipc.go:458.
+
+### Wire compatibility
+
+- **Pre-jf.11a.1 pilot-daemons** still omit these fields — Entmoot
+  decodes their absence as zero and keeps warning about half-
+  configuration, which is the correct behavior for older daemons
+  that really don't have the features.
+- **No wire format change between daemons**; only the IPC JSON
+  payload between pilot-daemon and its local drivers gained three
+  fields.
+
+### Known limitation (tracked as jf.11a.2 / future fix)
+
+- `-outbound-turn-only` currently requires the peer to have
+  advertised a TURN endpoint. That's overly restrictive: the
+  canonical WebRTC `iceTransportPolicy='relay'` semantic is
+  "our outbound traverses OUR own TURN; we send to the peer's
+  real address via relay.WriteTo." Peer doesn't need a TURN
+  endpoint of its own. Live 2026-04-24: a laptop in full hide-ip
+  could not reach VPS (no TURN advertised) or phobos (no TURN at
+  all) because writeFrame hit fail-closed. Fix deferred to
+  jf.11a.2: new path that resolves peer's real address (from
+  peerPath.direct / peerTCP / registry) and sends via the local
+  TURN relay's `WriteTo`. ~60 LOC + tests.
+
 ## [v1.9.0-jf.11a] - 2026-04-24
 
 Half-release. The full jf.11 plan (see
