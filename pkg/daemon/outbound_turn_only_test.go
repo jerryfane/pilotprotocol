@@ -119,6 +119,19 @@ func TestWriteFrame_OutboundTURNOnly_SkipsNonTURNCachedConn(t *testing.T) {
 	}
 }
 
+// NOTE: writeFrame's jf.11a.2 "send via own relay to peer's real
+// address" branch is covered by
+// pkg/daemon/transport/turn_ownrelay_test.go (real pion TURN server
+// verifying relay.WriteTo reaches an arbitrary UDP peer). The
+// writeFrame integration (control flow into SendViaOwnRelay) could
+// only be unit-tested here by either (a) spinning up a full pion
+// in-process server in the daemon package, which requires
+// significant test-helper extraction, or (b) refactoring tm.turn
+// to an interface, which is a larger jf.11b/jf.12 concern. For
+// jf.11a.2 the control flow is a direct if-else in writeFrame and
+// verifiable by code review; the expensive-behavior test lives at
+// the transport layer.
+
 // TestWriteFrame_OutboundTURNOnly_Disabled_PreservesDefaultBehavior is the
 // regression guard: without OutboundTURNOnly, writeFrame's tier chain is
 // unchanged. Beacon relay fires as before.

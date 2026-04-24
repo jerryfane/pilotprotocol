@@ -944,10 +944,44 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 					"node_id", nodeID, "error", dialErr)
 			}
 		}
+		// v1.9.0-jf.11a.2: peer did not advertise TURN, but WE have our
+		// own TURN allocation. Route via our own relay to the peer's
+		// real UDP address — the canonical WebRTC
+		// iceTransportPolicy='relay' semantic (RFC 8828 Mode 3). Peer
+		// sees source = our TURN anycast, never our real IP.
+		//
+		// Address priority: caller-supplied > pathDirect.
+		// (peerTCP isn't useful here — TURN forwards UDP; the peer's
+		// TCP endpoint isn't UDP-reachable even at the same host:port.)
+		//
+		// pion's auto-CreatePermission on first WriteTo per destination
+		// IP handles the TURN protocol dance transparently. Refresh
+		// every ~4 min; no manual plumbing needed.
+		if tm.turn != nil {
+			var peerAddr *net.UDPAddr
+			switch {
+			case addr != nil:
+				peerAddr = addr
+			case pathDirect != nil:
+				peerAddr = pathDirect
+			}
+			if peerAddr != nil {
+				if err := tm.turn.SendViaOwnRelay(peerAddr, frame); err == nil {
+					atomic.AddUint64(&tm.PktsSent, 1)
+					atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+					return nil
+				} else {
+					slog.Debug("outbound-turn-only: send via own relay failed",
+						"node_id", nodeID, "peer_addr", peerAddr.String(),
+						"error", err)
+				}
+			}
+		}
 		return fmt.Errorf("outbound-turn-only: no TURN path for node %d "+
-			"(peer advertised no TURN endpoint, or local TURN allocation "+
-			"failed; tunnel traffic refused rather than leak source IP "+
-			"via direct UDP or beacon)", nodeID)
+			"(peer advertised no TURN endpoint, local TURN allocation "+
+			"missing or dial failed, and no known UDP-reachable address "+
+			"for this peer; tunnel traffic refused rather than leak "+
+			"source IP via direct UDP or beacon)", nodeID)
 	}
 
 	// Tier 1 (beacon relay) — SKIPPED when this peer advertised a

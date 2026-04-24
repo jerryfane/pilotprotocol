@@ -10,6 +10,106 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11a.2] - 2026-04-24
+
+### Fixed
+
+- **`-outbound-turn-only` no longer requires the peer to advertise a
+  TURN endpoint.** jf.11a's first-pass implementation conflated two
+  concepts from different releases:
+  - jf.9's `DialTURNRelayForPeer` — dials a peer via THEIR advertised
+    TURN relay address. Used when we ourselves don't have TURN.
+  - jf.11a's `-outbound-turn-only` — WebRTC
+    `iceTransportPolicy='relay'` (RFC 8828 Mode 3): OUR outbound
+    traffic routes through OUR own TURN allocation.
+
+  The correct semantic is: peer's address can be anything (host,
+  srflx, or peer's own relay); WE send via OUR TURN's `WriteTo` to
+  that address; peer observes source = our TURN server, never our
+  real IP. Peer does NOT need their own TURN.
+
+  Live evidence 2026-04-24: a laptop in full `-hide-ip` mode with
+  its own Cloudflare TURN allocation could NOT reach the VPS
+  (public UDP, no TURN advertised) or phobos (CGNAT, no TURN at
+  all). Every outbound write failed with `outbound-turn-only: no
+  TURN path for node N`. Laptop was effectively isolated despite
+  having a perfectly usable TURN allocation that could forward to
+  any peer address.
+
+  Fix (per RFC 8656 §9 + pion/turn v5 `udp_conn.go:185` pattern):
+
+  - New `TURNTransport.SendViaOwnRelay(peerAddr, frame)` —
+    thin wrapper over `relay.WriteTo`. Pion handles
+    `CreatePermission` auto-lazily on first write per destination
+    IP and auto-refreshes every ~4 min. No manual plumbing.
+
+  - `writeFrame` outbound-turn-only branch gains a new fallback
+    after the peer-advertised-TURN check fails: if we have our
+    own TURN (`tm.turn != nil`), pick the peer's real UDP address
+    from a priority chain (caller-supplied `addr` > `pathDirect`),
+    and call `SendViaOwnRelay`. Peer sees source = Cloudflare
+    anycast.
+
+  - Fail-closed semantic preserved: when BOTH the peer has no
+    TURN endpoint AND we have no usable peer real-address (no
+    `pathDirect`, no caller-supplied `addr`), return the original
+    `no TURN path for node N` error.
+
+### Behaviour
+
+- **Full hide-ip now talks to everyone.** Laptop with
+  `-outbound-turn-only -turn-provider=cloudflare` reaches any peer
+  whose address it knows (VPS via registry, phobos via any prior
+  authenticated direct UDP), and all those peers see source =
+  Cloudflare anycast rather than laptop's residential IP.
+- **Permission management is lazy + automatic.** pion creates a
+  TURN permission on the first write to a new destination IP and
+  refreshes it; we don't maintain a permission table ourselves.
+- **MTU (documented, not changed).** TURN adds Send/Data Indication
+  overhead (~36 bytes) or ChannelData (~4 bytes). Applications
+  running close to the PMTU limit (~1500 Ethernet) may see
+  fragmentation when paths flip between direct and TURN. Mitigate
+  by keeping application payloads ≤ 1200 bytes where possible.
+- **Residual stale-cache leak (documented, not changed).** A peer
+  that learned our real IP before we flipped to
+  `-outbound-turn-only` keeps trying to dial that address. Our
+  outbound goes through TURN and is safe; the peer's outbound to
+  the stale address fails (kernel drops or NAT dead), and their
+  cache eventually expires. For a clean flip, pair with a fresh
+  local UDP port or a registry re-registration.
+
+### Tests
+
+- `pkg/daemon/transport/turn_ownrelay_test.go` (new):
+  - `TestSendViaOwnRelay_ReachesArbitraryPeer`: pion in-process
+    TURN server + a plain-UDP "peer" (no TURN). Verifies the
+    TURN-enabled client reaches the peer via its own relay; the
+    peer's observed source port equals the client's relay port
+    (confirming the packet traversed TURN, not the client's
+    direct socket).
+  - `TestSendViaOwnRelay_NilPeerAddr`: nil-input error path.
+  - `TestSendViaOwnRelay_NotListening`: pre-Listen error path.
+
+  The daemon-level writeFrame integration (`tm.turn != nil` +
+  pathDirect branch) is covered by code review: the real TURN
+  send primitive has unit tests; the writeFrame path is a direct
+  if-else over those primitives. Larger "full stack including
+  writeFrame routing" integration can land in jf.11b when the
+  disco rewrite refactors path selection anyway.
+
+### Compatibility
+
+- **No wire-format changes.** Same frame shapes on UDP and TURN.
+- **No IPC changes.** `DaemonInfo` still advertises
+  `outbound_turn_only` (added in jf.11a.1).
+- **Existing deployments without `-outbound-turn-only` unaffected.**
+  The new branch only runs when `tm.outboundTURNOnly == true`.
+
+### Dependencies
+
+- **No new dependencies.** Existing `github.com/pion/turn/v5`
+  `relay.WriteTo` API does everything we need.
+
 ## [v1.9.0-jf.11a.1] - 2026-04-24
 
 ### Fixed

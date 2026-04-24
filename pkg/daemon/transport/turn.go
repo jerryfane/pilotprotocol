@@ -236,6 +236,38 @@ func (t *TURNTransport) LocalAddr() net.Addr {
 	return t.relay.LocalAddr()
 }
 
+// SendViaOwnRelay writes frame through our own TURN allocation to an
+// arbitrary peer address. The peer observes source = our relay's
+// anycast address (e.g. Cloudflare TURN), never our real IP. Used by
+// writeFrame in -outbound-turn-only mode to reach peers that have
+// NOT advertised their own TURN endpoint — the canonical WebRTC
+// `iceTransportPolicy: "relay"` semantic (RFC 8828 Mode 3).
+//
+// Permission management is handled automatically by pion: the first
+// WriteTo for a given destination IP triggers an internal
+// CreatePermission; a background goroutine refreshes every ~4 min so
+// long-lived destinations stay permissioned. Callers do not need to
+// pre-permission via CreatePermission for this path.
+//
+// Returns error if the transport isn't listening, peerAddr is nil,
+// or the underlying UDP WriteTo fails (network error, allocation
+// expired, etc.). Does NOT itself gate on peer advertisement — the
+// decision "should I route this peer via my own TURN?" is made by
+// the caller (writeFrame). v1.9.0-jf.11a.2.
+func (t *TURNTransport) SendViaOwnRelay(peerAddr net.Addr, frame []byte) error {
+	if peerAddr == nil {
+		return errors.New("turn transport: nil peer address")
+	}
+	t.mu.RLock()
+	relay := t.relay
+	t.mu.RUnlock()
+	if relay == nil {
+		return errors.New("turn transport: not listening")
+	}
+	_, err := relay.WriteTo(frame, peerAddr)
+	return err
+}
+
 // CreatePermission proactively installs a TURN permission for addr
 // (host:port) on the current allocation so inbound datagrams from
 // that address are admitted by the server. Returns an error if the
