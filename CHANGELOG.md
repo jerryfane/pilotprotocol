@@ -10,6 +10,60 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11a.4] - 2026-04-25
+
+### Fixed
+
+- **`-no-registry-endpoint` silently leaked the daemon's real IP.**
+  A laptop running `-hide-ip -outbound-turn-only -no-registry-endpoint`
+  still exposed its UAE residential IP (`5.30.217.114`) to every peer
+  that resolved it via the registry. Root cause: the registry's
+  `sanitizeListenAddr` fell back to the TCP source IP whenever the
+  client supplied an empty `listen_addr`. The daemon side correctly
+  sent `listen_addr=""` under `-no-registry-endpoint`, but the server
+  silently substituted the TCP source IP and stored it as
+  `node.RealAddr`. Live evidence 2026-04-25 from phobos: `added peer
+  node_id=45491 addr=5.30.217.114:51619` — laptop's real UAE IP
+  observed by a remote peer despite the privacy flag being set.
+
+  Fix: `sanitizeListenAddr` now returns `""` when `clientAddr` is
+  explicitly empty, matching the "identity-only, no endpoint
+  published" semantic that `-no-registry-endpoint` was introduced
+  for in jf.10. `handleReRegister` then writes `node.RealAddr = ""`,
+  `handleResolve` returns an empty `real_addr`, and remote peers
+  correctly treat the node as endpoint-unknown (must learn routing
+  via Entmoot transport-ad carrying a TURN relay, or similar
+  out-of-band channel). The malformed-address fallback (parse
+  failure → use TCP source) is preserved for legacy robustness;
+  only the explicit-empty case was privacy-broken.
+
+  Non-hide-ip clients (the vast majority) never send
+  `listen_addr=""`, so the semantic change does not affect them.
+  Registry heartbeat's `real_addr` refresh is already gated on
+  `clientAddr != ""` (server.go:5504) and is unaffected.
+
+### Tests
+
+- `pkg/registry/sanitize_listen_addr_test.go`:
+  - `TestSanitizeListenAddr_EmptyClientMeansNoEndpoint` — the
+    regression guard: empty `clientAddr` must never leak the TCP
+    source IP.
+  - `TestSanitizeListenAddr_ClientPortRespected` — legacy contract
+    preserved: IP from TCP source, port from client, for
+    non-empty `clientAddr`.
+  - `TestSanitizeListenAddr_MalformedClientAddr` — parse failure
+    still falls back to the full TCP source (legacy robustness).
+  - `TestSanitizeListenAddr_IPv6ClientPort` — IPv6 host/port
+    splitting unchanged.
+
+### Upgrade path
+
+Upgrade the **registry** server first. Clients (daemons) need no
+change — jf.10+ already sends `listen_addr=""` correctly. After the
+registry is updated, any already-leaked `RealAddr` is overwritten
+to empty on the next laptop re-registration (~60 s heartbeat
+interval, or immediately on daemon restart).
+
 ## [v1.9.0-jf.11a.3] - 2026-04-25
 
 ### Fixed

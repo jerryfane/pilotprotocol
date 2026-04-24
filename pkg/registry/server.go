@@ -1842,12 +1842,20 @@ func (s *Server) handleMessage(msg map[string]interface{}, remoteAddr string) (r
 // the port from the client-provided address. This prevents clients from
 // registering arbitrary IP addresses while allowing them to specify their
 // actual listening port (which may differ from the TCP source port).
+//
+// When clientAddr is explicitly empty, the client is signalling "I am
+// registering identity only; do not record any endpoint for me" — the
+// semantic behind Pilot's -no-registry-endpoint flag (v1.9.0-jf.10).
+// Returning the empty string here lets handleReRegister clear RealAddr
+// rather than silently backfilling it from the TCP source IP, which
+// would defeat the privacy guarantee of -hide-ip + -no-registry-endpoint.
+// (v1.9.0-jf.11a.4)
 func sanitizeListenAddr(remoteAddr, clientAddr string) string {
+	if clientAddr == "" {
+		return ""
+	}
 	remoteHost, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return remoteAddr
-	}
-	if clientAddr == "" {
 		return remoteAddr
 	}
 	_, clientPort, err := net.SplitHostPort(clientAddr)
