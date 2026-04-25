@@ -20,6 +20,7 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/internal/fsutil"
 	"github.com/TeoSlayer/pilotprotocol/internal/validate"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/rendezvous"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/turncreds"
 	"github.com/TeoSlayer/pilotprotocol/pkg/policy"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
@@ -141,6 +142,16 @@ type Config struct {
 	// permissions and NAT mappings in both directions. See
 	// DefaultPeerKeepaliveInterval doc for the why.
 	PeerKeepaliveInterval time.Duration
+
+	// RendezvousURL is the base URL of a Pkarr-style endpoint
+	// rendezvous service (e.g. "https://rendezvous.example.com").
+	// When non-empty, the daemon publishes its TURN allocation
+	// address on every rotation event AND consults the rendezvous
+	// during cold-dial fallback when the cached endpoint for a
+	// peer has gone stale. Empty disables both code paths
+	// entirely. See pkg/daemon/rendezvous for the trust model.
+	// (v1.9.0-jf.14)
+	RendezvousURL string
 }
 
 // Default tuning constants (used when Config fields are zero).
@@ -344,6 +355,20 @@ type Daemon struct {
 	// it down before the daemon's other resources so the ticker
 	// can't fire against a half-closed daemon.
 	gossipEngine *gossip.Engine
+
+	// rendezvousClient is the Pkarr-style endpoint rendezvous
+	// client (v1.9.0-jf.14). Non-nil iff Config.RendezvousURL is
+	// non-empty. Drives both the publish-on-rotation loop and the
+	// cold-dial lookup fallback.
+	rendezvousClient *rendezvous.Client
+
+	// rendezvousPublishCh is a length-1 buffered channel that
+	// carries the most recent TURN local address waiting to be
+	// pushed to the rendezvous. SetTURNOnLocalAddrChange does a
+	// non-blocking send; rendezvousPublishLoop drains. "Last
+	// value wins" is the right shape — if rotation events outrun
+	// the network, only the latest endpoint matters.
+	rendezvousPublishCh chan string
 }
 
 const perSourceSYNLimit = 10     // max SYNs per source per second
@@ -421,6 +446,10 @@ func New(cfg Config) *Daemon {
 	}
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
 	d.handshakes = NewHandshakeManager(d)
+	if cfg.RendezvousURL != "" {
+		d.rendezvousClient = rendezvous.New(cfg.RendezvousURL)
+		d.rendezvousPublishCh = make(chan string, 1)
+	}
 	return d
 }
 
@@ -637,6 +666,25 @@ func (d *Daemon) Start() error {
 	})
 	d.tunnels.SetTURNOnLocalAddrChange(func(newAddr string) {
 		d.ipc.PublishTopic("turn_endpoint", []byte(newAddr))
+		// v1.9.0-jf.14: also feed the rendezvous publish loop on
+		// every rotation. Non-blocking, length-1 channel, last
+		// value wins — TURN rotation must not stall on a slow
+		// rendezvous.
+		if d.rendezvousPublishCh != nil {
+			select {
+			case d.rendezvousPublishCh <- newAddr:
+			default:
+				// drain stale value, push new
+				select {
+				case <-d.rendezvousPublishCh:
+				default:
+				}
+				select {
+				case d.rendezvousPublishCh <- newAddr:
+				default:
+				}
+			}
+		}
 	})
 
 	// v1.9.0-jf.11a: latch OutboundTURNOnly into the TunnelManager so
@@ -898,6 +946,15 @@ func (d *Daemon) Start() error {
 	// PersistentKeepalive at 25s. Loop self-checks for the
 	// disabled (negative interval) case.
 	go d.peerKeepaliveLoop()
+
+	// 10b. Start endpoint-rendezvous publish loop (v1.9.0-jf.14).
+	// No-op if Config.RendezvousURL is empty. Drains a length-1
+	// channel fed by SetTURNOnLocalAddrChange and PUTs each new
+	// TURN address to the configured rendezvous service. The
+	// initial Allocate fires fireLocalAddrChange exactly once,
+	// which produces the startup publish; subsequent rotations
+	// publish the same way. Best-effort, errors logged at Debug.
+	go d.rendezvousPublishLoop()
 
 	// 11. Start network sync (refreshes memberships/policies every 5 min)
 	go d.networkSyncLoop()
@@ -2435,6 +2492,11 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 		directRetries = 0
 	}
 
+	// v1.9.0-jf.14: Once-per-dial guard for the rendezvous lookup.
+	// Set true after the lookup runs (success or failure) so we don't
+	// hammer the rendezvous on every retry of a stuck peer.
+	rendezvousQueried := false
+
 	// v1.9.0-jf.11a.3: Race direct + relay concurrently. While the
 	// main retry loop drives direct UDP retransmissions (phase 1),
 	// a parallel goroutine re-transmits the same SYN through the
@@ -2501,6 +2563,25 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 			// Prefer TCP direct-connect (lower latency than relay) if the
 			// peer advertised a TCP endpoint; else fall back to relay.
 			if retries == directRetries && !relayActive {
+				// v1.9.0-jf.14: before falling back to TCP/relay,
+				// consult the rendezvous service once per dial. The
+				// most common cause of phase-1 timeout for hide-ip
+				// peers is a stale cached TURN endpoint left over
+				// from before the peer rotated. A fresh fetch from
+				// the rendezvous unblocks the next retry without
+				// burning the full relay-fallback budget.
+				if !rendezvousQueried && d.rendezvousClient != nil {
+					rendezvousQueried = true
+					if fresh := d.rendezvousLookupForDial(dstAddr.Node); fresh != "" {
+						if err := d.tunnels.AddPeerTURNEndpoint(dstAddr.Node, fresh); err != nil {
+							slog.Debug("rendezvous fresh endpoint install failed",
+								"node_id", dstAddr.Node, "addr", fresh, "error", err)
+						} else {
+							slog.Info("rendezvous installed fresh turn endpoint, retrying dial",
+								"node_id", dstAddr.Node, "addr", fresh)
+						}
+					}
+				}
 				switched := false
 				if d.tunnels.HasTCPEndpoint(dstAddr.Node) {
 					dctx, cancel := context.WithTimeout(context.Background(), DialTCPFallbackTimeout)
@@ -3758,6 +3839,95 @@ func (d *Daemon) sendPeerKeepalive(nodeID uint32) {
 		slog.Debug("peer keepalive send failed",
 			"peer_node_id", nodeID, "error", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint rendezvous (v1.9.0-jf.14)
+// ---------------------------------------------------------------------------
+
+// rendezvousPublishLoop is the goroutine that pushes our current
+// TURN allocation address to the rendezvous service on every
+// rotation event. Drains rendezvousPublishCh (length-1, fed by
+// SetTURNOnLocalAddrChange). No-op if RendezvousURL is empty —
+// the channel is nil in that case and the goroutine returns
+// immediately.
+//
+// We intentionally don't retry on failure inside the loop: every
+// rotation or restart re-publishes naturally, and the
+// peerKeepaliveLoop (jf.13) handles steady-state. The rendezvous
+// is a cold-start crowbar, not a transport.
+func (d *Daemon) rendezvousPublishLoop() {
+	if d.rendezvousClient == nil || d.rendezvousPublishCh == nil {
+		return
+	}
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case addr := <-d.rendezvousPublishCh:
+			if addr == "" || d.identity == nil {
+				continue
+			}
+			d.addrMu.RLock()
+			nodeID := d.nodeID
+			d.addrMu.RUnlock()
+			if nodeID == 0 {
+				// We get a rotation event before the daemon has
+				// registered (and therefore before nodeID is
+				// known). Drop — the next rotation, post-
+				// registration, will publish.
+				continue
+			}
+			if err := d.rendezvousClient.Publish(d.identity, nodeID, addr); err != nil {
+				slog.Debug("rendezvous publish failed",
+					"url", d.config.RendezvousURL,
+					"node_id", nodeID,
+					"turn_endpoint", addr,
+					"error", err)
+			} else {
+				slog.Debug("rendezvous publish ok",
+					"url", d.config.RendezvousURL,
+					"node_id", nodeID,
+					"turn_endpoint", addr)
+			}
+		}
+	}
+}
+
+// rendezvousLookupForDial is the cold-dial helper used by
+// DialConnection to refresh a stale path entry just before the
+// dial loop falls back to relay retries. Returns the freshly-
+// fetched TURN endpoint if the rendezvous has a more current
+// record than what the path table holds, or "" otherwise.
+//
+// Behaviour rules:
+//   - If RendezvousURL is empty: return "" immediately.
+//   - If Lookup returns no record (404): return "".
+//   - If Lookup returns the SAME endpoint we already have: return
+//     "" (no point reinstalling).
+//   - Otherwise: return the new endpoint. Caller installs via
+//     tm.AddPeerTURNEndpoint.
+//
+// All errors are logged at Debug and yield "". The dial loop
+// will continue regardless. (v1.9.0-jf.14)
+func (d *Daemon) rendezvousLookupForDial(nodeID uint32) string {
+	if d.rendezvousClient == nil {
+		return ""
+	}
+	fresh, err := d.rendezvousClient.Lookup(nodeID, nil)
+	if err != nil {
+		slog.Debug("rendezvous lookup failed",
+			"node_id", nodeID, "error", err)
+		return ""
+	}
+	if fresh == "" {
+		return ""
+	}
+	current := d.tunnels.PeerTURNEndpoint(nodeID)
+	if fresh == current {
+		return ""
+	}
+	return fresh
 }
 
 // ---------------------------------------------------------------------------

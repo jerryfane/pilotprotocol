@@ -10,6 +10,152 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.14] - 2026-04-25
+
+Pkarr-style endpoint rendezvous — fixes the cold-start bootstrap
+deadlock that survives jf.13's keepalive when the
+privacy-maximalist preset (`-hide-ip` + `-outbound-turn-only` +
+`-no-registry-endpoint`) makes both the registry and gossip
+channels unavailable for a peer's freshly-rotated TURN endpoint.
+
+### Added
+
+- **`cmd/pilot-rendezvous`** — new companion HTTP service
+  (~300 LOC + bbolt) that stores ed25519-signed
+  `(NodeID -> TURN_endpoint, timestamp)` records. Three
+  endpoints:
+
+  ```
+  PUT  /v1/announce/{node_id}   body: AnnounceBlob (JSON)
+  GET  /v1/announce/{node_id}   -> AnnounceBlob | 404
+  GET  /v1/health               -> "ok"
+  ```
+
+  Trust-on-first-use binds `(NodeID -> PublicKey)` on the first
+  PUT; subsequent PUTs whose key disagrees get 409 Conflict. PUT
+  is rate-limited to 1/min/NodeID; body cap 16 KiB; bbolt
+  persistence at `--db`. Trusted **for availability, not for
+  integrity** — signatures verify locally on every Lookup, so a
+  compromised service cannot inject endpoints.
+
+- **`pkg/daemon/rendezvous`** — client + shared blob format. The
+  canonical signing payload (`pilot-rendezvous/v1\x00 || u32be(NodeID) ||
+  u8(len(PublicKey)) || PublicKey || u8(len(TURNEndpoint)) ||
+  TURNEndpoint || u64be(IssuedAt) || u64be(ValidUntil)`) is
+  domain-separated to ensure signatures minted here can't be
+  replayed in any other Pilot/Entmoot signature surface.
+
+- **`-rendezvous-url`** CLI flag and `Config.RendezvousURL` —
+  empty (default) disables both publish and lookup. Non-empty
+  enables:
+  1. **Publish on TURN rotation.** The existing
+     `SetTURNOnLocalAddrChange` callback feeds a length-1
+     channel; `rendezvousPublishLoop` drains. Last-value-wins
+     so rapid rotations don't queue.
+  2. **Lookup on cold-dial fallback.** Once per `DialConnection`
+     attempt, just before the dial loop falls back to relay
+     retries, query the rendezvous for a fresh endpoint. If it
+     differs from the cached entry, install via
+     `tm.AddPeerTURNEndpoint` and let the next retry succeed.
+     Rate-limited to one lookup per dial via the
+     `rendezvousQueried` flag.
+
+### Why
+
+Three of the four canonical patterns for cold-start /
+post-rotation peer rediscovery (Tailscale DERP, libp2p
+Circuit-Relay-v2 + DCUtR, Tor HSDirs) require either a
+modifiable centralized coordinator or a heavy
+always-available signaling channel that itself has the same
+bootstrap problem. WebRTC ICE-Restart presumes the signaling
+channel is up. WireGuard endpoint roaming requires *one side*
+to already have a fresh address.
+
+iroh's Pkarr-based discovery — productionized in
+`iroh-dns-server` since 2024 — solves cold start with a tiny
+HTTP service holding only opaque signed blobs. We adopt the
+exact shape, point it at any operator-controlled endpoint
+(self-host, Cloudflare Worker, behind Caddy / Tailscale Funnel,
+or a Tor onion service), and gain a third independent
+endpoint-distribution channel orthogonal to the registry and
+gossip. The three channels collectively recover from any
+single-channel outage.
+
+### Composition with existing flags
+
+The rendezvous is the third independent endpoint channel, not a
+replacement for the other two. Operators choose which they
+trust:
+
+| Channel | Carries | Trust |
+|---|---|---|
+| Registry / beacon (third party) | UDP/TCP/LAN/TURN endpoints | full |
+| Gossip / transport-ads (entmoot) | TURN endpoints | mesh-internal |
+| Rendezvous (this release) | TURN endpoints, signed | available-not-integrity |
+
+`-no-registry-endpoint` continues to suppress the first.
+`-hide-ip` continues to mean "real IP never leaves this host."
+`-rendezvous-url` adds the third channel without altering the
+others.
+
+### Privacy
+
+The blob contains only the TURN allocation address (Cloudflare
+anycast). With `-hide-ip` + `-outbound-turn-only`, the daemon
+never publishes a real IP to the rendezvous. A compromised
+rendezvous learns: which NodeIDs are alive and roughly when
+they restart. For a mesh whose members already gossip-share
+NodeIDs after authentication, this is a strict subset of
+existing leakage.
+
+### Compat
+
+No wire-format changes. No protocol changes. No registry-side
+changes. No entmoot changes. No new dependencies in the daemon
+binary itself; `cmd/pilot-rendezvous` adds `go.etcd.io/bbolt`
+(used only by the standalone server). Mixed-version meshes:
+jf.14 peers transparently coexist with jf.13/earlier peers —
+the new code paths are no-ops when `-rendezvous-url` is empty,
+and a jf.14 peer that consults the rendezvous against a
+jf.13 peer simply gets 404 (unpublished) and falls back to
+existing behaviour.
+
+### Tests
+
+- `pkg/daemon/rendezvous/blob_test.go` — round-trip,
+  tamper-detection (signature, endpoint, NodeID), expiry,
+  validity-window bounds, expected-binding mismatches,
+  clock-skew rejection.
+- `pkg/daemon/rendezvous/client_test.go` — Publish/Lookup
+  round-trip via `httptest.Server`, 404 → empty, tampered
+  on-the-wire blob rejected, monotonic-IssuedAt latest-wins,
+  unreachable-server error category.
+- `cmd/pilot-rendezvous/server_test.go` — TOFU acceptance,
+  key-conflict 409, path/body NodeID mismatch 400,
+  bad-signature 400, rate-limit 429, monotonic blob
+  overwrite, body-size cap, bbolt persistence across reopen.
+- `pkg/daemon/daemon_rendezvous_test.go` — disabled-by-empty-URL
+  no-op, client constructed when URL set, publish loop
+  end-to-end via stub, drop-before-NodeID, last-value-wins on
+  rapid rotations, lookup-for-dial happy/cache-equal/404/error
+  paths.
+
+### Out of scope (deferred)
+
+- **Roster-anchored verification (jf.15).** Pull
+  `(NodeID -> PublicKey)` bindings from entmoot's signed
+  roster and reject any rendezvous response whose PublicKey
+  doesn't match. Closes the TOFU race entirely. Postponed
+  because it requires a daemon-to-entmoot read API that
+  doesn't exist today; jf.14 ships the rendezvous in TOFU
+  mode, which is sufficient for the existing 3-machine mesh
+  if the operator pre-seeds bindings out-of-band.
+- **Multi-rendezvous failover.** v1 supports exactly one
+  `-rendezvous-url`. Multi-URL fanout deferred.
+- **Rendezvous behind a Tor onion service.** Same binary;
+  bind to `127.0.0.1:8443` and front with a Tor hidden-
+  service config. Operator-level concern.
+
 ## [v1.9.0-jf.13] - 2026-04-25
 
 Per-peer tunnel-layer keepalive — WireGuard's `PersistentKeepalive`

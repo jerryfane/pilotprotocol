@@ -77,6 +77,7 @@ func main() {
 	// behind UDP-hostile NATs or running in hide-IP mode. Empty provider
 	// = disabled. See pkg/daemon/turncreds for credential backends.
 	peerKeepalive := flag.Duration("peer-keepalive", 0, `interval for per-peer tunnel keepalives (default 25s; set to a negative duration like -1s to disable). Sends one tiny encrypted control packet per authenticated peer to keep TURN allocation permissions (RFC 8656 §9, 5-min TTL) and NAT mappings fresh in both directions. Closes the post-rotation chicken-and-egg deadlock between peers behind TURN. (v1.9.0-jf.13)`)
+	rendezvousURL := flag.String("rendezvous-url", "", `base URL of a Pkarr-style endpoint rendezvous service (e.g. "https://rendezvous.example.com"; empty = disabled). When set, the daemon publishes its TURN endpoint on every rotation and consults the rendezvous on cold-dial fallback to refresh stale cached endpoints. Composes with -hide-ip + -outbound-turn-only + -no-registry-endpoint to fix the cold-start bootstrap deadlock that survives jf.13 keepalive. See cmd/pilot-rendezvous for the companion server. (v1.9.0-jf.14)`)
 	turnProvider := flag.String("turn-provider", "", `TURN credential provider ("" disables TURN; "static"=long-lived creds; "cloudflare"=short-lived Cloudflare Realtime TURN)`)
 	turnServer := flag.String("turn-server", "", "TURN server host:port (required when -turn-provider=static)")
 	turnTransport := flag.String("turn-transport", "udp", "TURN client→server transport: udp|tcp|tls")
@@ -166,6 +167,7 @@ func main() {
 		NoRegistryEndpoint:    *noRegistryEndpoint,
 		OutboundTURNOnly:      *outboundTurnOnly,
 		PeerKeepaliveInterval: *peerKeepalive,
+		RendezvousURL:         *rendezvousURL,
 	})
 
 	if err := d.Start(); err != nil {

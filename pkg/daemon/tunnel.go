@@ -548,6 +548,22 @@ func (tm *TunnelManager) HasTURNEndpoint(nodeID uint32) bool {
 	return ok
 }
 
+// PeerTURNEndpoint returns the host:port string of the peer's
+// recorded TURN endpoint, or "" if none is recorded. Used by
+// the daemon's rendezvous lookup path (v1.9.0-jf.14) to decide
+// whether a fresh record from the rendezvous differs from what's
+// already in the path table — no point reinstalling an
+// identical address.
+func (tm *TunnelManager) PeerTURNEndpoint(nodeID uint32) string {
+	tm.mu.RLock()
+	ep := tm.peerTURN[nodeID]
+	tm.mu.RUnlock()
+	if ep == nil {
+		return ""
+	}
+	return ep.String()
+}
+
 // DialTURNRelayForPeer is the asymmetric-TURN (v1.9.0-jf.9) analogue
 // of DialTURNForPeer for daemons without a local TURN allocation.
 // It sends raw UDP through the shared UDP socket to the peer's

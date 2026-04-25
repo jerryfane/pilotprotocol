@@ -6,6 +6,7 @@ require (
 	github.com/expr-lang/expr v1.17.8
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v5 v5.0.3
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/term v0.28.0
 )
 
