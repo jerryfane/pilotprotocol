@@ -1102,7 +1102,15 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	// to them. Honour the "route me via TURN" signal strictly.
 	if hasTURNEp {
 		addr = nil
-	} else if pathDirect != nil {
+	} else if addr == nil && pathDirect != nil {
+		// v1.9.0-jf.12: only fall back to the cached pathDirect when
+		// the caller didn't supply an explicit addr. A non-nil caller
+		// arg (typically the source addr of the most-recent
+		// authenticated inbound frame, threaded through by handshake
+		// reply paths — the WireGuard endpoint-learning rule) is the
+		// freshest evidence of where the peer is reachable, so it
+		// must override the cache. Pre-jf.12 behaviour is preserved
+		// for callers passing nil.
 		addr = pathDirect
 	}
 
@@ -1543,7 +1551,16 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 	})
 
 	if !hadCrypto || keyChanged {
-		tm.sendKeyExchangeToNode(peerNodeID)
+		// v1.9.0-jf.12: pass the observed source so the reply lands
+		// at the peer's freshly-observed address, not a stale
+		// path.direct. Skipped (nil) for relay-delivered frames so
+		// writeFrame's tier-1 (beacon-relay) keeps routing the reply
+		// back through the relay path.
+		var src *net.UDPAddr
+		if !fromRelay {
+			src = from
+		}
+		tm.sendKeyExchangeToNode(peerNodeID, src)
 	}
 
 	tm.flushPending(peerNodeID)
@@ -1592,7 +1609,14 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 		expectedPubKey, err := tm.getPeerPubKey(peerNodeID)
 		if err == nil && expectedPubKey != nil {
 			slog.Warn("rejecting unauthenticated key exchange from peer with known identity", "peer_node_id", peerNodeID)
-			tm.sendKeyExchangeToNode(peerNodeID)
+			// v1.9.0-jf.12: nudge the peer with our auth'd key
+			// exchange. Use the observed source addr so we don't
+			// nudge into a stale cached endpoint.
+			var src *net.UDPAddr
+			if !fromRelay {
+				src = from
+			}
+			tm.sendKeyExchangeToNode(peerNodeID, src)
 			return
 		}
 	}
@@ -1630,7 +1654,13 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 
 	// Respond with our key if this is a new peer or the peer rekeyed
 	if !hadCrypto || keyChanged {
-		tm.sendKeyExchangeToNode(peerNodeID)
+		// v1.9.0-jf.12: prefer observed source over cached path.direct
+		// so post-rotation handshakes converge in one round trip.
+		var src *net.UDPAddr
+		if !fromRelay {
+			src = from
+		}
+		tm.sendKeyExchangeToNode(peerNodeID, src)
 	}
 
 	// Flush any pending packets now that encryption is ready
@@ -1822,15 +1852,31 @@ func (tm *TunnelManager) deriveSecret(peerPubKeyBytes []byte) (*peerCrypto, erro
 
 // sendKeyExchangeToNode sends an authenticated key exchange if identity is available,
 // otherwise falls back to unauthenticated. Uses nodeID-based routing (relay-aware via writeFrame).
-func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32) {
+//
+// observedSrc, when non-nil, is the source UDP address of the
+// inbound authenticated frame that triggered this reply (passed by
+// handleAuthKeyExchange / handleKeyExchange). Per the WireGuard
+// endpoint-learning rule, the reply MUST go to that observed source
+// — it's the freshest evidence of where the peer is reachable, and
+// using it breaks the chicken-and-egg deadlock that arose post-TURN-
+// allocation rotation: peer B had A's OLD TURN cached in
+// path[A].direct, B's reply to A's handshake went to OLD TURN, frame
+// dropped at Cloudflare, A's auth never completed.
+//
+// When observedSrc is nil (caller-initiated KEX from startup, AddPeer,
+// or the SendTo queue path — none of which have an inbound frame to
+// react to), we fall back to path.direct as before. (v1.9.0-jf.12)
+func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32, observedSrc *net.UDPAddr) {
 	tm.mu.RLock()
 	hasIdentity := tm.identity != nil
-	// addr is only used as a fallback if path has no direct address
-	// recorded (pre-handshake state); writeFrame prefers path.direct
-	// when set. Relay routing is decided entirely by path.viaRelay.
-	var addr *net.UDPAddr
-	if p := tm.paths[peerNodeID]; p != nil {
-		addr = p.direct
+	// Resolve the destination addr. Prefer the observed source from a
+	// reactive handshake; only consult the cache when the caller had
+	// nothing fresher to offer.
+	addr := observedSrc
+	if addr == nil {
+		if p := tm.paths[peerNodeID]; p != nil {
+			addr = p.direct
+		}
 	}
 	tm.mu.RUnlock()
 
@@ -2092,7 +2138,9 @@ func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.
 		}
 
 		// No key yet — initiate key exchange and queue the packet (C1 fix: no plaintext fallback)
-		tm.sendKeyExchangeToNode(nodeID)
+		// Caller-initiated; no inbound frame to react to. Pass nil so
+		// sendKeyExchangeToNode falls back to path.direct (jf.12).
+		tm.sendKeyExchangeToNode(nodeID, nil)
 		tm.pendMu.Lock()
 		if _, exists := tm.pending[nodeID]; !exists && len(tm.pending) >= maxPendingPeers {
 			tm.pendMu.Unlock()
@@ -2142,9 +2190,11 @@ func (tm *TunnelManager) AddPeer(nodeID uint32, addr *net.UDPAddr) {
 	tm.mu.Unlock()
 	slog.Debug("added peer", "node_id", nodeID, "addr", addr)
 
-	// If encryption is enabled, initiate key exchange (relay-aware)
+	// If encryption is enabled, initiate key exchange (relay-aware).
+	// Caller-initiated; no inbound frame, so observedSrc is nil and
+	// the cached path.direct (which we just set above) is used (jf.12).
 	if tm.encrypt {
-		tm.sendKeyExchangeToNode(nodeID)
+		tm.sendKeyExchangeToNode(nodeID, nil)
 	}
 }
 

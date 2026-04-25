@@ -10,6 +10,117 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.12] - 2026-04-25
+
+WireGuard-style strict endpoint learning for handshake replies.
+Closes the post-TURN-rotation chicken-and-egg deadlock that caused
+`gossip: transport_ad retry budget exhausted` cycles for several
+minutes after a peer restarted.
+
+### Fixed
+
+- **Handshake replies now route to the most-recent observed
+  source, not the cached `path.direct`.** Pilot already implemented
+  the WireGuard endpoint-learning rule for encrypted-data frames
+  (`updatePathDirect` on auth, `writeFrame` consults the freshly-set
+  `path.direct`). Handshake replies — `sendKeyExchangeToNode`,
+  invoked from `handleAuthKeyExchange` and `handleKeyExchange` —
+  did not. They read `path.direct` at send time, which under post-
+  TURN-rotation conditions was a stale value that no longer
+  pointed to the peer's live allocation. The reply was sent to the
+  dead allocation; Cloudflare dropped it; authentication never
+  completed; the tunnel stayed broken until racing-dial eventually
+  found a non-TURN path.
+
+  Live evidence 2026-04-25 from VPS post-laptop-restart:
+  ```
+  gossip: transport_ad fanout peer=45491 err="dial: pilot: dial
+    0:0000.0000.B1B3:1004: context deadline exceeded"
+  gossip: transport_ad retry budget exhausted peer=45491 author=45981
+    seq=27 attempts=7
+  ```
+
+  Fix: `sendKeyExchangeToNode` gains an `observedSrc *net.UDPAddr`
+  parameter. The reactive callers — `handleAuthKeyExchange`,
+  `handleKeyExchange` (both branches) — pass through the inbound
+  frame's source address, and the reply lands at that address
+  instead of consulting the cache. Caller-initiated callers
+  (`SendTo`'s queue-and-KEX path, `AddPeer`'s auto-KEX) pass nil
+  and fall back to `path.direct` — pre-jf.12 behavior preserved
+  for those flows. `writeFrame`'s override condition narrows from
+  unconditional `if pathDirect != nil { addr = pathDirect }` to
+  `if addr == nil && pathDirect != nil { addr = pathDirect }`, so a
+  caller-supplied address is always respected.
+
+### Why
+
+Industry research (WireGuard whitepaper §2.2, Tailscale DERP /
+ipnlocal, libp2p Circuit Relay v2, WebRTC Trickle ICE, RFC 8838)
+converges on a single canonical rule: *"the peer's endpoint is
+learned from the outer external source IP of the most recent
+correctly-authenticated packet received."* Replies must go to that
+observed source, never to a cached value when the observed source
+is available. Pilot implemented this for data frames since jf.4;
+jf.12 extends it to handshake replies.
+
+The ALTERNATIVE — anti-entropy reconcile (task #86) — is a fine
+backup for the pathological cases where the WireGuard rule misses
+(auth signature failures, replay-window collisions, etc.). But the
+typical post-rotation case is now closed in one round-trip without
+any gossip-layer intervention.
+
+### Behaviour
+
+- **Detection latency for post-rotation re-handshake drops from
+  minutes to one round-trip.** A peer that restarts and gets a fresh
+  Cloudflare TURN allocation reaches its mesh peers as soon as the
+  first authenticated frame arrives at them; their reply goes back
+  to the new allocation immediately.
+- **Privacy preserved.** Outbound-turn-only daemons still route
+  through TURN: when `sendKeyExchangeToNode` passes `observedSrc`
+  through `writeFrame`, the outbound-turn-only branch
+  (`pkg/daemon/tunnel.go:895` / jf.11a-jf.11a.2) consumes that
+  addr via tier-3 SendViaOwnRelay. The freshly-observed addr is
+  used INSIDE the TURN routing, not as a way to bypass it.
+- **Backwards compat:** a jf.12 peer talking to a jf.11b peer
+  behaves identically to today. The jf.11b peer's reply path uses
+  `path.direct`; the jf.12 peer's reply path uses `observedSrc`.
+  Both produce valid handshake frames the other side accepts. No
+  wire-format change.
+
+### Tests
+
+- `pkg/daemon/handshake_endpoint_learning_test.go` (new):
+  - `TestHandshakeReply_UsesObservedSourceNotCachedDirect` — the
+    regression guard for the live deadlock. Stale cache, fresh
+    observed source; assert the UDP write went to the fresh
+    listener and NOT to the stale one.
+  - `TestHandshakeReply_FallsBackToCacheWhenNoObservedSource` —
+    caller-initiated KEX (nil observedSrc) still uses
+    `path.direct`, preserving jf.11b behaviour.
+  - `TestSendKeyExchangeToNode_CallerSrcOverridesPathDirect` —
+    drives `writeFrame`'s override condition directly. Without
+    the `addr == nil &&` narrowing, the caller's intent would be
+    silently overridden.
+  - `TestSendKeyExchangeToNode_RaceSafety` — concurrent
+    `updatePathDirect` + `sendKeyExchangeToNode` under -race.
+
+### Compat
+
+No wire-format changes. No IPC changes. No new dependencies. No
+Entmoot changes (Entmoot v1.5.0 driver works against jf.12 pilot
+unchanged). No registry changes (the centralized registry is out
+of our control anyway).
+
+### Out of scope (deferred)
+
+- **Task #86** — Entmoot transport-ad anti-entropy. Still the right
+  safety net for pathological cases where the first
+  authenticated-source observation fails (signature replay, etc.).
+- **Cross-peer registry-pushed signaling.** Tailscale DERP-style
+  pattern. Not applicable while the registry is operated by a
+  third party.
+
 ## [v1.9.0-jf.11b] - 2026-04-25
 
 Introduces server-initiated **pub/sub** primitives in pilot's IPC.
