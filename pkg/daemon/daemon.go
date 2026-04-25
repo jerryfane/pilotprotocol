@@ -833,6 +833,25 @@ func (d *Daemon) Start() error {
 	d.addr = parsedAddr
 	d.tunnels.SetNodeID(d.nodeID)
 
+	// v1.9.0-jf.14: now that nodeID is assigned, trigger an
+	// initial rendezvous publish if a TURN allocation is already
+	// up. The TURN transport's onLocalAddrChange fires once
+	// during Allocate (well before this point in Start), so the
+	// first publish event was dropped by rendezvousPublishLoop's
+	// "nodeID == 0" guard. Replay it here so steady-state
+	// publishing isn't blocked until the next pion-driven
+	// rotation (~30 min).
+	if d.rendezvousPublishCh != nil {
+		if turnAddr := d.tunnels.TURNLocalAddr(); turnAddr != nil {
+			select {
+			case d.rendezvousPublishCh <- turnAddr.String():
+			default:
+				// channel already has a pending publish — fine,
+				// the loop will drain to the latest value.
+			}
+		}
+	}
+
 	// Set identity on tunnel manager for authenticated key exchange
 	if d.identity != nil {
 		d.tunnels.SetIdentity(d.identity)

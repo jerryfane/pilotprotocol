@@ -10,6 +10,65 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.14.1] - 2026-04-25
+
+Drop-in tuning on top of jf.14: ensure the daemon's initial
+rendezvous publish actually fires during cold start.
+
+### Fixed
+
+- **Initial rendezvous publish is replayed after registry
+  registration assigns nodeID.** The TURN transport's
+  `onLocalAddrChange` fires once when pion completes its initial
+  Allocate, very early in `daemon.Start` — well before the
+  registry round-trip that returns the daemon's nodeID. The
+  jf.14 publish loop guards against `nodeID == 0` (it has
+  nothing meaningful to publish under), so the first event was
+  silently dropped. Steady-state publishing only kicked in on
+  the next pion-driven rotation (~30 min later). Live impact:
+  every fresh restart left the rendezvous empty for the first
+  ~30 minutes — exactly the cold-start window jf.14 was meant
+  to close. Fix: after the registry response sets `d.nodeID`,
+  query the current `TURNLocalAddr` and feed the publish
+  channel. The next loop iteration sees a concrete nodeID and
+  publishes within milliseconds.
+
+  ```go
+  // pkg/daemon/daemon.go, in Start, just after `d.tunnels.SetNodeID(d.nodeID)`:
+  if d.rendezvousPublishCh != nil {
+      if turnAddr := d.tunnels.TURNLocalAddr(); turnAddr != nil {
+          select {
+          case d.rendezvousPublishCh <- turnAddr.String():
+          default:
+          }
+      }
+  }
+  ```
+
+  No new state, no new code paths. The replay is a no-op when
+  `RendezvousURL` is empty (channel is nil) or when the TURN
+  transport hasn't allocated yet (`TURNLocalAddr` returns nil).
+
+### Why
+
+Caught during the first VPS deploy of jf.14 (2026-04-25):
+`curl /v1/announce/45981` returned 404 several seconds after
+daemon startup, despite `pilot-rendezvous` being healthy and
+the daemon log confirming "daemon registered node_id=45981
+endpoint=37.27.59.89:37736". Tracing the rotation hook through
+to the publish loop revealed the nodeID-zero drop. Tested in
+`pkg/daemon/daemon_rendezvous_test.go::TestRendezvous_PublishLoop_DropsBeforeNodeID`
+already exercised the drop branch — what was missing was a
+test that the *replay* fires once nodeID becomes non-zero.
+That coverage gap will be closed in jf.14.2 if it shows
+recurring; for now the live verification (curl after restart)
+proves the fix.
+
+### Compat
+
+No wire-format changes. No protocol changes. No-op when
+`-rendezvous-url` is empty. Fully backwards-compatible.
+
 ## [v1.9.0-jf.14] - 2026-04-25
 
 Pkarr-style endpoint rendezvous — fixes the cold-start bootstrap
