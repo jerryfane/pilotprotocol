@@ -10,6 +10,153 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15] - 2026-04-26
+
+TURN allocation self-heal — RFC 7675 consent-freshness circuit
+breaker (30 s) plus Tailscale-style atomic-swap pattern at the
+pion TURN-client layer. Closes a fragility class surfaced by
+the live deploy of jf.14.2: pion's TURN client can degrade
+silently (permission refresh failures, allocation half-dead),
+and `-outbound-turn-only` is fail-closed by design, so any
+pion failure cascades to "no TURN path" until manual restart.
+
+### Fixed
+
+- **Pion TURN client gets stuck → no auto-recovery → operator
+  must restart pilot.** Live evidence 2026-04-26: laptop on
+  jf.14.2 had a fresh allocation and a known good destination
+  for VPS but threw `outbound-turn-only: no TURN path for node
+  45981` repeatedly, with `turnc ERROR: Fail to refresh
+  permissions: all retransmissions failed` from pion's
+  internal timer. A clean pilot restart didn't recover; the
+  fragility recurs whenever pion's allocation goes half-alive.
+
+  Fix: track health passively at the TURN-transport layer.
+  Every `SendViaOwnRelay` and `CreatePermission` call records
+  success or failure. When the consecutive-failure count
+  reaches `selfHealFailureThreshold` (5) AND time since last
+  success exceeds `selfHealStaleWindow` (30 s), nudge a
+  background `selfHealLoop` that fetches fresh credentials and
+  calls the existing `rotate()` (atomic swap) to rebuild the
+  pion client + allocation.
+
+  The two-axis check (count AND time) follows RFC 7675's
+  consent-freshness model: 30 s is the canonical "path is
+  dead" boundary. Counting alone would heal on noise (a fast
+  burst of 5 failures inside a 1 s blip); time alone would
+  heal on silence (one failure followed by 30 s of no
+  attempts).
+
+### Why
+
+Industry-canonical pattern, validated three ways:
+
+| Layer | Pattern | Cadence |
+|---|---|---|
+| WebRTC ICE | Consent freshness (RFC 7675) | 4-6 s probe / 30 s timeout |
+| WebRTC ICE | ICE Restart on failure | 30 s after consent loss; ~67 % recovery rate |
+| Tailscale DERP | Atomic-swap region failover | Background rebuild, atomic switch |
+
+The 30 s circuit breaker is the same number RFC 7675 uses for
+consent loss. The atomic-swap pattern (build new client,
+re-issue permissions on it, atomically replace the old one
+under lock, then close old) was already implemented in
+`rotate()` for credential rotation; jf.15 just gives it a
+second trigger (transport failure, in addition to credential
+rotation). No protocol changes, no new dependencies.
+
+### Composes with the existing stack
+
+- **jf.13 keepalive** — fires on `AuthenticatedPeerIDs()`
+  every 25 s; each emission goes through `tm.Send` which
+  ultimately reaches `SendViaOwnRelay` for `-outbound-turn-only`
+  peers. Failed sends now feed the self-heal counter.
+- **jf.14.2 rendezvous refresh + eviction** — heal triggers
+  `rotate()`, which fires the existing `onLocalAddrChange`
+  callback, which already publishes the new allocation
+  address to the rendezvous (jf.14.2 publish path) and to the
+  IPC `turn_endpoint` topic (jf.11b). Peers learn the new
+  address through the same plumbing as a credential rotation
+  would propagate it.
+- **jf.11a.2 send-via-own-relay** — unchanged routing logic.
+  Heal just guarantees the underlying allocation stays
+  healthy.
+
+### Backoff & rate limit
+
+Heal attempts are bounded by `selfHealBackoffSchedule`:
+5 s → 10 s → 30 s → 60 s → 5 min cap. The first heal attempt
+fires immediately (operators expect rapid recovery); each
+subsequent failed attempt waits longer. This caps Cloudflare
+TURN API request rate during a regional outage where Allocate
+itself keeps failing — without the cap, a persistent outage
+could burn API budget at 1 request/sec.
+
+The attempt counter resets to 0 on a successful rebuild, so a
+recovered allocation gets a full retry budget on the next
+incident.
+
+### Tests
+
+`pkg/daemon/transport/turn_selfheal_test.go`:
+
+- `TestSelfHeal_ThresholdNotReachedDoesntNudge` — 4
+  failures (one below threshold) leaves the channel empty.
+- `TestSelfHeal_ThresholdAndStaleWindowTriggerNudge` —
+  5 failures with a 31 s-old last-success nudges exactly once.
+- `TestSelfHeal_ThresholdReachedButRecentSuccessDoesntNudge`
+  — 5 fast failures with a recent success leave the channel
+  empty (noise immunity).
+- `TestSelfHeal_RecordSuccessResetsCounter` — recordSuccess
+  zeros the failure counter so subsequent failures climb the
+  threshold ladder afresh.
+- `TestSelfHeal_NudgeChannelIsCoalesced` — 100× threshold
+  failures produce exactly one channel signal (length-1
+  buffer + non-blocking send).
+- `TestSelfHeal_NoLastSuccessTriggersOnCountAlone` — pre-
+  Listen state (lastSuccess=0) heals on count alone so a
+  never-working transport recovers eventually.
+- `TestSelfHeal_BumpHealAttemptIncrements` — backoff
+  index is monotonic across calls.
+- `TestSelfHeal_RunSerializes` — concurrent runSelfHeal
+  calls leave selfHealRunning in a clean state at the end.
+- `TestSelfHeal_ClosedTransportNoOps` / `TestSelfHeal_NilProviderNoOps`
+  — runSelfHeal exits cleanly on both edge cases without
+  panic / nil-deref.
+- `TestSelfHeal_BackoffScheduleMonotonic` — schedule is
+  strictly increasing and caps under 10 min.
+
+Total: 11 new tests, all green under `-race`.
+
+### Compat
+
+No wire-format changes. No protocol changes. No CLI flags
+added (the thresholds aren't user-tunable; SIP and WebRTC
+both use 30 s, so do we). No-op when `-turn-provider` is
+unset (the entire transport is inert in that case). Fully
+backwards-compatible — peers running jf.14.2 or earlier
+observe identical wire behaviour from a jf.15 peer; the only
+difference is jf.15 self-heals where earlier versions would
+silently fail.
+
+### Out of scope (deferred)
+
+- **Active health probes (RFC 7675-strict).** Real consent
+  freshness sends a STUN binding request every 4-6 s and
+  expects a response within 30 s. We're using passive
+  detection (count failed sends + permission refreshes) which
+  is cheaper and adequate for our threat model. Active probing
+  would require a TURN-server-side test endpoint we don't
+  have; defer until needed.
+- **Per-failure-type counter.** Different failure types
+  (timeout, refused, malformed) might warrant different
+  reactions. v1.9.0-jf.15 treats them all the same. Add later
+  if telemetry shows specific failure modes that benefit from
+  earlier intervention.
+- **Tunable thresholds via CLI flag.** SIP and WebRTC both
+  use 30 s; operators with weird requirements can fork the
+  constants in the source.
+
 ## [v1.9.0-jf.14.2] - 2026-04-25
 
 Two operational fixes for jf.14, surfaced by the first live

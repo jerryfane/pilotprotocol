@@ -35,6 +35,37 @@ const turnReadBufSize = 1500
 // headroom against clock skew and server-side timing.
 const defaultPermissionRefreshInterval = 4 * time.Minute
 
+// Self-heal thresholds for jf.15. Modeled on RFC 7675 (STUN consent
+// freshness) — that spec declares a path dead after 30 s without a
+// valid response. We apply the same boundary at the TURN-allocation
+// layer: if we've had several consecutive transport failures AND
+// >30 s have elapsed since the last successful operation against
+// pion's TURN client, the allocation is presumed dead and we
+// trigger an atomic rebuild.
+//
+// The two-axis check (count + time) prevents both noise (5 fast
+// failures during a transient network blip) and silence (one
+// failure followed by 30 s of nothing, which a count-only check
+// would never trip).
+const (
+	selfHealFailureThreshold = 5
+	selfHealStaleWindow      = 30 * time.Second
+)
+
+// selfHealBackoffSchedule is the exponential-ish retry budget used
+// by selfHealLoop after a heal attempt. Mirrors jf.13's
+// peerKeepaliveLoop / jf.14.2's rendezvousRefreshLoop bounded-
+// retry pattern; the 5-minute cap stops a persistently-broken
+// allocation (e.g. Cloudflare TURN outage in the peer's region)
+// from burning the API rate-limit budget.
+var selfHealBackoffSchedule = []time.Duration{
+	5 * time.Second,
+	10 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+	5 * time.Minute,
+}
+
 // TURNEndpoint wraps a peer's relayed "host:port" address and satisfies
 // the Endpoint interface. Endpoints for this transport identify the
 // server-assigned relay address the peer has allocated for itself — not
@@ -129,6 +160,24 @@ type TURNTransport struct {
 	// that completes Listen() / rotate(). Set via
 	// SetOnLocalAddrChange. (v1.9.0-jf.11b)
 	onLocalAddrChange func(string)
+
+	// jf.15 self-heal state. Tracks pion-client health by counting
+	// consecutive transport failures (SendViaOwnRelay errors and
+	// CreatePermission errors) and the wall time of the last
+	// success. selfHealLoop watches selfHealCh; when nudged it
+	// fetches fresh credentials and calls rotate() (atomic swap)
+	// to rebuild the allocation. Backoff is bounded by
+	// selfHealBackoffSchedule.
+	//
+	// Why two signals (count AND time): a few fast failures during
+	// a transient blip shouldn't trigger heal; a single failure
+	// followed by 30 s of silence shouldn't trigger either. Both
+	// gates must pass.
+	lastSuccessNano     atomic.Int64  // unix nanos of most recent success; >0 once any op has succeeded
+	consecutiveFailures atomic.Int64  // resets on success, increments on every transport failure
+	selfHealCh          chan struct{} // length-1 nudge from failure-detect path
+	selfHealAttempt     int           // backoff index (protected by mu)
+	selfHealRunning     bool          // serializes concurrent runSelfHeal calls (protected by mu)
 }
 
 // NewTURNTransport constructs a TURNTransport. The provider lifetime is
@@ -143,6 +192,7 @@ func NewTURNTransport(provider turncreds.Provider, sink chan<- InboundFrame) *TU
 		getTimeout:                defaultTURNGetTimeout,
 		permittedAddrs:            make(map[string]time.Time),
 		permissionRefreshInterval: defaultPermissionRefreshInterval,
+		selfHealCh:                make(chan struct{}, 1),
 	}
 }
 
@@ -236,6 +286,20 @@ func (t *TURNTransport) Listen(addr string, sink chan<- InboundFrame) error {
 	t.wg.Add(1)
 	go t.permissionRefreshLoop()
 
+	// jf.15: self-heal loop. Watches selfHealCh for nudges from
+	// recordFailure and atomically rebuilds the pion client +
+	// allocation when the consent-freshness threshold trips. Mirrors
+	// rotationLoop's shape but reacts to TRANSPORT FAILURE rather
+	// than CREDENTIAL ROTATION. Inert until a real failure burst
+	// nudges it.
+	t.wg.Add(1)
+	go t.selfHealLoop()
+
+	// Stamp lastSuccessNano so the first transport failure doesn't
+	// trigger heal on a stale "0" timestamp (which would breach the
+	// 30 s window immediately).
+	t.lastSuccessNano.Store(time.Now().UnixNano())
+
 	return nil
 }
 
@@ -312,6 +376,11 @@ func (t *TURNTransport) SendViaOwnRelay(peerAddr net.Addr, frame []byte) error {
 		return errors.New("turn transport: not listening")
 	}
 	_, err := relay.WriteTo(frame, peerAddr)
+	if err != nil {
+		t.recordFailure()
+	} else {
+		t.recordSuccess()
+	}
 	return err
 }
 
@@ -355,8 +424,10 @@ func (t *TURNTransport) CreatePermission(addr string) error {
 	}
 
 	if err := client.CreatePermission(ua); err != nil {
+		t.recordFailure()
 		return fmt.Errorf("turn create permission %s: %w", addr, err)
 	}
+	t.recordSuccess()
 
 	t.mu.Lock()
 	if t.permittedAddrs == nil {
@@ -710,6 +781,179 @@ func (t *TURNTransport) rotate(newCreds *turncreds.Credentials) {
 	// about — otherwise they keep advertising the previous (now
 	// dead) allocation in transport_ads.
 	t.fireLocalAddrChange()
+}
+
+// recordSuccess marks the most recent allocation operation
+// (SendViaOwnRelay or CreatePermission) as successful: stamps
+// the success timestamp and resets the consecutive-failures
+// counter. Atomic-only; no lock held.
+//
+// (v1.9.0-jf.15)
+func (t *TURNTransport) recordSuccess() {
+	t.lastSuccessNano.Store(time.Now().UnixNano())
+	t.consecutiveFailures.Store(0)
+}
+
+// recordFailure increments the consecutive-failure counter and,
+// if both the count threshold AND the staleness window are
+// breached, nudges the self-heal loop. The two-axis check
+// follows RFC 7675: we declare the path dead only when N
+// consecutive failures coincide with a long-enough silence
+// window (default 30 s). This prevents heal-on-noise (a fast
+// burst of 5 failures inside a 1 s blip) and heal-on-staleness
+// (one failure at startup followed by 30 s of silence).
+//
+// Atomic load+CAS-style; safe to call concurrently from any
+// transport-hot path.
+//
+// (v1.9.0-jf.15)
+func (t *TURNTransport) recordFailure() {
+	fails := t.consecutiveFailures.Add(1)
+	if fails < int64(selfHealFailureThreshold) {
+		return
+	}
+	lastNs := t.lastSuccessNano.Load()
+	// lastNs == 0 when no operation has ever succeeded since Listen.
+	// In that case the threshold count alone is the trigger — there's
+	// no useful "time since last success" to compare against.
+	if lastNs > 0 {
+		elapsed := time.Since(time.Unix(0, lastNs))
+		if elapsed < selfHealStaleWindow {
+			return
+		}
+	}
+	// Non-blocking nudge: if the channel is already full, the loop
+	// will already process when it picks up the existing signal.
+	select {
+	case t.selfHealCh <- struct{}{}:
+	default:
+	}
+}
+
+// selfHealLoop is the goroutine that responds to recordFailure
+// nudges by rebuilding the pion TURN client + allocation. Mirrors
+// the rotationLoop/permissionRefreshLoop shape: select on
+// closeCh + signal channel, exit on shutdown.
+//
+// Backoff is bounded (selfHealBackoffSchedule, 5 s -> 5 min cap)
+// so a persistently-broken allocation (e.g. a Cloudflare regional
+// outage) doesn't burn API budget. The attempt counter resets
+// only on a successful rebuild.
+//
+// (v1.9.0-jf.15)
+func (t *TURNTransport) selfHealLoop() {
+	defer t.wg.Done()
+	for {
+		select {
+		case <-t.closeCh:
+			return
+		case <-t.selfHealCh:
+			t.runSelfHeal()
+		}
+	}
+}
+
+// runSelfHeal performs one rebuild attempt: fetches fresh
+// credentials from the provider (cached values are fine —
+// rebuilding the allocation is independent of credential
+// rotation, and the provider's cache is exactly what we want)
+// and calls rotate() to do the atomic swap.
+//
+// Serializes with itself via selfHealRunning so a flood of
+// nudges during the rebuild window doesn't fan out to multiple
+// concurrent rotates. Concurrent rotation from rotationLoop is
+// still safe (rotate() is idempotent under the same mutex), but
+// avoiding waste matters — each rotate call burns one Cloudflare
+// Allocate request.
+func (t *TURNTransport) runSelfHeal() {
+	t.mu.Lock()
+	if t.selfHealRunning {
+		t.mu.Unlock()
+		return
+	}
+	t.selfHealRunning = true
+	attempt := t.selfHealAttempt
+	provider := t.provider
+	closed := t.closed
+	t.mu.Unlock()
+
+	defer func() {
+		t.mu.Lock()
+		t.selfHealRunning = false
+		t.mu.Unlock()
+	}()
+
+	if closed || provider == nil {
+		return
+	}
+
+	// Apply backoff for this attempt before fetching credentials.
+	// Skip the wait for attempt 0 (first heal after fresh failure
+	// burst) — operators expect rapid recovery on the first try.
+	if attempt > 0 {
+		backoff := selfHealBackoffSchedule[len(selfHealBackoffSchedule)-1]
+		if attempt-1 < len(selfHealBackoffSchedule) {
+			backoff = selfHealBackoffSchedule[attempt-1]
+		}
+		slog.Debug("turn: self-heal: backing off before retry",
+			"attempt", attempt, "backoff", backoff)
+		select {
+		case <-t.closeCh:
+			return
+		case <-time.After(backoff):
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), t.getTimeout)
+	creds, err := provider.Get(ctx)
+	cancel()
+	if err != nil {
+		slog.Warn("turn: self-heal: provider.Get failed",
+			"attempt", attempt, "error", err)
+		t.bumpHealAttempt()
+		// Re-arm: another nudge is harmless (selfHealCh is len-1).
+		// Without this, a Get-failure on attempt 0 leaves the loop
+		// idle until the next transport failure — which can be a
+		// long way off if writeFrame is fail-closing.
+		select {
+		case t.selfHealCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+
+	relayBefore := t.relay // for diagnostics only
+	t.rotate(creds)
+	t.mu.RLock()
+	relayAfter := t.relay
+	t.mu.RUnlock()
+
+	if relayBefore == relayAfter {
+		// rotate() failed to swap — keep backing off.
+		t.bumpHealAttempt()
+		select {
+		case t.selfHealCh <- struct{}{}:
+		default:
+		}
+		return
+	}
+
+	// Success — reset attempt + counters so the next failure burst
+	// has a fresh budget.
+	t.mu.Lock()
+	t.selfHealAttempt = 0
+	t.mu.Unlock()
+	t.consecutiveFailures.Store(0)
+	t.lastSuccessNano.Store(time.Now().UnixNano())
+
+	slog.Info("turn: self-heal completed (allocation rebuilt)",
+		"new_relay", relayAfter.LocalAddr())
+}
+
+func (t *TURNTransport) bumpHealAttempt() {
+	t.mu.Lock()
+	t.selfHealAttempt++
+	t.mu.Unlock()
 }
 
 // buildPionClient dials the raw client↔server socket per creds.Transport,
