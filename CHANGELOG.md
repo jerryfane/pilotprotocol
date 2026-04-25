@@ -10,6 +10,81 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.12.1] - 2026-04-25
+
+Drop-in tuning on top of jf.12: eliminate the cosmetic 7-second
+"direct dial timed out" stall on `-outbound-turn-only` peers.
+
+### Fixed
+
+- **`DialConnection` skips phase-1 direct retries when
+  `-outbound-turn-only` is set.** In that mode every outbound
+  send is gated through TURN by `writeFrame` (jf.11a / jf.11a.2)
+  — there is no actual direct UDP being attempted, just the
+  3-retry × 1-2-4 s exponential backoff timer running out before
+  the racing-relay goroutine's relay-tier RTO budget engages.
+  Live evidence 2026-04-25 from laptop's post-restart entmoot dial:
+
+  ```
+  17:38:22  laptop pilot-daemon restarted (new TURN allocation)
+  17:38:29  pilot-daemon: "direct dial timed out, switching to relay"
+                          node_id=45981 (= VPS)
+            (7-second cosmetic gap before phase-2 relay engaged;
+             the corresponding tunnel actually established at
+             17:38:22.683 via jf.12's WireGuard endpoint-learning,
+             so the dial-loop's "direct" retries were chasing a
+             tunnel that was already up.)
+  ```
+
+  Fix: when `d.config.OutboundTURNOnly` is true, set
+  `directRetries = 0` alongside the existing relay-active short-
+  circuit. The dial loop hits phase-2 retry timing immediately
+  (3 s initial RTO, exponential backoff capped at 8 s), which
+  matches Cloudflare TURN's 2-3× RTT profile rather than the
+  direct UDP's 1 s starting RTO.
+
+  No behaviour change for non-hide-ip peers (VPS, phobos): the
+  flag is false there, so phase-1 timing is unchanged.
+
+### Why
+
+jf.12 closed the post-rotation chicken-and-egg at the RECEIVER
+side (peer B replies to A's freshly-observed source). But the
+DIAL-INITIATOR side still emits phase-1 retries that are pure
+timer-wait under outbound-turn-only — direct UDP is forbidden
+by writeFrame's outbound-turn-only branch, so the SYN never
+actually goes out via direct UDP. The 7 s wait produced visible
+WARN-style log churn (`direct dial timed out`) and tied up
+entmoot's gossip-dial budget unnecessarily.
+
+### Compat
+
+No wire-format changes. No protocol changes. Observable only on
+peers that have `-outbound-turn-only` set (typically the same
+peers running with `-hide-ip`). Fully backwards-compatible:
+peers without `-outbound-turn-only` see identical behaviour to
+jf.12.
+
+### Tests
+
+No new unit tests — the change is a one-line conditional inside
+`DialConnection`'s retry-budget setup, fully covered by the
+existing integration suite (which exercises both hide-ip and
+non-hide-ip dial paths). Live verification: laptop's
+post-restart entmoot gossip-fanout latency drops from ~7-15 s
+(previously dominated by the cosmetic phase-1 wait) to ~300 ms
+(phase-2 first retry RTO).
+
+### Out of scope (deferred)
+
+- Phase-1 stall on **non**-outbound-turn-only peers (VPS,
+  phobos): still 7 s when their racing-dial's direct retries
+  fail before relay engages. That's a different scenario —
+  direct UDP is genuinely being attempted, and 7 s is the
+  designed exhaustion budget. Out of scope here; would need a
+  smarter heuristic that detects "direct UDP is failing
+  predictably" earlier (e.g., 1-2 retries instead of 3).
+
 ## [v1.9.0-jf.12] - 2026-04-25
 
 WireGuard-style strict endpoint learning for handshake replies.

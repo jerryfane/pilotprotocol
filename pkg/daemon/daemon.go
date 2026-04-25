@@ -2370,6 +2370,18 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	if relayActive {
 		directRetries = 0 // skip direct phase, go straight to relay
 	}
+	// v1.9.0-jf.12.1: skip phase-1 direct retries entirely when
+	// outbound-turn-only is enabled. In that mode writeFrame routes
+	// every send through the local TURN allocation (jf.11a / jf.11a.2)
+	// — there is no real "direct UDP" being attempted, just the
+	// 7-second cosmetic timer running out before phase-2 relay
+	// semantics engage. Cutting straight to relay-tier RTOs (which
+	// match Cloudflare TURN's 2-3× RTT profile) eliminates the
+	// 7-second post-restart cosmetic stall on hide-ip peers
+	// without changing any actual data-path behaviour.
+	if d.config.OutboundTURNOnly {
+		directRetries = 0
+	}
 
 	// v1.9.0-jf.11a.3: Race direct + relay concurrently. While the
 	// main retry loop drives direct UDP retransmissions (phase 1),
