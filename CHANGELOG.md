@@ -10,6 +10,104 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.14.2] - 2026-04-25
+
+Two operational fixes for jf.14, surfaced by the first live
+deployment and validated against canonical industry patterns
+(SIP REGISTER refresh + gRPC name-resolver eviction).
+
+### Fixed
+
+- **Rendezvous records no longer expire on stable allocations.**
+  In jf.14, the only thing that triggered `client.Publish()` was
+  pion's `onLocalAddrChange` callback, which fires only when the
+  TURN allocation rotates. If the allocation stayed stable for
+  more than the publish TTL (30 min), the rendezvous record
+  passed `ValidUntil` and lookups returned `verify: blob:
+  expired`. Live evidence 2026-04-25: VPS published at 21:04,
+  by 22:43 lookups failed with `now=1777149814235 >
+  valid_until=1777143291708`. Fix: add `rendezvousRefreshLoop`
+  that ticks every `DefaultRendezvousRefreshInterval = 15 min`
+  with ±2 min jitter and re-pushes the current `TURNLocalAddr`
+  through the existing publish channel. Mirrors **SIP REGISTER
+  refresh at 0.5×Expires** (RFC 3261) — one full retry window
+  before the record actually lapses. The on-rotation publish
+  path is unchanged; the loop covers the stable-allocation case.
+
+- **Stale TURN client conns are evicted when the cached endpoint
+  changes.** In jf.14, `AddPeerTURNEndpoint(nodeID, fresh)`
+  overwrote `peerTURN[nodeID]` but left any cached non-UDP
+  `peerConns[nodeID]` (the pion TURN client built against the
+  PREVIOUS address) in place. Subsequent `writeFrame` calls
+  reused that cached conn and pion kept failing
+  `CreatePermission` for the stale address — defeating the
+  rendezvous fresh-endpoint install. Live evidence 2026-04-25:
+  `rendezvous installed fresh turn endpoint addr=104.30.148.193:62971`
+  ran successfully at 20:51, but every subsequent send hit
+  `turn create permission 104.30.149.4:20414: all retransmissions
+  failed` against the stale address. Fix: when the new address
+  differs from the stored one, drop the cached non-UDP conn and
+  Close it; the next `writeFrame` re-dials via the fresh
+  endpoint. Mirrors **gRPC's name-resolver pattern** — when
+  resolution returns a new address, drop existing connections to
+  the old one and create fresh ones lazily on next dial. UDP
+  cached conns are preserved (stateless wrappers; nothing to
+  invalidate). No-op re-installs (same address called twice) do
+  not disturb the live conn.
+
+### Why both fixes ship together
+
+Two orthogonal failures, two minimal additions. They operate on
+different sides of the data flow: refresh is the *outbound*
+"keep our record alive at the rendezvous"; eviction is the
+*inbound* "consume fresh peer info and invalidate stale
+downstream transport state." Combining them into one mechanism
+would conflate the two concerns. Total surface: ~25 LOC for
+the loop, ~20 LOC for the eviction branch in
+`AddPeerTURNEndpoint`, ~80 LOC of new tests.
+
+### Tests
+
+`pkg/daemon/daemon_rendezvous_test.go`:
+
+- `TestRendezvous_RefreshLoop_DisabledByEmptyURL` — empty URL
+  → loop returns immediately.
+- `TestRendezvous_RefreshLoop_StopsOnStopCh` — closing stopCh
+  during the initial-jitter sleep exits within 500 ms.
+- `TestRendezvous_AddPeerTURNEndpoint_EvictsCachedConnOnAddrChange`
+  — non-UDP conn cached, address changed, conn evicted from
+  map AND `Close()`d.
+- `TestRendezvous_AddPeerTURNEndpoint_NoEvictOnSameAddr` —
+  no-op re-install with the same address leaves the live conn
+  alone.
+- `TestRendezvous_AddPeerTURNEndpoint_NoEvictUDPConn` — UDP
+  cached conns are preserved on addr change (stateless; no
+  pion permission state to break).
+
+### Compat
+
+No wire-format changes. No protocol changes. No CLI flags
+added. No-op when `-rendezvous-url` is empty. Fully backwards-
+compatible — a jf.14 peer talking to a jf.14.2 peer just sees
+the same publish cadence on rotation; the refresh loop adds
+one extra publish every 15 min on the jf.14.2 side, which the
+jf.14 server happily stamps and stores.
+
+### Out of scope (deferred)
+
+- **Per-peer eviction telemetry.** The Debug-level log on
+  eviction is enough for the live mesh; if eviction storms
+  ever appear, add a counter.
+- **Tunable refresh cadence.** A CLI flag to override
+  `DefaultRendezvousRefreshInterval` was considered and
+  rejected — 15 min is the SIP-validated value; operators
+  with weird requirements can fork.
+- **Graceful drain instead of immediate Close.** Considered
+  and rejected — `writeFrame` is best-effort, retries on next
+  caller invocation, and the eviction is bounded by the
+  rendezvous-lookup-on-cold-dial cadence (once per
+  DialConnection). Simpler is correct here.
+
 ## [v1.9.0-jf.14.1] - 2026-04-25
 
 Drop-in tuning on top of jf.14: ensure the daemon's initial

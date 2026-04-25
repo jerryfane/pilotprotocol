@@ -528,14 +528,46 @@ func (tm *TunnelManager) SetTURNOnLocalAddrChange(fn func(string)) {
 // AddPeerTURNEndpoint records a peer's advertised TURN relay address so
 // subsequent sends can route through the TURN transport. Call from
 // handleSetPeerEndpoints when peering advertises a "turn" endpoint.
+//
+// v1.9.0-jf.14.2: when the new address differs from a previously
+// stored one, evict any cached non-UDP peerConn for the node so the
+// next outbound write re-dials via the fresh endpoint. Without
+// this, pion's TURN client cached against the old address keeps
+// failing CreatePermission for the stale peer addr — defeating the
+// rendezvous fresh-endpoint install. Mirrors gRPC's name-resolver
+// pattern: when address resolution returns a new value, drop
+// existing connections to the old one and create fresh ones on
+// next dial. Brief dropout is acceptable; writeFrame is best-effort
+// and retries on the next caller invocation.
 func (tm *TunnelManager) AddPeerTURNEndpoint(nodeID uint32, addr string) error {
 	ep, err := transport.NewTURNEndpoint(addr)
 	if err != nil {
 		return fmt.Errorf("turn endpoint %q: %w", addr, err)
 	}
+	newAddr := ep.String()
 	tm.mu.Lock()
+	prevEp := tm.peerTURN[nodeID]
 	tm.peerTURN[nodeID] = ep
+	// Only evict when the address actually changed AND a cached
+	// non-UDP conn exists. Same-address re-installs (the common
+	// no-op case) leave the live conn alone.
+	addrChanged := prevEp != nil && prevEp.String() != newAddr
+	var evicted transport.DialedConn
+	if addrChanged {
+		if cached, ok := tm.peerConns[nodeID]; ok && cached != nil {
+			if cached.RemoteEndpoint() != nil &&
+				cached.RemoteEndpoint().Network() != "udp" {
+				evicted = cached
+				delete(tm.peerConns, nodeID)
+			}
+		}
+	}
 	tm.mu.Unlock()
+	if evicted != nil {
+		_ = evicted.Close()
+		slog.Debug("evicted stale peer conn after turn endpoint change",
+			"node_id", nodeID, "old_addr", prevEp.String(), "new_addr", newAddr)
+	}
 	return nil
 }
 

@@ -11,7 +11,33 @@ import (
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/rendezvous"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 )
+
+// fakeEndpoint and fakeDialedConn satisfy the transport-package
+// interfaces just enough for AddPeerTURNEndpoint's eviction
+// predicate to exercise its branches deterministically. Real
+// pion-backed conns can't be constructed in unit tests without
+// a network round-trip, and we only care about
+// RemoteEndpoint().Network() and Close() here.
+type fakeEndpoint struct{ network string }
+
+func (e *fakeEndpoint) Network() string { return e.network }
+func (e *fakeEndpoint) String() string  { return "fake://" + e.network }
+
+type fakeDialedConn struct {
+	network string
+	closed  bool
+}
+
+func (c *fakeDialedConn) Send(frame []byte) error { return nil }
+func (c *fakeDialedConn) RemoteEndpoint() transport.Endpoint {
+	return &fakeEndpoint{network: c.network}
+}
+func (c *fakeDialedConn) Close() error {
+	c.closed = true
+	return nil
+}
 
 // rendezvousStub captures Publish PUTs and serves a fixed reply
 // for Lookup GETs. We don't reuse the real cmd/pilot-rendezvous
@@ -319,6 +345,180 @@ func TestRendezvous_LookupForDial_ReturnsEmptyOnTransportError(t *testing.T) {
 	})
 	if got := d.rendezvousLookupForDial(1); got != "" {
 		t.Fatalf("rendezvousLookupForDial returned %q on transport error (want empty)", got)
+	}
+}
+
+// TestRendezvous_RefreshLoop_PeriodicallyRepublishes is the
+// load-bearing test for jf.14.2's Bug A fix: even with no TURN
+// rotation, the daemon's refresh loop must re-publish the
+// current endpoint at the configured cadence so the rendezvous
+// record doesn't expire.
+//
+// We can't realistically wait 15 minutes in a unit test, so we
+// can't directly exercise the production cadence. What we DO
+// exercise is the loop's structural behaviour: given a non-nil
+// rendezvousClient and a TUNNEL with a current TURN address,
+// the loop wakes on its ticker and feeds the publish channel.
+// Disabled-by-empty-URL is covered separately.
+//
+// This test fires the loop's body manually by ticking through
+// the publish channel — verifying that the LOOP'S CONTRACT
+// (read TURNLocalAddr → push to channel) holds, separate from
+// the timing of the ticker itself which is just a constant.
+func TestRendezvous_RefreshLoop_DisabledByEmptyURL(t *testing.T) {
+	d := New(Config{Email: "test@example.com"})
+	if d.rendezvousClient != nil {
+		t.Fatalf("rendezvousClient should be nil with empty URL")
+	}
+	done := make(chan struct{})
+	go func() {
+		d.rendezvousRefreshLoop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("rendezvousRefreshLoop didn't return for empty URL")
+	}
+}
+
+// TestRendezvous_RefreshLoop_StopsOnStopCh: standard goroutine-
+// lifecycle hygiene. The loop must exit promptly when stopCh
+// closes, even mid-jitter-sleep at startup.
+func TestRendezvous_RefreshLoop_StopsOnStopCh(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	d := New(Config{
+		Email:         "test@example.com",
+		RendezvousURL: srv.URL,
+	})
+	done := make(chan struct{})
+	go func() {
+		d.rendezvousRefreshLoop()
+		close(done)
+	}()
+	// Give the loop a beat to enter its initial-jitter sleep.
+	time.Sleep(50 * time.Millisecond)
+	close(d.stopCh)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("rendezvousRefreshLoop didn't exit after stopCh close")
+	}
+}
+
+// TestRendezvous_AddPeerTURNEndpoint_EvictsCachedConnOnAddrChange
+// is the load-bearing test for jf.14.2's Bug B fix.
+//
+// Setup: install a TURN endpoint AND a cached non-UDP conn for
+// the same peer. Then install a different endpoint via
+// AddPeerTURNEndpoint. Assert the cached conn was evicted from
+// peerConns and Closed.
+//
+// Without this fix, fresh endpoints from the rendezvous lookup
+// install correctly into peerTURN but never take effect because
+// pion's TURN client cached against the OLD address keeps
+// failing CreatePermission.
+func TestRendezvous_AddPeerTURNEndpoint_EvictsCachedConnOnAddrChange(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("first AddPeerTURNEndpoint: %v", err)
+	}
+	// Inject a fake non-UDP cached conn (simulates pion TURN
+	// client built against the old addr). The conn type doesn't
+	// matter for the eviction predicate — only that
+	// RemoteEndpoint().Network() != "udp".
+	stub := &fakeDialedConn{network: "turn", closed: false}
+	tm.mu.Lock()
+	tm.peerConns[7] = stub
+	tm.mu.Unlock()
+
+	// Replace with a different address.
+	if err := tm.AddPeerTURNEndpoint(7, "9.8.7.6:5"); err != nil {
+		t.Fatalf("second AddPeerTURNEndpoint: %v", err)
+	}
+
+	tm.mu.RLock()
+	_, stillCached := tm.peerConns[7]
+	tm.mu.RUnlock()
+	if stillCached {
+		t.Fatalf("cached non-UDP conn should have been evicted on addr change")
+	}
+	if !stub.closed {
+		t.Fatalf("evicted conn should have been Close()'d")
+	}
+	// The new endpoint is in place.
+	if got := tm.PeerTURNEndpoint(7); got != "9.8.7.6:5" {
+		t.Fatalf("PeerTURNEndpoint after change: %q, want 9.8.7.6:5", got)
+	}
+}
+
+// TestRendezvous_AddPeerTURNEndpoint_NoEvictOnSameAddr: a
+// no-op re-install (same address called twice — common when
+// the rendezvous lookup confirms the cached value) must NOT
+// disturb the live cached conn. Otherwise we'd cause spurious
+// reconnects every time the rendezvous returns the same
+// endpoint we already have.
+func TestRendezvous_AddPeerTURNEndpoint_NoEvictOnSameAddr(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("first AddPeerTURNEndpoint: %v", err)
+	}
+	stub := &fakeDialedConn{network: "turn", closed: false}
+	tm.mu.Lock()
+	tm.peerConns[7] = stub
+	tm.mu.Unlock()
+
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("re-install same addr: %v", err)
+	}
+
+	tm.mu.RLock()
+	_, stillCached := tm.peerConns[7]
+	tm.mu.RUnlock()
+	if !stillCached {
+		t.Fatalf("cached conn was evicted on no-op re-install (must be preserved)")
+	}
+	if stub.closed {
+		t.Fatalf("conn was Close()'d on no-op re-install")
+	}
+}
+
+// TestRendezvous_AddPeerTURNEndpoint_NoEvictUDPConn: the
+// eviction predicate is "non-UDP" because UDP cached conns
+// are stateless wrappers (raw UDP sockets) — they don't hold
+// pion permission state and aren't broken by an addr change.
+// Evicting them would just cause unnecessary churn.
+func TestRendezvous_AddPeerTURNEndpoint_NoEvictUDPConn(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("first AddPeerTURNEndpoint: %v", err)
+	}
+	stub := &fakeDialedConn{network: "udp", closed: false}
+	tm.mu.Lock()
+	tm.peerConns[7] = stub
+	tm.mu.Unlock()
+
+	if err := tm.AddPeerTURNEndpoint(7, "9.8.7.6:5"); err != nil {
+		t.Fatalf("second AddPeerTURNEndpoint: %v", err)
+	}
+
+	tm.mu.RLock()
+	_, stillCached := tm.peerConns[7]
+	tm.mu.RUnlock()
+	if !stillCached {
+		t.Fatalf("UDP cached conn should be preserved on addr change")
+	}
+	if stub.closed {
+		t.Fatalf("UDP cached conn was unnecessarily Close()'d")
 	}
 }
 

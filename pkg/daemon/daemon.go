@@ -255,6 +255,22 @@ const DefaultBeaconKeepaliveInterval = 25 * time.Second
 // 25s as the default. (v1.9.0-jf.13)
 const DefaultPeerKeepaliveInterval = 25 * time.Second
 
+// DefaultRendezvousRefreshInterval is how often the daemon
+// re-publishes its current TURN endpoint to the rendezvous
+// service, independent of TURN rotation events. Set to half
+// of rendezvous.DefaultPublishTTL (30 min) so a missed publish
+// has one full retry window before the record's ValidUntil
+// passes — the SIP-REGISTER pattern (RFC 3261: clients refresh
+// at half the server-accepted Expires interval).
+//
+// Without this, the only thing that would trigger a publish is
+// pion's onLocalAddrChange callback, which fires only when the
+// TURN allocation actually rotates. If the allocation stays
+// stable for >30 min, the rendezvous record falls past its
+// ValidUntil and lookups return "expired" — defeating the
+// cold-start bootstrap purpose. (v1.9.0-jf.14.2)
+const DefaultRendezvousRefreshInterval = 15 * time.Minute
+
 // EndpointCacheTTL is how long a cached endpoint is considered fresh.
 // After this, the entry is stale but still usable as a fallback.
 const EndpointCacheTTL = 5 * time.Minute
@@ -974,6 +990,15 @@ func (d *Daemon) Start() error {
 	// which produces the startup publish; subsequent rotations
 	// publish the same way. Best-effort, errors logged at Debug.
 	go d.rendezvousPublishLoop()
+
+	// 10c. Start endpoint-rendezvous refresh loop (v1.9.0-jf.14.2).
+	// SIP-style 0.5×TTL keep-alive — re-publishes the current
+	// TURN address every DefaultRendezvousRefreshInterval (15 min)
+	// even when the allocation hasn't rotated. Without this, a
+	// stable allocation lets the rendezvous record fall past its
+	// ValidUntil within one TTL window. No-op if RendezvousURL
+	// is empty.
+	go d.rendezvousRefreshLoop()
 
 	// 11. Start network sync (refreshes memberships/policies every 5 min)
 	go d.networkSyncLoop()
@@ -3908,6 +3933,78 @@ func (d *Daemon) rendezvousPublishLoop() {
 					"url", d.config.RendezvousURL,
 					"node_id", nodeID,
 					"turn_endpoint", addr)
+			}
+		}
+	}
+}
+
+// rendezvousRefreshLoop periodically re-publishes our current
+// TURN endpoint to the rendezvous service, independent of
+// rotation events. Cadence is DefaultRendezvousRefreshInterval
+// (15 min by default = half the publish TTL). Without this, a
+// peer whose TURN allocation stays stable for the full TTL
+// window would let its rendezvous record expire and become
+// useless for cold-dial recovery.
+//
+// SIP REGISTER refresh pattern (RFC 3261 §10.2.4): clients
+// refresh at half the server-accepted Expires interval, leaving
+// one full retry window before the record actually lapses. Same
+// rationale here.
+//
+// No-op if RendezvousURL is empty (rendezvousClient is nil).
+// Best-effort: errors are logged at Debug and the loop keeps
+// ticking.
+//
+// Composes orthogonally with the on-rotation publish path: that
+// callback covers TURN address changes; this loop covers the
+// stable-allocation case.
+func (d *Daemon) rendezvousRefreshLoop() {
+	if d.rendezvousClient == nil {
+		return
+	}
+	// Jitter the first tick so a fleet restarting in lockstep
+	// doesn't synchronize publishes. ±2 min around the nominal
+	// 15 min.
+	jitter := time.Duration(rand.Int63n(int64(2 * time.Minute)))
+	select {
+	case <-d.stopCh:
+		return
+	case <-time.After(jitter):
+	}
+	ticker := time.NewTicker(DefaultRendezvousRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			turnAddr := d.tunnels.TURNLocalAddr()
+			if turnAddr == nil {
+				// No TURN allocation yet (or never will be —
+				// daemon started without -turn-provider). Nothing
+				// to publish; try again next tick.
+				continue
+			}
+			d.addrMu.RLock()
+			nodeID := d.nodeID
+			d.addrMu.RUnlock()
+			if nodeID == 0 || d.identity == nil {
+				continue
+			}
+			// Feed the publish channel rather than calling
+			// Publish directly. The loop in
+			// rendezvousPublishLoop already handles the same
+			// publish call with proper error logging and
+			// stopCh handling. Reusing the same path keeps
+			// behaviour identical between rotation-driven and
+			// timer-driven publishes.
+			if d.rendezvousPublishCh != nil {
+				select {
+				case d.rendezvousPublishCh <- turnAddr.String():
+				default:
+					// channel full — that's fine, the publish
+					// loop will drain to the latest value.
+				}
 			}
 		}
 	}
