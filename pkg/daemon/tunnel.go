@@ -897,6 +897,26 @@ func (tm *TunnelManager) RelayPeerIDs() []uint32 {
 	return ids
 }
 
+// AuthenticatedPeerIDs returns the node IDs of all peers whose
+// encrypted-tunnel state is ready (i.e. shared crypto keys are
+// installed and at least one authenticated frame has flowed).
+// Used by the daemon's peer-keepalive loop (v1.9.0-jf.13) to emit
+// periodic permission-refresh frames to every reachable peer.
+//
+// Snapshots under RLock; the returned slice is safe to iterate
+// without holding the lock.
+func (tm *TunnelManager) AuthenticatedPeerIDs() []uint32 {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	out := make([]uint32, 0, len(tm.crypto))
+	for nodeID, pc := range tm.crypto {
+		if pc != nil && pc.ready {
+			out = append(out, nodeID)
+		}
+	}
+	return out
+}
+
 // RegisterWithBeacon sends a MsgDiscover to the beacon from the tunnel socket
 // using the real nodeID, so the beacon knows our endpoint for punch coordination.
 func (tm *TunnelManager) RegisterWithBeacon() {

@@ -128,6 +128,19 @@ type Config struct {
 	// a short value for fast convergence assertions without waiting
 	// for the production cadence. Zero = use default.
 	GossipInterval time.Duration
+
+	// PeerKeepaliveInterval controls the per-peer tunnel keepalive
+	// emission rate (v1.9.0-jf.13).
+	//
+	//   == 0 (zero/unset)      → DefaultPeerKeepaliveInterval (25s)
+	//   >  0                   → use that value
+	//   <  0 (e.g. -1*time.Second) → disabled
+	//
+	// The keepalive emits one small authenticated control packet
+	// per authenticated peer per interval. Refreshes TURN
+	// permissions and NAT mappings in both directions. See
+	// DefaultPeerKeepaliveInterval doc for the why.
+	PeerKeepaliveInterval time.Duration
 }
 
 // Default tuning constants (used when Config fields are zero).
@@ -206,6 +219,30 @@ const RelayProbeInterval = 60 * time.Second
 // through the beacon hits a dead mapping. A 25s cadence stays well under the
 // typical NAT timeout.
 const DefaultBeaconKeepaliveInterval = 25 * time.Second
+
+// DefaultPeerKeepaliveInterval is how often the daemon emits a tiny
+// authenticated control packet to every peer with established crypto
+// state. Mirrors WireGuard's PersistentKeepalive at 25s — the
+// empirical sweet spot for keeping consumer-grade NAT mappings AND
+// TURN allocation permissions (RFC 8656 §9; permissions have a
+// 5-minute lifetime) fresh in both directions.
+//
+// Why this matters: when a peer owns a TURN allocation (e.g. a
+// hide-ip peer running with -outbound-turn-only), CreatePermission
+// is auto-issued by pion only when that peer SENDS to a particular
+// destination. If the TURN-owning peer is silent toward another
+// peer for >5 minutes, the permission expires; subsequent
+// peer-initiated dials toward the TURN allocation get silently
+// dropped at Cloudflare's edge ("permission" mismatch). The
+// keepalive forces a periodic outbound to every peer, refreshing
+// the permission on every cycle. Symmetrically, peers without
+// TURN benefit from refreshed NAT bindings on their outbound
+// path.
+//
+// Validated in production by every WireGuard-based VPN: NetBird,
+// Tailscale's WireGuard mode, and dozens of commercial VPNs ship
+// 25s as the default. (v1.9.0-jf.13)
+const DefaultPeerKeepaliveInterval = 25 * time.Second
 
 // EndpointCacheTTL is how long a cached endpoint is considered fresh.
 // After this, the entry is stale but still usable as a fallback.
@@ -360,6 +397,12 @@ func (c *Config) timeWaitDuration() time.Duration {
 }
 
 func New(cfg Config) *Daemon {
+	// v1.9.0-jf.13: resolve PeerKeepaliveInterval default. Zero
+	// means "use default"; negative explicitly disables. Concrete
+	// value flows through to peerKeepaliveLoop.
+	if cfg.PeerKeepaliveInterval == 0 {
+		cfg.PeerKeepaliveInterval = DefaultPeerKeepaliveInterval
+	}
 	d := &Daemon{
 		config:        cfg,
 		tunnels:       NewTunnelManager(),
@@ -846,6 +889,15 @@ func (d *Daemon) Start() error {
 
 	// 10. Start relay→direct fallback probe (checks every 5 min)
 	go d.relayProbeLoop()
+
+	// 10a. Start per-peer tunnel keepalive (v1.9.0-jf.13). Sends a
+	// tiny authenticated control packet to every peer with ready
+	// crypto state every PeerKeepaliveInterval (default 25s).
+	// Refreshes TURN allocation permissions (RFC 8656 §9, 5-min
+	// lifetime) and NAT mappings symmetrically. WireGuard's
+	// PersistentKeepalive at 25s. Loop self-checks for the
+	// disabled (negative interval) case.
+	go d.peerKeepaliveLoop()
 
 	// 11. Start network sync (refreshes memberships/policies every 5 min)
 	go d.networkSyncLoop()
@@ -3627,6 +3679,84 @@ func (d *Daemon) relayProbeLoop() {
 				})
 			}
 		}
+	}
+}
+
+// peerKeepaliveLoop emits a tiny authenticated control packet to
+// every peer with ready encrypted-tunnel state, on a fixed
+// interval (default 25s, configurable via Config.PeerKeepaliveInterval).
+//
+// Purpose: solve the TURN-permission-asymmetry cold-start dialer
+// problem (v1.9.0-jf.13). When this peer owns a Cloudflare TURN
+// allocation, periodic outbound traffic refreshes pion's
+// CreatePermission for every known peer's source IP (RFC 8656 §9,
+// 5-minute permission lifetime). Subsequent peer-initiated dials
+// toward our TURN allocation always find a fresh permission.
+// Symmetrically, peers without TURN benefit from refreshed NAT
+// mappings on their outbound path. Mirrors WireGuard's
+// PersistentKeepalive, which validated this design at scale.
+//
+// The emission goes via tm.Send → writeFrame, so all routing gates
+// apply (outbound-turn-only routes via own TURN; relay-flagged
+// peers route via beacon; direct otherwise). A failed send logs at
+// Debug; the next interval retries.
+//
+// Loop is launched unconditionally from Start; if
+// Config.PeerKeepaliveInterval was set negative (operator opt-out),
+// the loop returns immediately. Zero is resolved to
+// DefaultPeerKeepaliveInterval in daemon.New, so the loop never
+// sees a 0 here.
+func (d *Daemon) peerKeepaliveLoop() {
+	interval := d.config.PeerKeepaliveInterval
+	if interval <= 0 {
+		// Negative (or somehow-still-zero) interval: disabled.
+		return
+	}
+
+	// Small jitter so a fleet restarting in lockstep doesn't emit
+	// synchronized bursts toward the same peers. Respects stopCh
+	// during the jitter window so a fast-shutdown test or signal-
+	// handler doesn't have to wait the full jitter out.
+	jitter := time.Duration(rand.Int63n(int64(2 * time.Second)))
+	select {
+	case <-d.stopCh:
+		return
+	case <-time.After(jitter):
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			for _, nodeID := range d.tunnels.AuthenticatedPeerIDs() {
+				d.sendPeerKeepalive(nodeID)
+			}
+		}
+	}
+}
+
+// sendPeerKeepalive emits one tiny authenticated control packet to
+// nodeID. Same packet shape as relayProbeLoop's probe (FlagACK on
+// PortPing), so the receiver's existing control-protocol path
+// handles it without app-layer side effects. Best-effort; errors
+// are logged at Debug. (v1.9.0-jf.13)
+func (d *Daemon) sendPeerKeepalive(nodeID uint32) {
+	pkt := &protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagACK,
+		Protocol: protocol.ProtoControl,
+		Src:      d.Addr(),
+		Dst:      protocol.Addr{Network: 0, Node: nodeID},
+		SrcPort:  protocol.PortPing,
+		DstPort:  protocol.PortPing,
+		Seq:      1,
+	}
+	if err := d.tunnels.Send(nodeID, pkt); err != nil {
+		slog.Debug("peer keepalive send failed",
+			"peer_node_id", nodeID, "error", err)
 	}
 }
 

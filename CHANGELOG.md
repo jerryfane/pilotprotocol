@@ -10,6 +10,131 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.13] - 2026-04-25
+
+Per-peer tunnel-layer keepalive — WireGuard's `PersistentKeepalive`
+pattern, applied to every authenticated peer at the Pilot tunnel
+layer. Closes the dialer-side TURN-permission-asymmetry deadlock
+that survived jf.12 / jf.12.1.
+
+### Fixed
+
+- **TURN permissions and consumer-NAT mappings are now refreshed
+  symmetrically by a periodic outbound to every authenticated
+  peer.** Per RFC 8656 §9, a TURN allocation forwards an inbound
+  packet to its owner only when the source IP is on the
+  allocation's permission list. Permissions are IP-only, 5-min
+  lifetime, and installed by the allocation owner via
+  `CreatePermission`. pion auto-issues `CreatePermission` on each
+  outbound `Send` toward a peer; no outbound for >5 min means the
+  peer's source IP is no longer admissible. Live evidence
+  2026-04-25 from the 3-machine mesh:
+
+  ```
+  vps:    gossip: reconcile: dial for root  peer=45491
+                  err="peer 45491 in dial-backoff"
+  vps:    gossip: reconcile: dial for root  peer=45491
+                  err="pilot: dial 0:0000.0000.B1B3:1004:
+                        ipcclient: daemon: dial timeout"
+  ... (every reconcile attempt failed identically for >30 min;
+   5 gossip messages sat undelivered to laptop for >24 h.)
+  ```
+
+  Fix: a new `peerKeepaliveLoop` goroutine emits one tiny
+  authenticated control-protocol packet
+  (`FlagACK | ProtoControl | PortPing`) to every peer with ready
+  encrypted-tunnel state every 25 s (configurable via
+  `-peer-keepalive`, mirroring WireGuard's
+  `PersistentKeepalive=25` default). The emission goes through
+  `tm.Send` so it respects every existing routing gate
+  (`-outbound-turn-only`, relay-flagged peers, etc.). Each
+  outbound forces pion to refresh `CreatePermission` for the
+  destination on the allocation's permission list, keeping the
+  inverse-direction dial path admissible.
+
+### Why
+
+Three of the four canonical patterns for cold-start dialer /
+NAT-mapping refresh (Tailscale `CallMeMaybe`, WebRTC ICE
+simultaneous checks, libp2p DCUtR) require a separate
+always-available signaling channel, additional state machines, or
+a relay coordinator. WireGuard's `PersistentKeepalive` (2017+)
+solves all three problems — TURN-permission refresh, NAT-table
+refresh, tunnel liveness — with one extra timer per peer and ~10
+bytes/sec/peer-pair in steady state. It's the empirical
+sweet-spot validated by every WireGuard-based VPN at scale, and
+fits this fork's "minimum mechanism that's correct" disposition.
+
+The interval (25 s) is the same value WireGuard ships and well
+under the 5-min TURN permission lifetime, so even a single
+dropped keepalive doesn't lose the permission window.
+
+### Config
+
+```
+-peer-keepalive duration
+    interval for per-peer tunnel keepalives (default 25s; set
+    to a negative duration like -1s to disable). Sends one
+    tiny encrypted control packet per peer to keep TURN
+    permissions and NAT mappings fresh. (v1.9.0-jf.13)
+```
+
+`Config.PeerKeepaliveInterval` semantics:
+
+- `0` (zero-value, unset) → resolved to
+  `DefaultPeerKeepaliveInterval` (25 s) in `daemon.New`.
+- `> 0` → that interval.
+- `< 0` → disabled. The loop returns immediately without
+  emitting.
+
+### Compat
+
+No wire-format changes. No protocol changes. No new
+dependencies. No registry / beacon changes. No entmoot changes.
+
+Backwards-compatible: jf.13 peers emit periodic
+`FlagACK | ProtoControl | PortPing` frames at the rate of one
+per peer per 25 s, which pre-jf.13 peers already accept (it's
+the same shape as `relayProbeLoop`'s probe). If the keepalive
+itself is broken, the effect is "we're back to today's behaviour
+— the chicken-and-egg returns" — i.e., jf.12.1 parity, not a
+regression.
+
+### Tests
+
+`pkg/daemon/peer_keepalive_test.go`:
+
+- `TestAuthenticatedPeerIDs_FiltersByReady` — only
+  `ready=true` peers appear; pending and nil-crypto peers are
+  excluded. Critical: `tm.Send` to a non-ready peer would queue
+  a frame pending key exchange, which is exactly the wrong
+  behaviour for a periodic probe.
+- `TestAuthenticatedPeerIDs_PeerNotInCryptoMap` — peers with a
+  path entry but no crypto entry must not appear.
+- `TestAuthenticatedPeerIDs_ConcurrentSafe` — RLock-snapshot
+  pattern under `-race` with a concurrent writer.
+- `TestPeerKeepaliveLoop_DisabledByNegativeInterval` — negative
+  interval is preserved by `daemon.New` and short-circuits the
+  loop.
+- `TestPeerKeepaliveLoop_DefaultResolved` — zero interval is
+  resolved to `DefaultPeerKeepaliveInterval` in `daemon.New`.
+- `TestPeerKeepaliveLoop_StopsOnStopCh` — closing `d.stopCh`
+  exits the goroutine within 500 ms.
+- `TestSendPeerKeepalive_NoTunnelDoesNotPanic` — calling for a
+  peer with no path entry logs at Debug and returns; does not
+  panic.
+
+### Out of scope (deferred)
+
+- **Adaptive interval.** Skipping keepalives when there's been
+  recent outbound traffic to a peer would save the redundant
+  emission; defer until profiling shows it matters.
+- **Per-peer override.** Some peers (always-on, no NAT) don't
+  benefit from 25 s. Defer.
+- **Unifying keepalive + relay-probe goroutines.** The 60 s
+  `relayProbeLoop` and the 25 s `peerKeepaliveLoop` could share
+  one prober. Refactor later.
+
 ## [v1.9.0-jf.12.1] - 2026-04-25
 
 Drop-in tuning on top of jf.12: eliminate the cosmetic 7-second
