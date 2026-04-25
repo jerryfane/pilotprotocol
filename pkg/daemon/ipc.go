@@ -60,6 +60,23 @@ const (
 	// from the central registry. (v1.9.0-jf.7)
 	CmdSetPeerEndpoints   byte = 0x25
 	CmdSetPeerEndpointsOK byte = 0x26
+
+	// v1.9.0-jf.11b: pub/sub state-change push primitives.
+	// CmdNotify is server-initiated and bypasses the request-reply
+	// queue (same model as CmdRecvFrom datagrams). Subscribe replies
+	// carry the current snapshot so subscribers don't have to wait
+	// for the next change to learn the initial value.
+	//   Subscribe:     [topic_len:uint16][topic:bytes]
+	//   SubscribeOK:   [topic_len:uint16][topic][payload_len:uint32][payload]
+	//   Unsubscribe:   [topic_len:uint16][topic:bytes]
+	//   UnsubscribeOK: empty
+	//   Notify:        [topic_len:uint16][topic][payload_len:uint32][payload]
+	// Topic strings are UTF-8. Initial topic: "turn_endpoint".
+	CmdSubscribe     byte = 0x30
+	CmdSubscribeOK   byte = 0x31
+	CmdUnsubscribe   byte = 0x32
+	CmdUnsubscribeOK byte = 0x33
+	CmdNotify        byte = 0x34
 )
 
 // Network sub-commands (second byte of CmdNetwork payload)
@@ -118,13 +135,26 @@ type IPCServer struct {
 	daemon     *Daemon
 	mu         sync.Mutex
 	clients    map[*ipcConn]bool
+
+	// v1.9.0-jf.11b: pub/sub registry. subsMu is intentionally
+	// distinct from mu so PublishTopic doesn't contend with
+	// client-set updates on the hot accept/disconnect paths. subs
+	// maps topic → set of subscribed conns; topicSnapshot maps
+	// topic → snapshot fn whose result is delivered in
+	// CmdSubscribeOK so a fresh subscriber learns the current value
+	// without waiting for the next change.
+	subsMu        sync.RWMutex
+	subs          map[string]map[*ipcConn]struct{}
+	topicSnapshot map[string]func() []byte
 }
 
 func NewIPCServer(socketPath string, d *Daemon) *IPCServer {
 	return &IPCServer{
-		socketPath: socketPath,
-		daemon:     d,
-		clients:    make(map[*ipcConn]bool),
+		socketPath:    socketPath,
+		daemon:        d,
+		clients:       make(map[*ipcConn]bool),
+		subs:          make(map[string]map[*ipcConn]struct{}),
+		topicSnapshot: make(map[string]func() []byte),
 	}
 }
 
@@ -193,6 +223,10 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 			s.daemon.ports.Unbind(port)
 		}
 
+		// v1.9.0-jf.11b: drop conn from every topic's subscriber set
+		// so PublishTopic doesn't try to write to a closed socket.
+		s.removeSubsForConn(conn)
+
 		conn.Close()
 		s.mu.Lock()
 		delete(s.clients, conn)
@@ -251,6 +285,10 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 			s.handleManaged(conn, payload)
 		case CmdSetPeerEndpoints:
 			s.handleSetPeerEndpoints(conn, payload)
+		case CmdSubscribe:
+			s.handleSubscribe(conn, payload)
+		case CmdUnsubscribe:
+			s.handleUnsubscribe(conn, payload)
 		default:
 			s.sendError(conn, fmt.Sprintf("unknown command: 0x%02X", cmd))
 		}
@@ -995,6 +1033,163 @@ func (s *IPCServer) sendError(conn *ipcConn, msg string) {
 	copy(resp[3:], msg)
 	if err := conn.ipcWrite(resp); err != nil {
 		slog.Debug("IPC error reply failed", "msg", msg, "err", err)
+	}
+}
+
+// parseTopicFrame decodes a CmdSubscribe / CmdUnsubscribe payload of
+// the form [topic_len:uint16][topic:bytes]. Returns the topic and any
+// trailing bytes (currently unused by either opcode but reserved for
+// future per-topic options). (v1.9.0-jf.11b)
+func parseTopicFrame(payload []byte) (topic string, rest []byte, err error) {
+	if len(payload) < 2 {
+		return "", nil, fmt.Errorf("missing topic length")
+	}
+	n := binary.BigEndian.Uint16(payload[0:2])
+	if int(n) > len(payload)-2 {
+		return "", nil, fmt.Errorf("topic length %d overruns payload (%d bytes after header)",
+			n, len(payload)-2)
+	}
+	if n == 0 {
+		return "", nil, fmt.Errorf("empty topic")
+	}
+	return string(payload[2 : 2+n]), payload[2+n:], nil
+}
+
+// encodeSubscribeReply builds a CmdSubscribeOK or CmdNotify frame.
+// Both share the same payload shape:
+//
+//	[topic_len:uint16][topic][payload_len:uint32][payload]
+//
+// payload may be nil; an empty body is encoded as length 0.
+// (v1.9.0-jf.11b)
+func encodeSubscribeReply(opcode byte, topic string, payload []byte) []byte {
+	out := make([]byte, 1+2+len(topic)+4+len(payload))
+	out[0] = opcode
+	binary.BigEndian.PutUint16(out[1:3], uint16(len(topic)))
+	copy(out[3:3+len(topic)], topic)
+	binary.BigEndian.PutUint32(out[3+len(topic):7+len(topic)], uint32(len(payload)))
+	copy(out[7+len(topic):], payload)
+	return out
+}
+
+// handleSubscribe registers conn in the topic's subscriber set, then
+// replies CmdSubscribeOK with the current snapshot for that topic
+// (or empty payload if no snapshot fn is registered — topics are
+// dynamic, the producer might appear later).
+//
+// Ordering invariant: register BEFORE reply, so any PublishTopic
+// fired between snapshot capture and SubscribeOK delivery still
+// reaches this conn via Notify. Worst case the subscriber sees the
+// snapshot AND a Notify carrying the same value (idempotent on the
+// client side). (v1.9.0-jf.11b)
+func (s *IPCServer) handleSubscribe(conn *ipcConn, payload []byte) {
+	topic, _, err := parseTopicFrame(payload)
+	if err != nil {
+		s.sendError(conn, fmt.Sprintf("subscribe: %v", err))
+		return
+	}
+	s.subsMu.Lock()
+	set, ok := s.subs[topic]
+	if !ok {
+		set = make(map[*ipcConn]struct{})
+		s.subs[topic] = set
+	}
+	set[conn] = struct{}{}
+	snapFn := s.topicSnapshot[topic]
+	s.subsMu.Unlock()
+
+	var snapshot []byte
+	if snapFn != nil {
+		snapshot = snapFn()
+	}
+	if err := conn.ipcWrite(encodeSubscribeReply(CmdSubscribeOK, topic, snapshot)); err != nil {
+		slog.Debug("IPC subscribe reply failed", "topic", topic, "err", err)
+	}
+}
+
+// handleUnsubscribe removes conn from the topic's subscriber set.
+// Idempotent: unknown topic or conn-not-subscribed both reply OK.
+// (v1.9.0-jf.11b)
+func (s *IPCServer) handleUnsubscribe(conn *ipcConn, payload []byte) {
+	topic, _, err := parseTopicFrame(payload)
+	if err != nil {
+		s.sendError(conn, fmt.Sprintf("unsubscribe: %v", err))
+		return
+	}
+	s.subsMu.Lock()
+	if set := s.subs[topic]; set != nil {
+		delete(set, conn)
+		if len(set) == 0 {
+			delete(s.subs, topic)
+		}
+	}
+	s.subsMu.Unlock()
+
+	if err := conn.ipcWrite([]byte{CmdUnsubscribeOK}); err != nil {
+		slog.Debug("IPC unsubscribe reply failed", "topic", topic, "err", err)
+	}
+}
+
+// PublishTopic sends a CmdNotify frame to every subscriber of topic.
+// payload is opaque bytes; topic-specific encoding is the caller's
+// responsibility (e.g. "turn_endpoint" carries UTF-8 host:port).
+// Safe to call concurrently. Errors writing to a particular
+// subscriber are logged at Debug; the connection's handleClient
+// defer eventually removes it from the subs map via
+// removeSubsForConn, so PublishTopic does not eagerly evict (which
+// would race with concurrent Subscribe/Unsubscribe). (v1.9.0-jf.11b)
+func (s *IPCServer) PublishTopic(topic string, payload []byte) {
+	s.subsMu.RLock()
+	set := s.subs[topic]
+	if len(set) == 0 {
+		s.subsMu.RUnlock()
+		return
+	}
+	conns := make([]*ipcConn, 0, len(set))
+	for c := range set {
+		conns = append(conns, c)
+	}
+	s.subsMu.RUnlock()
+
+	msg := encodeSubscribeReply(CmdNotify, topic, payload)
+	for _, c := range conns {
+		if err := c.ipcWrite(msg); err != nil {
+			slog.Debug("IPC notify delivery failed",
+				"topic", topic, "err", err)
+		}
+	}
+}
+
+// SetTopicSnapshot registers a snapshot fn for topic. The fn is
+// invoked synchronously when a new subscriber joins, and its result
+// is delivered in CmdSubscribeOK so the subscriber learns the
+// current value without waiting for the next change-driven Notify.
+// Pass nil to clear. fn must be safe to call concurrently with
+// PublishTopic. Topic strings are case-sensitive UTF-8.
+// (v1.9.0-jf.11b)
+func (s *IPCServer) SetTopicSnapshot(topic string, fn func() []byte) {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	if fn == nil {
+		delete(s.topicSnapshot, topic)
+		return
+	}
+	s.topicSnapshot[topic] = fn
+}
+
+// removeSubsForConn drops conn from every topic's subscriber set.
+// Called by handleClient's cleanup defer when the IPC connection
+// closes; also called directly by tests. (v1.9.0-jf.11b)
+func (s *IPCServer) removeSubsForConn(conn *ipcConn) {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+	for topic, set := range s.subs {
+		if _, ok := set[conn]; ok {
+			delete(set, conn)
+			if len(set) == 0 {
+				delete(s.subs, topic)
+			}
+		}
 	}
 }
 

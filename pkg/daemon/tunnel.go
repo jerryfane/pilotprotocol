@@ -510,6 +510,21 @@ func (tm *TunnelManager) TURNLocalAddr() net.Addr {
 	return tm.turn.LocalAddr()
 }
 
+// SetTURNOnLocalAddrChange forwards a callback into the TURN transport
+// that fires whenever the server-assigned relay address changes —
+// initial Allocate succeeds or a re-allocation completes after
+// credential rotation / expiry recovery. No-op when TURN is not
+// enabled. Safe to call any time after ListenTURN succeeds; the
+// daemon currently wires this in Start() to publish a "turn_endpoint"
+// CmdNotify to subscribed IPC clients (entmootd's gossip
+// advertiser). (v1.9.0-jf.11b)
+func (tm *TunnelManager) SetTURNOnLocalAddrChange(fn func(string)) {
+	if tm.turn == nil {
+		return
+	}
+	tm.turn.SetOnLocalAddrChange(fn)
+}
+
 // AddPeerTURNEndpoint records a peer's advertised TURN relay address so
 // subsequent sends can route through the TURN transport. Call from
 // handleSetPeerEndpoints when peering advertises a "turn" endpoint.

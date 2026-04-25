@@ -577,6 +577,25 @@ func (d *Daemon) Start() error {
 		}
 	}
 
+	// v1.9.0-jf.11b: pub/sub wiring for the "turn_endpoint" topic.
+	// Snapshot fn returns the current relay addr so a fresh subscriber
+	// learns the value without waiting for the next change. The
+	// rotation hook publishes CmdNotify whenever the relay address
+	// changes (initial Allocate AND post-rotate). Both are safe to
+	// register before d.ipc.Start: SetTopicSnapshot/PublishTopic only
+	// touch IPCServer maps, not the listener. The first Subscribe
+	// arrives only after Start brings the socket up.
+	d.ipc.SetTopicSnapshot("turn_endpoint", func() []byte {
+		addr := d.tunnels.TURNLocalAddr()
+		if addr == nil {
+			return nil
+		}
+		return []byte(addr.String())
+	})
+	d.tunnels.SetTURNOnLocalAddrChange(func(newAddr string) {
+		d.ipc.PublishTopic("turn_endpoint", []byte(newAddr))
+	})
+
 	// v1.9.0-jf.11a: latch OutboundTURNOnly into the TunnelManager so
 	// writeFrame sees it on every subsequent outbound frame.
 	d.tunnels.SetOutboundTURNOnly(d.config.OutboundTURNOnly)

@@ -10,6 +10,135 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.11b] - 2026-04-25
+
+Introduces server-initiated **pub/sub** primitives in pilot's IPC.
+Replaces the polling pattern entmoot has been using since v1.4.4 to
+detect TURN-allocation rotation.
+
+### Added
+
+- **Five new IPC opcodes** for state-change push notifications:
+  - `CmdSubscribe` (`0x30`) — client→pilot, payload
+    `[topic_len:uint16][topic:bytes]`.
+  - `CmdSubscribeOK` (`0x31`) — pilot→client, payload
+    `[topic_len:uint16][topic][payload_len:uint32][payload]`. The
+    payload is a current-state snapshot (e.g. the present TURN
+    relay `host:port`) so a fresh subscriber learns the value
+    without waiting for the next change.
+  - `CmdUnsubscribe` (`0x32`) — client→pilot, same payload shape
+    as `CmdSubscribe`. Idempotent.
+  - `CmdUnsubscribeOK` (`0x33`) — pilot→client, empty payload.
+  - `CmdNotify` (`0x34`) — pilot→client (push), same payload shape
+    as `CmdSubscribeOK`. Server-initiated; bypasses the
+    request-reply queue (same model as `CmdRecvFrom` datagrams).
+
+- **`IPCServer.PublishTopic(topic string, payload []byte)`** —
+  fans out a `CmdNotify` frame to every subscriber of `topic`.
+  Safe to call concurrently. Errors writing to a particular
+  subscriber are logged at Debug; the conn's `handleClient` defer
+  cleans up via `removeSubsForConn`.
+
+- **`IPCServer.SetTopicSnapshot(topic string, fn func() []byte)`** —
+  registers a snapshot fn whose result is delivered in
+  `CmdSubscribeOK`. Topics are dynamic; absence of a snapshot fn
+  is not an error (subscriber receives empty payload).
+
+- **`TURNTransport.SetOnLocalAddrChange(fn func(string))`** —
+  callback fires whenever the server-assigned relay address
+  changes (initial `Allocate` AND post-rotate). Wired in
+  `daemon.Start` to call `IPCServer.PublishTopic("turn_endpoint", ...)`.
+
+- **`TunnelManager.SetTURNOnLocalAddrChange`** — passthrough so the
+  daemon doesn't need to reach into `*TURNTransport` directly.
+
+### Behaviour
+
+- **Initial topic:** `"turn_endpoint"`. Payload is the daemon's
+  current TURN relay `host:port` as UTF-8, or empty when no
+  `-turn-provider` is configured.
+- **Subscribe-then-reply ordering invariant.** `handleSubscribe`
+  registers the subscriber in the topic set BEFORE writing
+  `CmdSubscribeOK`. A `PublishTopic` fired between snapshot
+  capture and SubscribeOK delivery still reaches the new
+  subscriber via `CmdNotify` — at worst the subscriber sees the
+  snapshot AND a Notify carrying the same value (idempotent on
+  the client).
+- **`CmdNotify` bypasses the IPC handler bottleneck.** The
+  serial-`handleClient` loop only blocks request-reply commands
+  (Dial, Send, Info, …). `PublishTopic` is invoked from pilot's
+  TURN code path, NOT from `handleClient`, so a slow `handleDial`
+  on the same connection does NOT delay Notify delivery.
+
+### Why
+
+Entmoot v1.4.4–v1.4.6 polls `Info` every 30 s to detect TURN
+rotation. RFC 8656 says the relay address is stable across
+`Refresh`; in practice it changes maybe once a day (restart,
+credential rotation). 30 s polling = ~2,880 polls/day with ~1
+actual change = 99.97 % wasted IPC. The polling Info frames also
+queue behind slow gossip Dials in pilot's serial `handleClient`,
+producing live `WARN turn-endpoint poll: pilot Info query failed
+err=ipcclient: info: context deadline exceeded` noise on phobos
+and VPS. Push notification eliminates both the wasted traffic
+AND the head-of-line contention for state changes.
+
+The pattern matches the canonical industry shape: Kubernetes
+Watch API, Tailscale `LocalBackend.Notify`, D-Bus signals,
+JSON-RPC 2.0 notifications. Producers tell consumers when state
+changes; consumers don't poll.
+
+### Tests
+
+- `pkg/daemon/ipc_subscribe_test.go`:
+  - `TestSubscribe_RoundTripWithSnapshot` — Subscribe receives
+    SubscribeOK with the current snapshot.
+  - `TestSubscribe_NoSnapshotReturnsEmpty` — absent snapshot
+    fn yields empty payload; subscriber still registered.
+  - `TestPublishTopic_FansOutToMultipleSubscribers` — every
+    subscriber's pipe receives Notify.
+  - `TestPublishTopic_NoSubscribers_NoOp` — must not block /
+    panic. Important because `daemon.Start` wires the rotation
+    hook BEFORE the IPC listener accepts; the first publish
+    during initial Allocate has zero subscribers.
+  - `TestUnsubscribe_StopsDelivery` — post-Unsubscribe Notify
+    isn't delivered.
+  - `TestRemoveSubsForConn_CleansAllTopics` — handleClient's
+    cleanup helper drops conn from every topic and prunes
+    empty entries.
+  - `TestSubscribe_MalformedPayload` — empty / undersized /
+    zero-topic payloads return `CmdError` and don't register.
+  - `TestPublishTopic_ConcurrentSafe` — 100×
+    Publish/SetTopicSnapshot under -race.
+- `pkg/daemon/transport/turn_localaddr_change_test.go` (real
+  pion test server):
+  - `TestTURN_OnLocalAddrChange_FiresOnInitialAllocate` — the
+    callback fires once with the relay address after Listen.
+  - `TestTURN_OnLocalAddrChange_FiresOnRotation` — `Rotate`
+    triggers a re-allocation and the callback fires again with
+    the new (different) port.
+
+### Compat
+
+No wire-format changes to existing opcodes. Legacy clients that
+don't know `CmdSubscribe` / `CmdNotify` simply never use them;
+`handleClient`'s `default` branch returns
+`unknown command: 0x30` for them. Entmoot v1.4.x continues
+polling against jf.11b pilot — wasted IPC continues until they
+upgrade to v1.5.0, but no breakage.
+
+### Out of scope (deferred)
+
+- Other topics (peer trust, tunnel up/down, registry health) —
+  trivial to add later via additional `PublishTopic` callsites;
+  no further protocol work.
+- Camp-A correlation IDs in the IPC framing for the general
+  fast-vs-slow-on-shared-connection problem. P-A retires the
+  only currently-observed victim (Info poll) by routing it
+  through the push path. Future fast commands would need
+  correlation IDs; tracked as a future SPEC proposal.
+- `pilotctl subs list` diagnostic command. Nice-to-have; defer.
+
 ## [v1.9.0-jf.11a.5] - 2026-04-25
 
 ### Fixed

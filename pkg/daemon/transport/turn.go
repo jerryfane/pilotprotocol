@@ -120,6 +120,15 @@ type TURNTransport struct {
 	// Default 4 minutes; overridable via setPermissionRefreshInterval
 	// for tests.
 	permissionRefreshInterval time.Duration
+
+	// onLocalAddrChange, if non-nil, is invoked synchronously
+	// (outside the mu lock) whenever the server-assigned relay
+	// address changes — initial Allocate succeeds, or a re-allocation
+	// follows credential rotation / expiry recovery. Callbacks must
+	// be short and non-blocking; they fire on the same goroutine
+	// that completes Listen() / rotate(). Set via
+	// SetOnLocalAddrChange. (v1.9.0-jf.11b)
+	onLocalAddrChange func(string)
 }
 
 // NewTURNTransport constructs a TURNTransport. The provider lifetime is
@@ -212,6 +221,12 @@ func (t *TURNTransport) Listen(addr string, sink chan<- InboundFrame) error {
 		"relay", relay.LocalAddr(),
 	)
 
+	// v1.9.0-jf.11b: notify subscribers (entmootd's gossip advertiser
+	// via the IPC pub/sub primitive) of the new relay address so they
+	// can re-publish a fresh transport_ad without waiting for a poll
+	// tick.
+	t.fireLocalAddrChange()
+
 	t.wg.Add(1)
 	go t.readerLoop(relay)
 
@@ -234,6 +249,38 @@ func (t *TURNTransport) LocalAddr() net.Addr {
 		return nil
 	}
 	return t.relay.LocalAddr()
+}
+
+// SetOnLocalAddrChange registers a callback invoked synchronously
+// whenever the server-assigned relay address changes — initial
+// Allocate, and any subsequent re-allocation triggered by credential
+// rotation or expiry recovery. Pass nil to clear. fn must be short
+// and non-blocking; it runs on the goroutine that completed
+// Listen() or rotate(). Used by the daemon to publish a
+// "turn_endpoint" CmdNotify to subscribed IPC clients (entmootd's
+// gossip advertiser). (v1.9.0-jf.11b)
+func (t *TURNTransport) SetOnLocalAddrChange(fn func(string)) {
+	t.mu.Lock()
+	t.onLocalAddrChange = fn
+	t.mu.Unlock()
+}
+
+// fireLocalAddrChange invokes onLocalAddrChange (if registered) with
+// the current relay address. Must be called WITHOUT t.mu held — the
+// callback is opaque to us and we don't want to deadlock with code
+// in the daemon that reads tunnel state under its own locks.
+// (v1.9.0-jf.11b)
+func (t *TURNTransport) fireLocalAddrChange() {
+	t.mu.RLock()
+	fn := t.onLocalAddrChange
+	var addr string
+	if t.relay != nil {
+		addr = t.relay.LocalAddr().String()
+	}
+	t.mu.RUnlock()
+	if fn != nil {
+		fn(addr)
+	}
 }
 
 // SendViaOwnRelay writes frame through our own TURN allocation to an
@@ -656,6 +703,13 @@ func (t *TURNTransport) rotate(newCreds *turncreds.Credentials) {
 		"expires_at", newCreds.ExpiresAt,
 		"relay", newRelay.LocalAddr(),
 	)
+
+	// v1.9.0-jf.11b: notify subscribers of the new relay address.
+	// Cloudflare hands out a new port on each Allocate (the typical
+	// rotation case), so this is the moment subscribers must know
+	// about — otherwise they keep advertising the previous (now
+	// dead) allocation in transport_ads.
+	t.fireLocalAddrChange()
 }
 
 // buildPionClient dials the raw client↔server socket per creds.Transport,
