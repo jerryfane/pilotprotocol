@@ -152,6 +152,16 @@ type Config struct {
 	// entirely. See pkg/daemon/rendezvous for the trust model.
 	// (v1.9.0-jf.14)
 	RendezvousURL string
+
+	// TraceSends, when true, gates a per-event INFO log line for
+	// every writeFrame tier-decision and the SendTo "queued
+	// pending key exchange" branch. High-volume; intended for
+	// short-lived diagnostic windows, not steady-state. The
+	// per-tier counters in TunnelManager are populated regardless
+	// of this flag and exposed via pilotctl info — those are the
+	// always-on observability spine; this flag adds per-event
+	// detail. (v1.9.0-jf.15.2)
+	TraceSends bool
 }
 
 // Default tuning constants (used when Config fields are zero).
@@ -709,6 +719,12 @@ func (d *Daemon) Start() error {
 	if d.config.OutboundTURNOnly {
 		slog.Info("outbound-turn-only enabled: all outbound tunnel " +
 			"traffic routes through local TURN allocation")
+	}
+
+	// v1.9.0-jf.15.2: per-send tier traces (high-volume; gated).
+	d.tunnels.SetTraceSends(d.config.TraceSends)
+	if d.config.TraceSends {
+		slog.Info("trace-sends enabled: per-event INFO log per writeFrame tier decision")
 	}
 
 	// Collect LAN addresses using the actual tunnel port (not config port which may be 0)
@@ -1833,6 +1849,18 @@ type DaemonInfo struct {
 	// clients decode cleanly (fields default to false).
 	OutboundTURNOnly   bool `json:"outbound_turn_only,omitempty"`
 	NoRegistryEndpoint bool `json:"no_registry_endpoint,omitempty"`
+
+	// PktsSentByTier and BytesSentByTier expose the jf.15.2
+	// per-tier send counters as a JSON map keyed by stable tier
+	// name (e.g. "direct_udp", "cached_conn",
+	// "queued_pending_key"). Operators read these to see at a
+	// glance which tier a peer's traffic is actually going
+	// through, without needing to flip the high-volume
+	// -trace-sends flag. Counters increment only on successful
+	// sends. omitempty so jf.15.1 and earlier clients decode
+	// cleanly (the maps default to nil → omitted).
+	PktsSentByTier  map[string]uint64 `json:"pkts_sent_by_tier,omitempty"`
+	BytesSentByTier map[string]uint64 `json:"bytes_sent_by_tier,omitempty"`
 }
 
 // Info returns current daemon status.
@@ -1920,6 +1948,8 @@ func (d *Daemon) Info() *DaemonInfo {
 		TURNEndpoint:          turnEndpoint,
 		OutboundTURNOnly:      d.config.OutboundTURNOnly,
 		NoRegistryEndpoint:    d.config.NoRegistryEndpoint,
+		PktsSentByTier:        d.tunnels.SnapshotPktsByTier(),
+		BytesSentByTier:       d.tunnels.SnapshotBytesByTier(),
 	}
 }
 

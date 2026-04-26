@@ -506,6 +506,12 @@ func (s *IPCServer) handleInfo(conn *ipcConn) {
 		"turn_endpoint":        info.TURNEndpoint,
 		"outbound_turn_only":   info.OutboundTURNOnly,
 		"no_registry_endpoint": info.NoRegistryEndpoint,
+		// jf.15.2: per-tier send counters as named maps. Always
+		// populated; observers (pilotctl, entmoot) can drop the
+		// keys cleanly if older daemons haven't shipped them
+		// yet (omitempty on the wire shape).
+		"pkts_sent_by_tier":  info.PktsSentByTier,
+		"bytes_sent_by_tier": info.BytesSentByTier,
 	})
 	if err != nil {
 		s.sendError(conn, fmt.Sprintf("info marshal: %v", err))

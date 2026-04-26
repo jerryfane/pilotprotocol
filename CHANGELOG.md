@@ -10,6 +10,148 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.2] - 2026-04-26
+
+Per-tier observability for `writeFrame`. Pure additive — no
+behaviour changes when the new flag is off. Goal: diagnose the
+last residual convergence blocker in jf.15.1 (VPS sees laptop
+authenticated, receives frames, but never sends a single packet
+back).
+
+### Added
+
+- **`-trace-sends` CLI flag** (default: `false`). When on, the
+  daemon emits one INFO log per `writeFrame` tier-decision and
+  per `SendTo` "queued pending key exchange" branch. Volume is
+  high (~10 events/min/peer-pair in steady state, more during
+  dial storms); intended for short-lived diagnostic windows,
+  not steady-state operation.
+
+  Each log carries structured fields:
+
+  ```
+  level=INFO msg=writeFrame
+    node_id=45491 tier=cached_conn bytes=137
+    dst_addr=104.30.150.205:45823 result=ok via_relay=false
+  ```
+
+  Tier values are stable strings and form a closed set:
+
+  ```
+  outbound_turn_only_cached    (jf.11a cached non-UDP path)
+  outbound_turn_only_jf9       (jf.9 lazy DialTURNRelayForPeer)
+  outbound_turn_only_own_relay (jf.11a.2 SendViaOwnRelay)
+  beacon_relay                 (jf.10 beacon path)
+  cached_conn                  (cached non-UDP, non-turn-only)
+  jf9_fallback                 (jf.9 lazy dial with addr==nil)
+  direct_udp                   (final tm.udp.WriteToUDPAddr)
+  queued_pending_key           (SendTo encryption-queue branch)
+  ```
+
+- **Always-on per-tier counters in `pilotctl info`**. Two new
+  JSON map fields exposed regardless of the flag:
+
+  ```
+  pkts_sent_by_tier:  { "direct_udp": 1234, "cached_conn": 56, ... }
+  bytes_sent_by_tier: { ... }
+  ```
+
+  Counters increment only on successful sends (mirrors the
+  existing `pkts_sent` / `bytes_sent` semantics). Operators can
+  read these at a glance to see which tier a peer's traffic is
+  going through, without needing to flip the flag and parse
+  per-event logs.
+
+  These are the always-on observability spine; the flag-gated
+  logs are per-event detail when needed.
+
+### Why
+
+jf.15.1 closed the consent-probe gap on TURN allocations. But
+live diagnostics on 2026-04-26 surfaced a different residual
+issue: VPS shows laptop as `auth=true`, receives frames every
+~8 s, yet sends zero packets to laptop's TURN allocation
+(verified by tcpdump). VPS's keepalive log emits nothing
+(success path is silent), so we can't tell which tier the send
+took or whether it took any tier at all.
+
+The exploration of `pkg/daemon/tunnel.go` mapped seven
+tier-decision points where `writeFrame` returns nil — plus an
+eighth pre-`writeFrame` branch in `SendTo` that **queues the
+packet, returns nil silently**, and never reaches `writeFrame`
+at all. Without observability we can only guess which one is
+the silent no-op offender. This release makes it observable.
+
+### Composes with
+
+- `-log-level` already exists; `-trace-sends` is orthogonal and
+  upgrades INFO log volume specifically for the send path.
+- All prior jf.X observability (rendezvous publish/lookup logs,
+  self-heal markers, eviction events) keeps its existing log
+  level and shape.
+- Existing per-tier Debug logs (`outbound-turn-only: ...
+  failed`, `cached peer conn failed, falling back`,
+  `turn-relay fallback dial failed`) are preserved — they
+  carry richer error context than the structured INFO logs and
+  remain useful at `-log-level=debug` when the flag is off.
+
+### Tests
+
+`pkg/daemon/tunnel_trace_test.go`:
+
+- `TestSendTier_NamesStableAcrossIndices` — pins the
+  index→name mapping (operators grep for these strings).
+- `TestRecordTierSend_BumpsCountersOnSuccess` — `err == nil`
+  bumps both pkts and bytes for the matching tier.
+- `TestRecordTierSend_DoesNotBumpOnFailure` — `err != nil`
+  leaves counters alone (counters represent bytes-on-the-wire,
+  not attempts).
+- `TestRecordTierSend_OnlyTouchesItsOwnTier` — bumping tier X
+  doesn't move tier Y.
+- `TestSnapshotByTier_ReturnsAllTiers` — JSON map includes
+  every tier even with zero bytes (stable shape for ops).
+- `TestTraceSends_DefaultOff` — fresh `TunnelManager` has the
+  flag off (operators must opt in).
+- `TestSetTraceSends_TogglesField` — runtime toggle works.
+- `TestRecordTierSend_NoLogWhenOff` /
+  `TestRecordTierSend_LogsWhenOn` — gate works in both states
+  (counter behaviour is identical regardless of flag).
+
+8 new tests, all green under `-race`.
+
+### Compat
+
+No wire-format changes. No protocol changes. New JSON fields
+in `pilotctl info` use `omitempty`-equivalent defaults so
+older clients decode cleanly. Counters are zero-initialized;
+flag is off by default. Pure additive.
+
+### Live verification (next deploy)
+
+1. Bump VPS to jf.15.2 with `-trace-sends`. Restart.
+2. Wait 60 s.
+3. ```
+   grep '"writeFrame"' /root/.pilot/log/pilot-daemon.jf15.2.log \
+     | jq -r '"\(.tier) \(.dst_addr) \(.result)"' \
+     | sort | uniq -c | sort -rn | head
+   ```
+4. Or simpler:
+   ```
+   pilotctl info | jq '.pkts_sent_by_tier'
+   ```
+5. The output names which tier is the silent no-op offender.
+   Targeted fix lands in jf.15.3.
+
+### Out of scope (deferred)
+
+- **Fixing the underlying silent no-op.** That's jf.15.3 once
+  jf.15.2 tells us where to look.
+- **Removing existing Debug logs.** Keep them; they have
+  failure-context strings the new INFO logs don't replicate.
+- **Per-tier RTT histograms.** Not needed for current
+  diagnostic. Add later if `writeFrame` becomes a recurring
+  hot path.
+
 ## [v1.9.0-jf.15.1] - 2026-04-26
 
 Two related gaps in jf.15's self-heal trigger surfaced from

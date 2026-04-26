@@ -213,6 +213,138 @@ type TunnelManager struct {
 	PktsRecv    uint64
 	EncryptOK   uint64
 	EncryptFail uint64
+
+	// jf.15.2: per-tier send observability. Counters always
+	// populated regardless of traceSends; gated INFO log fires
+	// only when traceSends is true. Tier index follows
+	// SendTier* constants below.
+	PktsSentByTier  [numSendTiers]uint64
+	BytesSentByTier [numSendTiers]uint64
+
+	// traceSends, when true, gates per-event INFO logging in
+	// writeFrame and SendTo. Set once at daemon.Start; never
+	// changed at runtime in production. Tests may toggle via
+	// SetTraceSends.
+	traceSends bool
+}
+
+// Send-tier identifiers used by jf.15.2's per-tier counters and
+// gated trace logs. The index space MUST stay stable — operators
+// rely on the JSON map keys for diagnostics.
+const (
+	SendTierOutboundTurnOnlyCached    = 0
+	SendTierOutboundTurnOnlyJF9       = 1
+	SendTierOutboundTurnOnlyOwnRelay  = 2
+	SendTierBeaconRelay               = 3
+	SendTierCachedConn                = 4
+	SendTierJF9Fallback               = 5
+	SendTierDirectUDP                 = 6
+	SendTierQueuedPendingKey          = 7
+	numSendTiers                      = 8
+)
+
+// sendTierName returns a stable string label for the given tier
+// index. Used for INFO log fields and the JSON snapshot's map
+// keys. Returns "unknown" for out-of-range indices to keep the
+// caller from panicking on a future tier-table addition.
+func sendTierName(tier int) string {
+	switch tier {
+	case SendTierOutboundTurnOnlyCached:
+		return "outbound_turn_only_cached"
+	case SendTierOutboundTurnOnlyJF9:
+		return "outbound_turn_only_jf9"
+	case SendTierOutboundTurnOnlyOwnRelay:
+		return "outbound_turn_only_own_relay"
+	case SendTierBeaconRelay:
+		return "beacon_relay"
+	case SendTierCachedConn:
+		return "cached_conn"
+	case SendTierJF9Fallback:
+		return "jf9_fallback"
+	case SendTierDirectUDP:
+		return "direct_udp"
+	case SendTierQueuedPendingKey:
+		return "queued_pending_key"
+	default:
+		return "unknown"
+	}
+}
+
+// recordTierSend is the jf.15.2 helper that bumps the per-tier
+// counters AND emits a gated INFO log line, in one call.
+//
+// Always called AFTER the tier's underlying Send / WriteToUDPAddr
+// resolves. result is "ok" or "err: <msg>". When err is non-nil,
+// counters are NOT incremented (a failed send didn't put bytes
+// on the wire); the log fires regardless to make the failure
+// observable. dstAddr is best-effort — pass "" if not known.
+func (tm *TunnelManager) recordTierSend(
+	tier int, nodeID uint32, bytesLen int,
+	dstAddr string, viaRelay bool, err error,
+) {
+	if err == nil {
+		atomic.AddUint64(&tm.PktsSentByTier[tier], 1)
+		atomic.AddUint64(&tm.BytesSentByTier[tier], uint64(bytesLen))
+	}
+	if !tm.traceSends {
+		return
+	}
+	result := "ok"
+	if err != nil {
+		result = "err: " + err.Error()
+	}
+	slog.Info("writeFrame",
+		"node_id", nodeID,
+		"tier", sendTierName(tier),
+		"bytes", bytesLen,
+		"dst_addr", dstAddr,
+		"result", result,
+		"via_relay", viaRelay,
+	)
+}
+
+// SetTraceSends toggles jf.15.2's per-send INFO logging at
+// runtime. Test-only hook; production sets this once at
+// daemon.Start via Config.TraceSends.
+func (tm *TunnelManager) SetTraceSends(on bool) {
+	tm.mu.Lock()
+	tm.traceSends = on
+	tm.mu.Unlock()
+}
+
+// addrString is a nil-safe helper for trace-log dst_addr
+// fields. Returns "" instead of panicking on a nil *net.UDPAddr.
+func addrString(a *net.UDPAddr) string {
+	if a == nil {
+		return ""
+	}
+	return a.String()
+}
+
+// SnapshotPktsByTier returns an atomic snapshot of the per-tier
+// packet counters as a map keyed by stable tier name. Used by
+// pilotctl info to expose where each peer's traffic is going
+// without requiring the high-volume -trace-sends flag.
+//
+// Tiers with zero packets are still included so operators can
+// confirm "this tier never fired" vs "this tier hasn't been
+// queried yet". (v1.9.0-jf.15.2)
+func (tm *TunnelManager) SnapshotPktsByTier() map[string]uint64 {
+	out := make(map[string]uint64, numSendTiers)
+	for i := 0; i < numSendTiers; i++ {
+		out[sendTierName(i)] = atomic.LoadUint64(&tm.PktsSentByTier[i])
+	}
+	return out
+}
+
+// SnapshotBytesByTier mirrors SnapshotPktsByTier for bytes.
+// (v1.9.0-jf.15.2)
+func (tm *TunnelManager) SnapshotBytesByTier() map[string]uint64 {
+	out := make(map[string]uint64, numSendTiers)
+	for i := 0; i < numSendTiers; i++ {
+		out[sendTierName(i)] = atomic.LoadUint64(&tm.BytesSentByTier[i])
+	}
+	return out
 }
 
 type IncomingPacket struct {
@@ -1054,21 +1186,24 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 		if cachedConn != nil {
 			net := cachedConn.RemoteEndpoint().Network()
 			if net == "turn" || net == "turn-relay" {
-				if err := cachedConn.Send(frame); err == nil {
+				err := cachedConn.Send(frame)
+				tm.recordTierSend(SendTierOutboundTurnOnlyCached,
+					nodeID, len(frame),
+					cachedConn.RemoteEndpoint().String(), relay, err)
+				if err == nil {
 					atomic.AddUint64(&tm.PktsSent, 1)
 					atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
 					return nil
-				} else {
-					// Cached TURN conn failed. Evict and fall through to dial.
-					tm.mu.Lock()
-					if tm.peerConns[nodeID] == cachedConn {
-						delete(tm.peerConns, nodeID)
-						_ = cachedConn.Close()
-					}
-					tm.mu.Unlock()
-					slog.Debug("outbound-turn-only: cached turn conn failed, re-dialling",
-						"node_id", nodeID, "network", net, "error", err)
 				}
+				// Cached TURN conn failed. Evict and fall through to dial.
+				tm.mu.Lock()
+				if tm.peerConns[nodeID] == cachedConn {
+					delete(tm.peerConns, nodeID)
+					_ = cachedConn.Close()
+				}
+				tm.mu.Unlock()
+				slog.Debug("outbound-turn-only: cached turn conn failed, re-dialling",
+					"node_id", nodeID, "network", net, "error", err)
 			}
 		}
 		// Lazily dial turn-relay if the peer advertised a TURN endpoint.
@@ -1084,13 +1219,19 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 				cc := tm.peerConns[nodeID]
 				tm.mu.RUnlock()
 				if cc != nil {
-					if err := cc.Send(frame); err == nil {
+					err := cc.Send(frame)
+					tm.recordTierSend(SendTierOutboundTurnOnlyJF9,
+						nodeID, len(frame),
+						cc.RemoteEndpoint().String(), relay, err)
+					if err == nil {
 						atomic.AddUint64(&tm.PktsSent, 1)
 						atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
 						return nil
 					}
 				}
 			} else {
+				tm.recordTierSend(SendTierOutboundTurnOnlyJF9,
+					nodeID, len(frame), "", relay, dialErr)
 				slog.Debug("outbound-turn-only: turn-relay dial failed",
 					"node_id", nodeID, "error", dialErr)
 			}
@@ -1117,15 +1258,18 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 				peerAddr = pathDirect
 			}
 			if peerAddr != nil {
-				if err := tm.turn.SendViaOwnRelay(peerAddr, frame); err == nil {
+				err := tm.turn.SendViaOwnRelay(peerAddr, frame)
+				tm.recordTierSend(SendTierOutboundTurnOnlyOwnRelay,
+					nodeID, len(frame),
+					peerAddr.String(), relay, err)
+				if err == nil {
 					atomic.AddUint64(&tm.PktsSent, 1)
 					atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
 					return nil
-				} else {
-					slog.Debug("outbound-turn-only: send via own relay failed",
-						"node_id", nodeID, "peer_addr", peerAddr.String(),
-						"error", err)
 				}
+				slog.Debug("outbound-turn-only: send via own relay failed",
+					"node_id", nodeID, "peer_addr", peerAddr.String(),
+					"error", err)
 			}
 		}
 		return fmt.Errorf("outbound-turn-only: no TURN path for node %d "+
@@ -1151,6 +1295,8 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 		binary.BigEndian.PutUint32(msg[5:9], nodeID)
 		copy(msg[9:], frame)
 		n, err := tm.udp.WriteToUDPAddr(msg, bAddr)
+		tm.recordTierSend(SendTierBeaconRelay, nodeID, len(frame),
+			bAddr.String(), relay, err)
 		if err == nil {
 			atomic.AddUint64(&tm.PktsSent, 1)
 			atomic.AddUint64(&tm.BytesSent, uint64(n))
@@ -1187,24 +1333,26 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	// and (v1.9.0-jf.9) DialTURNRelayForPeer. UDP conns are not cached
 	// here — they're effectively free to re-issue via WriteToUDPAddr.
 	if cachedConn != nil && cachedConn.RemoteEndpoint().Network() != "udp" {
-		if err := cachedConn.Send(frame); err == nil {
+		err := cachedConn.Send(frame)
+		tm.recordTierSend(SendTierCachedConn, nodeID, len(frame),
+			cachedConn.RemoteEndpoint().String(), relay, err)
+		if err == nil {
 			atomic.AddUint64(&tm.PktsSent, 1)
 			atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
 			return nil
-		} else {
-			// Cached conn is dead (e.g. peer closed TCP). Drop it so the
-			// next sender can re-dial, and fall through to UDP.
-			tm.mu.Lock()
-			if tm.peerConns[nodeID] == cachedConn {
-				delete(tm.peerConns, nodeID)
-				_ = cachedConn.Close()
-			}
-			tm.mu.Unlock()
-			slog.Debug("cached peer conn failed, falling back",
-				"node_id", nodeID,
-				"network", cachedConn.RemoteEndpoint().Network(),
-				"error", err)
 		}
+		// Cached conn is dead (e.g. peer closed TCP). Drop it so the
+		// next sender can re-dial, and fall through to UDP.
+		tm.mu.Lock()
+		if tm.peerConns[nodeID] == cachedConn {
+			delete(tm.peerConns, nodeID)
+			_ = cachedConn.Close()
+		}
+		tm.mu.Unlock()
+		slog.Debug("cached peer conn failed, falling back",
+			"node_id", nodeID,
+			"network", cachedConn.RemoteEndpoint().Network(),
+			"error", err)
 	}
 
 	if addr == nil {
@@ -1222,21 +1370,28 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 				cc := tm.peerConns[nodeID]
 				tm.mu.RUnlock()
 				if cc != nil && cc.RemoteEndpoint().Network() != "udp" {
-					if err := cc.Send(frame); err == nil {
+					err := cc.Send(frame)
+					tm.recordTierSend(SendTierJF9Fallback, nodeID,
+						len(frame), cc.RemoteEndpoint().String(),
+						relay, err)
+					if err == nil {
 						atomic.AddUint64(&tm.PktsSent, 1)
 						atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
 						return nil
-					} else {
-						return fmt.Errorf("turn-relay send after dial: %w", err)
 					}
+					return fmt.Errorf("turn-relay send after dial: %w", err)
 				}
 			} else {
+				tm.recordTierSend(SendTierJF9Fallback, nodeID,
+					len(frame), "", relay, dialErr)
 				slog.Debug("turn-relay fallback dial failed", "node_id", nodeID, "error", dialErr)
 			}
 		}
 		return fmt.Errorf("no address for node %d", nodeID)
 	}
 	n, err := tm.udp.WriteToUDPAddr(frame, addr)
+	tm.recordTierSend(SendTierDirectUDP, nodeID, len(frame),
+		addr.String(), relay, err)
 	if err == nil {
 		atomic.AddUint64(&tm.PktsSent, 1)
 		atomic.AddUint64(&tm.BytesSent, uint64(n))
@@ -2219,7 +2374,24 @@ func (tm *TunnelManager) SendTo(addr *net.UDPAddr, nodeID uint32, pkt *protocol.
 			q = q[1:] // drop oldest
 		}
 		tm.pending[nodeID] = append(q, data)
+		queueDepth := len(tm.pending[nodeID])
 		tm.pendMu.Unlock()
+		// jf.15.2: count this no-emit branch in the per-tier
+		// stats and emit a gated trace. Use err=nil so the
+		// counter increments — "queued" is the operation, the
+		// counter answers "how many sends ended up queued".
+		// Caller-side observers see 0-byte tier counter growth
+		// vs N-byte direct_udp counter growth and can tell
+		// where their traffic is actually going.
+		tm.recordTierSend(SendTierQueuedPendingKey, nodeID,
+			len(data), addrString(addr), false, nil)
+		if tm.traceSends {
+			slog.Info("send queued pending key exchange",
+				"node_id", nodeID,
+				"bytes", len(data),
+				"queue_depth", queueDepth,
+			)
+		}
 		return nil // queued, will be sent encrypted after key exchange
 	}
 
