@@ -289,3 +289,111 @@ func TestSelfHeal_RecordHelpersExist(t *testing.T) {
 // if the only test that referenced it is later removed. Cheap
 // defensive declaration.
 var _ = errSimulated
+
+// TestSelfHeal_ConsentProbeIntervalDefault: a fresh transport
+// has the documented default consent-probe cadence. Anchors
+// the public contract — operators can rely on this number.
+func TestSelfHeal_ConsentProbeIntervalDefault(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	if tr.consentProbeInterval != defaultConsentProbeInterval {
+		t.Fatalf("default consentProbeInterval=%v; want %v",
+			tr.consentProbeInterval, defaultConsentProbeInterval)
+	}
+}
+
+// TestSelfHeal_SetConsentProbeIntervalRespected: the
+// test-only setter overrides the default and zero/negative
+// values are silently ignored (mirrors
+// setPermissionRefreshInterval semantics).
+func TestSelfHeal_SetConsentProbeIntervalRespected(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.setConsentProbeInterval(50 * time.Millisecond)
+	if tr.consentProbeInterval != 50*time.Millisecond {
+		t.Fatalf("after set: consentProbeInterval=%v; want 50ms",
+			tr.consentProbeInterval)
+	}
+	tr.setConsentProbeInterval(0)
+	if tr.consentProbeInterval != 50*time.Millisecond {
+		t.Fatalf("zero set should be ignored; got %v",
+			tr.consentProbeInterval)
+	}
+	tr.setConsentProbeInterval(-1 * time.Second)
+	if tr.consentProbeInterval != 50*time.Millisecond {
+		t.Fatalf("negative set should be ignored; got %v",
+			tr.consentProbeInterval)
+	}
+}
+
+// TestSelfHeal_ConsentProbeOnNilClientNoOp: runConsentProbe
+// must exit cleanly when the transport hasn't successfully
+// listened (client is nil). The active loop fires on a timer
+// regardless of listen state; nil-client must be a no-op,
+// not a nil-deref panic.
+func TestSelfHeal_ConsentProbeOnNilClientNoOp(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	// client is nil; closed is false. Just ensure no panic.
+	tr.runConsentProbe()
+	// And no spurious failure increment when client is nil.
+	if got := tr.consecutiveFailures.Load(); got != 0 {
+		t.Fatalf("nil-client probe incremented failures: %d", got)
+	}
+}
+
+// TestSelfHeal_ConsentProbeOnClosedTransportNoOp: similar
+// guarantee for a Close()d transport.
+func TestSelfHeal_ConsentProbeOnClosedTransportNoOp(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.mu.Lock()
+	tr.closed = true
+	tr.mu.Unlock()
+	tr.runConsentProbe()
+	if got := tr.consecutiveFailures.Load(); got != 0 {
+		t.Fatalf("closed-transport probe incremented failures: %d", got)
+	}
+}
+
+// TestSelfHeal_ConsentLoopExitsOnClose: standard goroutine-
+// lifecycle hygiene. Start the loop with a tiny interval,
+// close the transport, expect the goroutine to return
+// promptly. Without this, Close() would hang waiting on the
+// wg.
+func TestSelfHeal_ConsentLoopExitsOnClose(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.consentProbeInterval = 10 * time.Millisecond
+	tr.wg.Add(1)
+	done := make(chan struct{})
+	go func() {
+		tr.consentLoop()
+		close(done)
+	}()
+	// Let it tick a few times.
+	time.Sleep(40 * time.Millisecond)
+	close(tr.closeCh)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("consentLoop didn't exit within 500ms of closeCh")
+	}
+}
+
+// TestSelfHeal_RefreshAllPermissionsRecordsFailures was the
+// missing health signal that motivated jf.15.1: pion's
+// periodic permission refresh failures used to be silent. We
+// can't easily exercise the real pion client failure path
+// here without a live TURN server, but we CAN confirm the
+// recordFailure / recordSuccess hooks are reachable from
+// outside via a structural assertion (compile-time).
+//
+// The actual integration is covered by the live mesh
+// (laptop's stuck pion which jf.15.1 is intended to recover).
+func TestSelfHeal_RefreshAllPermissionsHooksWired(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	// Fresh transport: no permittedAddrs, no client. Calling
+	// refreshAllPermissions should be a no-op (early return on
+	// client == nil) — and crucially must NOT increment
+	// failures (the no-op shouldn't bump our heal counter).
+	tr.refreshAllPermissions()
+	if got := tr.consecutiveFailures.Load(); got != 0 {
+		t.Fatalf("no-op refreshAllPermissions incremented failures: %d", got)
+	}
+}

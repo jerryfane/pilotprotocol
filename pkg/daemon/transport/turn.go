@@ -52,6 +52,23 @@ const (
 	selfHealStaleWindow      = 30 * time.Second
 )
 
+// defaultConsentProbeInterval is how often the consent-freshness
+// loop sends a STUN BindingRequest to the TURN server to verify
+// the allocation is still alive. Derived from RFC 7675's consent-
+// freshness model — that spec uses 4-6 s for WebRTC media paths.
+// For our long-lived control-plane allocations 30 s is the right
+// balance: low enough that a stuck pion is detected within a
+// minute or two (5 failures × 30 s = ~2.5 min worst-case), high
+// enough that idle daemons don't spam the TURN server.
+//
+// The probe target is the TURN server's STUN address itself, NOT
+// any peer — a 1 RTT round-trip that proves "pion can talk to
+// the allocation server." If pion's allocation is half-dead,
+// permission refresh failing, or the underlying socket has gone
+// silent, the probe will time out and recordFailure() bumps the
+// self-heal counter.
+const defaultConsentProbeInterval = 30 * time.Second
+
 // selfHealBackoffSchedule is the exponential-ish retry budget used
 // by selfHealLoop after a heal attempt. Mirrors jf.13's
 // peerKeepaliveLoop / jf.14.2's rendezvousRefreshLoop bounded-
@@ -178,6 +195,12 @@ type TURNTransport struct {
 	selfHealCh          chan struct{} // length-1 nudge from failure-detect path
 	selfHealAttempt     int           // backoff index (protected by mu)
 	selfHealRunning     bool          // serializes concurrent runSelfHeal calls (protected by mu)
+
+	// consentProbeInterval controls how often consentLoop
+	// (jf.15.1) sends a STUN BindingRequest to the TURN
+	// server. Default defaultConsentProbeInterval (30 s);
+	// overridable via setConsentProbeInterval for tests.
+	consentProbeInterval time.Duration
 }
 
 // NewTURNTransport constructs a TURNTransport. The provider lifetime is
@@ -193,6 +216,7 @@ func NewTURNTransport(provider turncreds.Provider, sink chan<- InboundFrame) *TU
 		permittedAddrs:            make(map[string]time.Time),
 		permissionRefreshInterval: defaultPermissionRefreshInterval,
 		selfHealCh:                make(chan struct{}, 1),
+		consentProbeInterval:      defaultConsentProbeInterval,
 	}
 }
 
@@ -206,6 +230,18 @@ func (t *TURNTransport) setPermissionRefreshInterval(d time.Duration) {
 	}
 	t.mu.Lock()
 	t.permissionRefreshInterval = d
+	t.mu.Unlock()
+}
+
+// setConsentProbeInterval is the jf.15.1 test hook for the active
+// consent-freshness loop's cadence. Same shape as
+// setPermissionRefreshInterval. Must be called before Listen.
+func (t *TURNTransport) setConsentProbeInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.consentProbeInterval = d
 	t.mu.Unlock()
 }
 
@@ -294,6 +330,18 @@ func (t *TURNTransport) Listen(addr string, sink chan<- InboundFrame) error {
 	// nudges it.
 	t.wg.Add(1)
 	go t.selfHealLoop()
+
+	// jf.15.1: active consent-freshness probe. Sends a STUN
+	// BindingRequest to the TURN server every consentProbeInterval
+	// (default 30 s). If the allocation is half-dead — pion's
+	// internal state silent, permission refresh hung, underlying
+	// socket broken — the probe times out and feeds recordFailure.
+	// Without this loop, the only failure detectors were
+	// SendViaOwnRelay (only fires when something tries to send) and
+	// CreatePermission (only fires on explicit refresh paths).
+	// A stuck pion with no traffic stayed stuck forever.
+	t.wg.Add(1)
+	go t.consentLoop()
 
 	// Stamp lastSuccessNano so the first transport failure doesn't
 	// trigger heal on a stale "0" timestamp (which would breach the
@@ -512,8 +560,17 @@ func (t *TURNTransport) refreshAllPermissions() {
 		if err := client.CreatePermission(ua); err != nil {
 			slog.Warn("turn: permission refresh failed",
 				"addr", addr, "error", err)
+			// jf.15.1: feed periodic-refresh failures into the
+			// self-heal counter. The earlier code path
+			// (refreshAllPermissions) bypassed t.CreatePermission's
+			// recordFailure() hook, so a stuck pion never
+			// triggered heal even when its internal permission
+			// refreshes were failing for hours. Now both code
+			// paths converge on the same health signal.
+			t.recordFailure()
 			continue
 		}
+		t.recordSuccess()
 		t.mu.Lock()
 		if _, ok := t.permittedAddrs[addr]; ok {
 			t.permittedAddrs[addr] = now
@@ -782,6 +839,96 @@ func (t *TURNTransport) rotate(newCreds *turncreds.Credentials) {
 	// dead) allocation in transport_ads.
 	t.fireLocalAddrChange()
 }
+
+// consentLoop is the active health probe added in jf.15.1. It
+// periodically calls pion's SendBindingRequest against the TURN
+// server itself — the canonical RFC 7675 STUN-binding probe.
+// Success → recordSuccess (zeros the failure counter); failure
+// → recordFailure (which may trigger heal once the threshold
+// trips).
+//
+// This catches the case where pion's INTERNAL state has gone
+// silent (allocation half-dead, permission refresh thread
+// hung, underlying socket broken) but no peer has tried to
+// SendViaOwnRelay recently. Without an active probe, a stuck
+// pion stays stuck indefinitely if no traffic flows.
+//
+// Cadence is t.consentProbeInterval (default 30 s) with
+// startup jitter to spread fleet-wide ticks. Per-call
+// transaction has its own internal timeout inside pion;
+// failures surface as a returned error.
+//
+// (v1.9.0-jf.15.1)
+func (t *TURNTransport) consentLoop() {
+	defer t.wg.Done()
+
+	t.mu.RLock()
+	interval := t.consentProbeInterval
+	t.mu.RUnlock()
+	if interval <= 0 {
+		interval = defaultConsentProbeInterval
+	}
+
+	// Jitter so a fleet-wide restart doesn't synchronize probes.
+	// Pick from [0, interval/4) — small, just enough to avoid
+	// lockstep.
+	jitter := time.Duration(0)
+	if interval >= 4*time.Millisecond {
+		jitter = time.Duration(int64(interval) / 4)
+		if jitter > 0 {
+			jitter = time.Duration(timeNow().UnixNano() % int64(jitter))
+		}
+	}
+	select {
+	case <-t.closeCh:
+		return
+	case <-time.After(jitter):
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.closeCh:
+			return
+		case <-ticker.C:
+			t.runConsentProbe()
+		}
+	}
+}
+
+// runConsentProbe performs one consent-freshness check by
+// asking pion to send a STUN BindingRequest to the TURN server.
+// If the allocation is healthy, pion gets back a XOR-MAPPED-
+// ADDRESS attribute and we recordSuccess. If the binding-request
+// transaction fails (timeout, server rejection, transport
+// error), we recordFailure — which feeds the same self-heal
+// counter as SendViaOwnRelay/CreatePermission failures.
+//
+// Snapshot client under RLock so a concurrent rotate() can't
+// race with us; the actual transaction runs without t.mu held
+// because pion's PerformTransaction can take seconds and we
+// don't want to serialize Send paths behind it.
+func (t *TURNTransport) runConsentProbe() {
+	t.mu.RLock()
+	client := t.client
+	closed := t.closed
+	t.mu.RUnlock()
+	if closed || client == nil {
+		return
+	}
+	if _, err := client.SendBindingRequest(); err != nil {
+		slog.Debug("turn: consent probe failed",
+			"error", err)
+		t.recordFailure()
+		return
+	}
+	t.recordSuccess()
+}
+
+// timeNow is a swappable wall-clock used by consentLoop's
+// jitter pick. Tests can override; production uses time.Now.
+var timeNow = time.Now
 
 // recordSuccess marks the most recent allocation operation
 // (SendViaOwnRelay or CreatePermission) as successful: stamps

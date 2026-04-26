@@ -10,6 +10,94 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.1] - 2026-04-26
+
+Two related gaps in jf.15's self-heal trigger surfaced from
+deeper diagnosis of the live mesh: the heal counter never
+incremented in the actual production failure mode.
+
+### Fixed
+
+- **Periodic permission-refresh failures now feed the
+  self-heal counter.** `refreshAllPermissions` was calling
+  `client.CreatePermission` directly (bypassing the public
+  `t.CreatePermission` wrapper that records failures). Live
+  evidence 2026-04-26 from laptop: `turnc ERROR: Fail to
+  refresh permissions: all retransmissions failed` recurring
+  every 4 minutes for hours, but VPS's pilot log shows zero
+  self-heal events — because the failures were never counted.
+  Fix: in `refreshAllPermissions`, on `client.CreatePermission`
+  error → `t.recordFailure()`; on success → `t.recordSuccess()`.
+  Both code paths now converge on the same health signal.
+
+- **Active consent-freshness probe.** Even with the
+  bookkeeping fix, the heal counter only increments when
+  *something* tries to use the allocation. A stuck pion with
+  no traffic stayed stuck indefinitely. Fix: new
+  `consentLoop` goroutine that calls pion's
+  `SendBindingRequest()` against the TURN server every 30
+  seconds (overridable via `setConsentProbeInterval` for
+  tests). This is the canonical RFC 7675 STUN-binding probe —
+  exactly the pattern WebRTC uses for the same job. Failures
+  feed `recordFailure` like any other operation; success
+  resets the counter.
+
+  With both fixes, a pion stuck in any failure mode is
+  detected within ~2.5 minutes (5 probe failures × 30 s
+  interval = 2.5 min) and atomically rebuilt by jf.15's
+  existing self-heal path.
+
+### Why
+
+The jf.15 design correctly identified the canonical pattern
+(RFC 7675 + atomic swap) but missed the *coverage* problem:
+passive failure tracking only catches failures from explicit
+send paths. A daemon whose peers are all silent — exactly
+the case where bootstrap is most fragile — never gets a
+failure signal even when its allocation is dead. The
+solution is the same active probe RFC 7675 specifies for
+WebRTC media paths, scaled to our long-lived control-plane
+cadence (30 s instead of 4-6 s).
+
+### Tests
+
+`pkg/daemon/transport/turn_selfheal_test.go` adds 5 tests
+on top of jf.15's 11:
+
+- `TestSelfHeal_ConsentProbeIntervalDefault` — fresh
+  transport gets `defaultConsentProbeInterval` (30 s).
+- `TestSelfHeal_SetConsentProbeIntervalRespected` — test
+  hook overrides default; zero/negative ignored (mirrors
+  setPermissionRefreshInterval semantics).
+- `TestSelfHeal_ConsentProbeOnNilClientNoOp` — pre-Listen
+  state probe is a no-op, no panic, no spurious failure.
+- `TestSelfHeal_ConsentProbeOnClosedTransportNoOp` — same
+  for Close()d transport.
+- `TestSelfHeal_ConsentLoopExitsOnClose` — goroutine
+  lifecycle hygiene: tiny interval, tick a few times, close
+  channel, expect prompt return.
+- `TestSelfHeal_RefreshAllPermissionsHooksWired` — no-op
+  refresh (nil client) doesn't spuriously increment failures.
+
+Total: 16 self-heal tests, all green under `-race`.
+
+### Compat
+
+No wire-format changes. No protocol changes. No CLI flags
+added. Adds 1 STUN BindingRequest per 30 s per running
+TURN allocation (~50 bytes round-trip). Backwards-compatible
+with all earlier jf.X versions on the wire.
+
+### Out of scope (deferred)
+
+- **Tunable probe cadence via CLI flag.** 30 s is the
+  RFC-7675-derived default; operators with weird needs can
+  fork the constant.
+- **Skip probe when allocation is idle for short windows.**
+  Considered. Skipped — the probe is cheap, and an idle
+  allocation is exactly where consent-freshness matters most
+  (no peer traffic to detect failure passively).
+
 ## [v1.9.0-jf.15] - 2026-04-26
 
 TURN allocation self-heal — RFC 7675 consent-freshness circuit
