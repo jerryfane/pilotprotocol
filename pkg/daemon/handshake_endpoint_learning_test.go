@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 )
 
 // The tests below pin v1.9.0-jf.12's strict endpoint-learning
@@ -86,6 +87,44 @@ func newKEXTestTunnel(t *testing.T) *TunnelManager {
 	tm.pubKey = make([]byte, 32)
 	tm.pubKey[0] = 0x01
 	return tm
+}
+
+func newAuthKEXTestTunnel(t *testing.T, nodeID uint32) (*TunnelManager, *crypto.Identity) {
+	t.Helper()
+	tm := NewTunnelManager()
+	tm.SetNodeID(nodeID)
+	if err := tm.EnableEncryption(); err != nil {
+		t.Fatalf("EnableEncryption: %v", err)
+	}
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("crypto.GenerateIdentity: %v", err)
+	}
+	tm.SetIdentity(id)
+	return tm, id
+}
+
+func expectCapturedFrame(t *testing.T, cl *captureListener, label string) []byte {
+	t.Helper()
+	select {
+	case f := <-cl.frames:
+		if len(f) < 4 {
+			t.Fatalf("%s got %d-byte frame; want >= 4", label, len(f))
+		}
+		return f
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s listener never received frame", label)
+	}
+	return nil
+}
+
+func expectNoCapturedFrame(t *testing.T, cl *captureListener, label string) {
+	t.Helper()
+	select {
+	case f := <-cl.frames:
+		t.Fatalf("%s listener received unexpected %d-byte frame", label, len(f))
+	case <-time.After(150 * time.Millisecond):
+	}
 }
 
 // TestHandshakeReply_UsesObservedSourceNotCachedDirect is the
@@ -265,6 +304,125 @@ func TestSendKeyExchangeToNode_RaceSafety(t *testing.T) {
 	if calls.Load() != 50 {
 		t.Fatalf("calls.Load() = %d; want 50", calls.Load())
 	}
+}
+
+func TestAuthKEXTrailer_FlagsDoNotContaminateCaps(t *testing.T) {
+	tm := newKEXTestTunnel(t)
+	defer tm.Close()
+
+	tm.SetLocalCaps(0x40)
+	frame := tm.buildAuthKeyExchangeFrameWithFlags(authKEXFlagRequest)
+	if len(frame) <= 136 {
+		t.Fatalf("flagged auth KEX frame has no trailer")
+	}
+	caps, flags := parseAuthKEXTrailer(frame[136:])
+	if caps != 0x40 {
+		t.Fatalf("caps = %#x, want 0x40", caps)
+	}
+	if flags != authKEXFlagRequest {
+		t.Fatalf("flags = %#x, want request", flags)
+	}
+
+	tm.SetLocalCaps(0)
+	frame = tm.buildAuthKeyExchangeFrameWithFlags(authKEXFlagResponse)
+	caps, flags = parseAuthKEXTrailer(frame[136:])
+	if caps != 0 {
+		t.Fatalf("caps with flags-only trailer = %#x, want 0", caps)
+	}
+	if flags != authKEXFlagResponse {
+		t.Fatalf("flags = %#x, want response", flags)
+	}
+}
+
+func TestAuthKeyExchange_TURNIngressInstallsObservedEndpoint(t *testing.T) {
+	const (
+		localNode = uint32(45491)
+		peerNode  = uint32(45981)
+		turnAddr  = "104.30.148.46:39762"
+	)
+	tm, _ := newAuthKEXTestTunnel(t, localNode)
+	defer tm.Close()
+	peer, peerID := newAuthKEXTestTunnel(t, peerNode)
+	defer peer.Close()
+	tm.SetPeerVerifyFunc(func(nodeID uint32) (ed25519.PublicKey, error) {
+		if nodeID != peerNode {
+			t.Fatalf("unexpected verify nodeID %d", nodeID)
+		}
+		return peerID.PublicKey, nil
+	})
+
+	turnEP, err := transport.NewTURNEndpoint(turnAddr)
+	if err != nil {
+		t.Fatalf("NewTURNEndpoint: %v", err)
+	}
+	frame := peer.buildAuthKeyExchangeFrameWithFlags(authKEXFlagRequest)
+	tm.handleAuthKeyExchange(frame[4:], turnEP, false)
+
+	if got := tm.PeerTURNEndpoint(peerNode); got != turnAddr {
+		t.Fatalf("PeerTURNEndpoint = %q, want %q", got, turnAddr)
+	}
+	tm.mu.RLock()
+	p := tm.paths[peerNode]
+	tm.mu.RUnlock()
+	if p == nil {
+		t.Fatalf("path entry not created for authenticated TURN peer")
+	}
+	if p.direct != nil {
+		t.Fatalf("TURN ingress poisoned direct path: got %v", p.direct)
+	}
+}
+
+func TestAuthKeyExchange_DuplicateRecoveryRequestRepliesWithoutCryptoReset(t *testing.T) {
+	const (
+		localNode = uint32(45491)
+		peerNode  = uint32(45981)
+	)
+	tm, _ := newAuthKEXTestTunnel(t, localNode)
+	defer tm.Close()
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+	peer, peerID := newAuthKEXTestTunnel(t, peerNode)
+	defer peer.Close()
+	tm.SetPeerVerifyFunc(func(nodeID uint32) (ed25519.PublicKey, error) {
+		if nodeID != peerNode {
+			t.Fatalf("unexpected verify nodeID %d", nodeID)
+		}
+		return peerID.PublicKey, nil
+	})
+	observed := newCaptureListener(t)
+	defer observed.Close()
+	observedEP := transport.NewUDPEndpoint(observed.addr)
+	frame := peer.buildAuthKeyExchangeFrameWithFlags(authKEXFlagRequest)
+
+	tm.handleAuthKeyExchange(frame[4:], observedEP, false)
+	firstReply := expectCapturedFrame(t, observed, "initial reply")
+	_, firstFlags := parseAuthKEXTrailer(firstReply[136:])
+	if firstFlags != authKEXFlagResponse {
+		t.Fatalf("initial reply flags = %#x, want response", firstFlags)
+	}
+	tm.mu.RLock()
+	firstPC := tm.crypto[peerNode]
+	tm.mu.RUnlock()
+	if firstPC == nil {
+		t.Fatalf("crypto not installed after initial auth KEX")
+	}
+
+	tm.handleAuthKeyExchange(frame[4:], observedEP, false)
+	secondReply := expectCapturedFrame(t, observed, "duplicate request reply")
+	_, secondFlags := parseAuthKEXTrailer(secondReply[136:])
+	if secondFlags != authKEXFlagResponse {
+		t.Fatalf("duplicate reply flags = %#x, want response", secondFlags)
+	}
+	tm.mu.RLock()
+	secondPC := tm.crypto[peerNode]
+	tm.mu.RUnlock()
+	if secondPC != firstPC {
+		t.Fatalf("same-key duplicate recovery request replaced crypto state")
+	}
+
+	tm.handleAuthKeyExchange(frame[4:], observedEP, false)
+	expectNoCapturedFrame(t, observed, "cooldown duplicate request")
 }
 
 // Ensure crypto.Identity satisfies the interface ed25519 expects

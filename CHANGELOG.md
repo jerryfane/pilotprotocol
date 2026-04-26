@@ -10,6 +10,21 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.9] - 2026-04-26
+
+### Fixed
+
+- **Authenticated recovery PILA now preserves TURN ingress endpoints and
+  repeats replies safely.** Frames delivered by TURN now reach the auth path as
+  `TURNEndpoint` values instead of collapsing to `nil`, so a verified PILA can
+  install/re-permit the peer's observed TURN allocation without poisoning
+  `path.direct`. Recovery PILA frames now carry a backward-compatible
+  request/response trailer; verified duplicate requests receive a bounded
+  same-key response without resetting replay/crypto state. This closes the
+  laptop↔VPS one-way crypto-state deadlock where laptop sent recovery PILA,
+  VPS installed laptop's key, but laptop never received a repeatable reciprocal
+  auth reply.
+
 ## [v1.9.0-jf.15.8] - 2026-04-26
 
 ### Fixed

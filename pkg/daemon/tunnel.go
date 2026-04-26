@@ -126,10 +126,10 @@ type TunnelManager struct {
 	// Circuit Relay v2) records the path the last authenticated frame
 	// arrived on and always replies there. No cross-daemon coordination
 	// needed; symmetry falls out of the per-peer state.
-	paths     map[uint32]*peerPath              // node_id → last-authenticated ingress path
-	peerTCP   map[uint32]*transport.TCPEndpoint // node_id → TCP endpoint, populated from registry lookup when advertised
+	paths     map[uint32]*peerPath               // node_id → last-authenticated ingress path
+	peerTCP   map[uint32]*transport.TCPEndpoint  // node_id → TCP endpoint, populated from registry lookup when advertised
 	peerTURN  map[uint32]*transport.TURNEndpoint // node_id → TURN relayed endpoint, populated from SetPeerEndpoints
-	peerConns map[uint32]transport.DialedConn   // node_id → cached DialedConn (whichever transport won the last Dial)
+	peerConns map[uint32]transport.DialedConn    // node_id → cached DialedConn (whichever transport won the last Dial)
 
 	// turnPermittedPeers records host:port strings for which we have
 	// issued CreatePermission on the local TURN allocation (via
@@ -145,11 +145,11 @@ type TunnelManager struct {
 	// flow. Read-mostly thereafter; guarded by tm.mu because
 	// writeFrame reads it under RLock alongside other fields. v1.9.0-jf.11a.
 	outboundTURNOnly bool
-	crypto    map[uint32]*peerCrypto            // node_id → encryption state
-	recvCh    chan *IncomingPacket
-	done      chan struct{}  // closed on Close() to stop dispatchLoop
-	readWg    sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
-	closeOnce sync.Once
+	crypto           map[uint32]*peerCrypto // node_id → encryption state
+	recvCh           chan *IncomingPacket
+	done             chan struct{}  // closed on Close() to stop dispatchLoop
+	readWg           sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
+	closeOnce        sync.Once
 
 	// Encryption config
 	encrypt bool             // if true, attempt encrypted tunnels
@@ -175,6 +175,11 @@ type TunnelManager struct {
 	// avoid any amplification-loop concern if a peer (or attacker)
 	// keeps feeding us un-decryptable frames.
 	lastRecoveryPILA map[uint32]time.Time
+	// lastAuthKEXResponse bounds same-key replies to authenticated
+	// recovery PILA requests. A verified peer may repeat a request when
+	// our first reciprocal PILA was lost; we answer those idempotently,
+	// but not for every duplicate frame.
+	lastAuthKEXResponse map[uint32]time.Time
 	// Our own capability bitmap, appended to outbound PILA frames so
 	// peers can learn that we support gossip. Zero when the daemon
 	// hasn't opted in (e.g. during tests, or pre-engine bootstrap).
@@ -232,15 +237,15 @@ type TunnelManager struct {
 // gated trace logs. The index space MUST stay stable — operators
 // rely on the JSON map keys for diagnostics.
 const (
-	SendTierOutboundTurnOnlyCached    = 0
-	SendTierOutboundTurnOnlyJF9       = 1
-	SendTierOutboundTurnOnlyOwnRelay  = 2
-	SendTierBeaconRelay               = 3
-	SendTierCachedConn                = 4
-	SendTierJF9Fallback               = 5
-	SendTierDirectUDP                 = 6
-	SendTierQueuedPendingKey          = 7
-	numSendTiers                      = 8
+	SendTierOutboundTurnOnlyCached   = 0
+	SendTierOutboundTurnOnlyJF9      = 1
+	SendTierOutboundTurnOnlyOwnRelay = 2
+	SendTierBeaconRelay              = 3
+	SendTierCachedConn               = 4
+	SendTierJF9Fallback              = 5
+	SendTierDirectUDP                = 6
+	SendTierQueuedPendingKey         = 7
+	numSendTiers                     = 8
 )
 
 // sendTierName returns a stable string label for the given tier
@@ -412,21 +417,22 @@ const RecvChSize = 8192
 
 func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
-		udp:                transport.NewUDPTransport(),
-		inbound:            make(chan transport.InboundFrame, RecvChSize),
-		paths:              make(map[uint32]*peerPath),
-		peerTCP:            make(map[uint32]*transport.TCPEndpoint),
-		peerTURN:           make(map[uint32]*transport.TURNEndpoint),
-		peerConns:          make(map[uint32]transport.DialedConn),
-		turnPermittedPeers: make(map[string]time.Time),
-		crypto:             make(map[uint32]*peerCrypto),
-		peerPubKeys:        make(map[uint32]ed25519.PublicKey),
-		peerCaps:           make(map[uint32]uint64),
-		lastRecoveryPILA:   make(map[uint32]time.Time),
-		pending:            make(map[uint32][][]byte),
-		recvCh:             make(chan *IncomingPacket, RecvChSize),
-		done:               make(chan struct{}),
-		gossipView:         gossip.NewMembershipView(),
+		udp:                 transport.NewUDPTransport(),
+		inbound:             make(chan transport.InboundFrame, RecvChSize),
+		paths:               make(map[uint32]*peerPath),
+		peerTCP:             make(map[uint32]*transport.TCPEndpoint),
+		peerTURN:            make(map[uint32]*transport.TURNEndpoint),
+		peerConns:           make(map[uint32]transport.DialedConn),
+		turnPermittedPeers:  make(map[string]time.Time),
+		crypto:              make(map[uint32]*peerCrypto),
+		peerPubKeys:         make(map[uint32]ed25519.PublicKey),
+		peerCaps:            make(map[uint32]uint64),
+		lastRecoveryPILA:    make(map[uint32]time.Time),
+		lastAuthKEXResponse: make(map[uint32]time.Time),
+		pending:             make(map[uint32][][]byte),
+		recvCh:              make(chan *IncomingPacket, RecvChSize),
+		done:                make(chan struct{}),
+		gossipView:          gossip.NewMembershipView(),
 	}
 }
 
@@ -1602,11 +1608,6 @@ func extractFrameNodeID(frame []byte) (uint32, bool) {
 // transport and routes them to the per-magic handlers. It is the
 // single place where we interpret Pilot's wire format at the tunnel
 // layer; individual transports are dumb byte-movers.
-//
-// Phase 1b scope: only the UDP transport is wired in, so every frame
-// arrives with a *transport.UDPEndpoint. Handlers still take
-// *net.UDPAddr — we unwrap the concrete type here until Phase 1c
-// abstracts the handler signatures to transport.Endpoint.
 func (tm *TunnelManager) dispatchLoop() {
 	defer tm.readWg.Done()
 
@@ -1624,15 +1625,7 @@ func (tm *TunnelManager) dispatchLoop() {
 				continue
 			}
 
-			// Unwrap the concrete UDP address for handlers that still
-			// take *net.UDPAddr. For non-UDP frames (TCP/QUIC/…) we pass
-			// nil — handlers that use `from` for peer-address learning
-			// just skip that update for non-UDP, and TCP peers are
-			// tracked via peerConns (cached Reply channel) instead.
-			var remote *net.UDPAddr
-			if udpEP, ok := inbound.From.(*transport.UDPEndpoint); ok {
-				remote = udpEP.Addr()
-			}
+			remote := udpAddrFromEndpoint(inbound.From)
 
 			// Phase 4: for frames that carry a peer nodeID and arrive
 			// on a connection-oriented transport (TCP), cache the Reply
@@ -1675,17 +1668,17 @@ func (tm *TunnelManager) dispatchLoop() {
 			switch magic {
 			case protocol.TunnelMagicAuthEx:
 				// Authenticated key exchange: [PILA][4-byte nodeID][32-byte X25519][32-byte Ed25519][64-byte sig]
-				tm.handleAuthKeyExchange(buf[4:n], remote, false)
+				tm.handleAuthKeyExchange(buf[4:n], inbound.From, false)
 				continue
 
 			case protocol.TunnelMagicKeyEx:
 				// Key exchange packet: [PILK][4-byte nodeID][32-byte pubkey]
-				tm.handleKeyExchange(buf[4:n], remote, false)
+				tm.handleKeyExchange(buf[4:n], inbound.From, false)
 				continue
 
 			case protocol.TunnelMagicSecure:
 				// Encrypted packet: [PILS][4-byte nodeID][12-byte nonce][ciphertext+tag]
-				tm.handleEncrypted(buf[4:n], remote, false /* direct */)
+				tm.handleEncrypted(buf[4:n], inbound.From, false /* direct */)
 				continue
 
 			case protocol.TunnelMagicPunch:
@@ -1722,11 +1715,112 @@ func (tm *TunnelManager) dispatchLoop() {
 	}
 }
 
+func udpAddrFromEndpoint(ep transport.Endpoint) *net.UDPAddr {
+	udpEP, ok := ep.(*transport.UDPEndpoint)
+	if !ok || udpEP == nil {
+		return nil
+	}
+	return udpEP.Addr()
+}
+
+func turnAddrFromEndpoint(ep transport.Endpoint) string {
+	turnEP, ok := ep.(*transport.TURNEndpoint)
+	if !ok || turnEP == nil {
+		return ""
+	}
+	return turnEP.String()
+}
+
+// recordAuthenticatedIngress applies the reply-on-ingress rule after a
+// key exchange frame has been accepted. UDP sources update path.direct;
+// beacon sources mark relay mode; TURN sources install the peer's relay
+// address and CreatePermission without poisoning path.direct with a
+// relay IP.
+func (tm *TunnelManager) recordAuthenticatedIngress(nodeID uint32, from transport.Endpoint, fromRelay bool, forceTURNInstall bool) {
+	var turnAddr string
+	if !fromRelay {
+		turnAddr = turnAddrFromEndpoint(from)
+	}
+
+	tm.mu.Lock()
+	if fromRelay {
+		tm.updatePathRelay(nodeID)
+	} else if turnAddr != "" {
+		// Keep the peer visible/last-seen without treating the TURN
+		// allocation as a direct UDP endpoint.
+		tm.updatePathDirect(nodeID, nil)
+	} else {
+		tm.updatePathDirect(nodeID, udpAddrFromEndpoint(from))
+	}
+	tm.mu.Unlock()
+
+	if turnAddr != "" && forceTURNInstall {
+		if err := tm.AddPeerTURNEndpoint(nodeID, turnAddr); err != nil {
+			slog.Debug("authenticated ingress turn endpoint install failed",
+				"peer_node_id", nodeID, "addr", turnAddr, "error", err)
+		}
+	}
+}
+
+// refreshAuthenticatedIngress is the low-churn version used for
+// decrypted data frames. It updates path state only when the observed
+// ingress path differs from the current one.
+func (tm *TunnelManager) refreshAuthenticatedIngress(nodeID uint32, from transport.Endpoint, fromRelay bool) {
+	if fromRelay {
+		tm.mu.RLock()
+		p := tm.paths[nodeID]
+		stale := p == nil || !p.viaRelay
+		tm.mu.RUnlock()
+		if stale {
+			tm.mu.Lock()
+			tm.updatePathRelay(nodeID)
+			tm.mu.Unlock()
+		}
+		return
+	}
+
+	if turnAddr := turnAddrFromEndpoint(from); turnAddr != "" {
+		tm.mu.RLock()
+		p := tm.paths[nodeID]
+		cur := tm.peerTURN[nodeID]
+		stalePath := p == nil
+		staleTurn := cur == nil || cur.String() != turnAddr
+		tm.mu.RUnlock()
+		if stalePath {
+			tm.mu.Lock()
+			tm.updatePathDirect(nodeID, nil)
+			tm.mu.Unlock()
+		}
+		if staleTurn {
+			if err := tm.AddPeerTURNEndpoint(nodeID, turnAddr); err != nil {
+				slog.Debug("encrypted ingress turn endpoint install failed",
+					"peer_node_id", nodeID, "addr", turnAddr, "error", err)
+			}
+		}
+		return
+	}
+
+	fromUDP := udpAddrFromEndpoint(from)
+	if fromUDP == nil {
+		return
+	}
+	tm.mu.RLock()
+	p := tm.paths[nodeID]
+	stale := p == nil || p.viaRelay || p.direct == nil ||
+		p.direct.Port != fromUDP.Port || !p.direct.IP.Equal(fromUDP.IP)
+	tm.mu.RUnlock()
+	if stale {
+		tm.mu.Lock()
+		tm.updatePathDirect(nodeID, fromUDP)
+		tm.mu.Unlock()
+	}
+}
+
 // handleAuthKeyExchange processes an authenticated key exchange packet.
 // Format: [4-byte nodeID][32-byte X25519 pubkey][32-byte Ed25519 pubkey][64-byte Ed25519 signature]
 // The signature is over: "auth:" + nodeID(4 bytes) + X25519-pubkey(32 bytes)
 // fromRelay indicates this was received via beacon relay — don't update peer endpoint.
-func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, fromRelay bool) {
+func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from transport.Endpoint, fromRelay bool) {
 	if len(data) < 4+32+32+64 {
 		return
 	}
@@ -1736,15 +1830,7 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 	peerEd25519PubKey := ed25519.PublicKey(data[36:68])
 	signature := data[68:132]
 
-	// Optional trailing varint: peer's capability bitmap. Older
-	// daemons don't emit anything after byte 132; for them peerCaps
-	// stays at its zero value and the gossip engine skips the peer.
-	var peerCaps uint64
-	if len(data) > 132 {
-		if c, n := binary.Uvarint(data[132:]); n > 0 {
-			peerCaps = c
-		}
-	}
+	peerCaps, kexFlags := parseAuthKEXTrailer(data[132:])
 
 	if !tm.encrypt || tm.privKey == nil {
 		return
@@ -1802,18 +1888,27 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 	oldPC := tm.crypto[peerNodeID]
 	hadCrypto := oldPC != nil
 	keyChanged := hadCrypto && oldPC.peerX25519Key != pc.peerX25519Key
-	tm.crypto[peerNodeID] = pc
-	// Reply-on-ingress: update the peer's path based on where this
-	// authenticated frame actually arrived from.
-	if fromRelay {
-		tm.updatePathRelay(peerNodeID)
+	if hadCrypto && !keyChanged {
+		oldPC.authenticated = true
+		pc = oldPC
 	} else {
-		tm.updatePathDirect(peerNodeID, from)
+		tm.crypto[peerNodeID] = pc
 	}
 	// Cache the peer's Ed25519 pubkey and advertised caps bitmap.
 	tm.peerPubKeys[peerNodeID] = peerEd25519PubKey
 	tm.peerCaps[peerNodeID] = peerCaps
+	shouldReply := !hadCrypto || keyChanged
+	if !shouldReply && kexFlags&authKEXFlagRequest != 0 {
+		now := time.Now()
+		last := tm.lastAuthKEXResponse[peerNodeID]
+		if last.IsZero() || now.Sub(last) >= authKEXResponseInterval {
+			tm.lastAuthKEXResponse[peerNodeID] = now
+			shouldReply = true
+		}
+	}
 	tm.mu.Unlock()
+
+	tm.recordAuthenticatedIngress(peerNodeID, from, fromRelay, true)
 
 	if keyChanged {
 		slog.Info("peer rekeyed (auth), re-establishing tunnel", "peer_node_id", peerNodeID)
@@ -1825,17 +1920,17 @@ func (tm *TunnelManager) handleAuthKeyExchange(data []byte, from *net.UDPAddr, f
 		"relay": fromRelay, "rekeyed": keyChanged,
 	})
 
-	if !hadCrypto || keyChanged {
+	if shouldReply {
 		// v1.9.0-jf.12: pass the observed source so the reply lands
 		// at the peer's freshly-observed address, not a stale
 		// path.direct. Skipped (nil) for relay-delivered frames so
 		// writeFrame's tier-1 (beacon-relay) keeps routing the reply
 		// back through the relay path.
-		var src *net.UDPAddr
+		var src transport.Endpoint
 		if !fromRelay {
 			src = from
 		}
-		tm.sendKeyExchangeToNode(peerNodeID, src)
+		tm.sendKeyExchangeToEndpoint(peerNodeID, src, authKEXFlagResponse)
 	}
 
 	tm.flushPending(peerNodeID)
@@ -1862,7 +1957,7 @@ func (tm *TunnelManager) notifyRekey(peerNodeID uint32) {
 // If we have an identity and the peer has a registered pubkey, reject unauthenticated
 // exchange and require authenticated (PILA) instead.
 // fromRelay indicates this was received via beacon relay — don't update peer endpoint.
-func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromRelay bool) {
+func (tm *TunnelManager) handleKeyExchange(data []byte, from transport.Endpoint, fromRelay bool) {
 	if len(data) < 36 {
 		return
 	}
@@ -1887,11 +1982,11 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 			// v1.9.0-jf.12: nudge the peer with our auth'd key
 			// exchange. Use the observed source addr so we don't
 			// nudge into a stale cached endpoint.
-			var src *net.UDPAddr
+			var src transport.Endpoint
 			if !fromRelay {
 				src = from
 			}
-			tm.sendKeyExchangeToNode(peerNodeID, src)
+			tm.sendKeyExchangeToEndpoint(peerNodeID, src, authKEXFlagResponse)
 			return
 		}
 	}
@@ -1909,13 +2004,9 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 	// Detect rekeying: peer restarted with a new keypair
 	keyChanged := hadCrypto && oldPC.peerX25519Key != pc.peerX25519Key
 	tm.crypto[peerNodeID] = pc
-	// Reply-on-ingress path update.
-	if fromRelay {
-		tm.updatePathRelay(peerNodeID)
-	} else {
-		tm.updatePathDirect(peerNodeID, from)
-	}
 	tm.mu.Unlock()
+
+	tm.recordAuthenticatedIngress(peerNodeID, from, fromRelay, false)
 
 	if keyChanged {
 		slog.Info("peer rekeyed, re-establishing tunnel", "peer_node_id", peerNodeID)
@@ -1931,11 +2022,11 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 	if !hadCrypto || keyChanged {
 		// v1.9.0-jf.12: prefer observed source over cached path.direct
 		// so post-rotation handshakes converge in one round trip.
-		var src *net.UDPAddr
+		var src transport.Endpoint
 		if !fromRelay {
 			src = from
 		}
-		tm.sendKeyExchangeToNode(peerNodeID, src)
+		tm.sendKeyExchangeToEndpoint(peerNodeID, src, 0)
 	}
 
 	// Flush any pending packets now that encryption is ready
@@ -1953,7 +2044,7 @@ func (tm *TunnelManager) handleKeyExchange(data []byte, from *net.UDPAddr, fromR
 // relay envelope (true) or arrived direct on the UDP socket (false).
 // Used to update the peer's path state via the reply-on-ingress rule
 // (v1.9.0-jf.4).
-func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr, fromRelay bool) {
+func (tm *TunnelManager) handleEncrypted(data []byte, from transport.Endpoint, fromRelay bool) {
 	if len(data) < 4+12+16 { // nodeID + nonce + min GCM tag
 		return
 	}
@@ -2023,48 +2114,11 @@ func (tm *TunnelManager) handleEncrypted(data []byte, from *net.UDPAddr, fromRel
 	atomic.AddUint64(&tm.PktsRecv, 1)
 	atomic.AddUint64(&tm.BytesRecv, uint64(len(data)+4)) // +4 for PILS magic
 
-	// Reply-on-ingress path update (v1.9.0-jf.4).
-	//
-	// Direct frame: update path.direct so subsequent writeFrame calls
-	// follow the peer's current UDP endpoint. Handles CGN-style NAT
-	// port rotation observed live on a UAE ISP — the tunnel stays
-	// alive from keepalives, but fresh stream SYNs were going to the
-	// stale mapping before this refresh existed.
-	//
-	// Relay frame: flip path.viaRelay = true so our next outbound
-	// traffic to this peer routes through the beacon, symmetric with
-	// how the inbound arrived. Do NOT touch path.direct — we keep
-	// the last-known-good direct endpoint so direct can resume if
-	// reachability returns.
-	//
-	// Two-phase lock check avoids write-lock churn when state is
-	// already current, which is the steady-state case.
-	if from != nil {
-		tm.mu.RLock()
-		p := tm.paths[peerNodeID]
-		var stale bool
-		if p == nil {
-			stale = true
-		} else if fromRelay {
-			stale = !p.viaRelay
-		} else {
-			// direct — stale if viaRelay is set OR direct addr differs.
-			stale = p.viaRelay || p.direct == nil || p.direct.Port != from.Port || !p.direct.IP.Equal(from.IP)
-		}
-		tm.mu.RUnlock()
-		if stale {
-			tm.mu.Lock()
-			if fromRelay {
-				tm.updatePathRelay(peerNodeID)
-			} else {
-				tm.updatePathDirect(peerNodeID, from)
-			}
-			tm.mu.Unlock()
-		}
-	}
+	tm.refreshAuthenticatedIngress(peerNodeID, from, fromRelay)
 
+	fromUDP := udpAddrFromEndpoint(from)
 	select {
-	case tm.recvCh <- &IncomingPacket{Packet: pkt, From: from}:
+	case tm.recvCh <- &IncomingPacket{Packet: pkt, From: fromUDP}:
 	case <-tm.done:
 	}
 }
@@ -2142,17 +2196,16 @@ func (tm *TunnelManager) deriveSecret(peerPubKeyBytes []byte) (*peerCrypto, erro
 // or the SendTo queue path — none of which have an inbound frame to
 // react to), we fall back to path.direct as before. (v1.9.0-jf.12)
 func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32, observedSrc *net.UDPAddr) {
+	var observed transport.Endpoint
+	if observedSrc != nil {
+		observed = transport.NewUDPEndpoint(observedSrc)
+	}
+	tm.sendKeyExchangeToEndpoint(peerNodeID, observed, 0)
+}
+
+func (tm *TunnelManager) sendKeyExchangeToEndpoint(peerNodeID uint32, observed transport.Endpoint, authFlags uint64) {
 	tm.mu.RLock()
 	hasIdentity := tm.identity != nil
-	// Resolve the destination addr. Prefer the observed source from a
-	// reactive handshake; only consult the cache when the caller had
-	// nothing fresher to offer.
-	addr := observedSrc
-	if addr == nil {
-		if p := tm.paths[peerNodeID]; p != nil {
-			addr = p.direct
-		}
-	}
 	tm.mu.RUnlock()
 
 	frame := tm.buildKeyExchangeFrame()
@@ -2161,15 +2214,111 @@ func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32, observedSrc *n
 	}
 
 	if hasIdentity {
-		authFrame := tm.buildAuthKeyExchangeFrame()
+		authFrame := tm.buildAuthKeyExchangeFrameWithFlags(authFlags)
 		if authFrame != nil {
 			frame = authFrame
 		}
 	}
 
-	if err := tm.writeFrame(peerNodeID, addr, frame); err != nil {
+	if err := tm.writeFrameToEndpoint(peerNodeID, observed, frame); err != nil {
 		slog.Error("send key exchange failed", "peer_node_id", peerNodeID, "error", err)
 	}
+}
+
+func (tm *TunnelManager) writeFrameToEndpoint(nodeID uint32, ep transport.Endpoint, frame []byte) error {
+	switch observed := ep.(type) {
+	case nil:
+		return tm.writeFrame(nodeID, nil, frame)
+	case *transport.UDPEndpoint:
+		return tm.writeFrame(nodeID, observed.Addr(), frame)
+	case *transport.TURNEndpoint:
+		return tm.writeFrameToTURNEndpoint(nodeID, observed, frame)
+	default:
+		return tm.writeFrame(nodeID, nil, frame)
+	}
+}
+
+func (tm *TunnelManager) writeFrameToTURNEndpoint(nodeID uint32, ep *transport.TURNEndpoint, frame []byte) error {
+	if ep == nil {
+		return tm.writeFrame(nodeID, nil, frame)
+	}
+	if err := tm.AddPeerTURNEndpoint(nodeID, ep.String()); err != nil {
+		return err
+	}
+
+	tm.mu.RLock()
+	cached := tm.peerConns[nodeID]
+	t := tm.turn
+	udpT := tm.udp
+	tm.mu.RUnlock()
+
+	if cached != nil && cached.RemoteEndpoint() != nil &&
+		cached.RemoteEndpoint().Network() == "turn" &&
+		cached.RemoteEndpoint().String() == ep.String() {
+		err := cached.Send(frame)
+		tm.recordTierSend(SendTierCachedConn, nodeID, len(frame),
+			ep.String(), false, err)
+		if err == nil {
+			atomic.AddUint64(&tm.PktsSent, 1)
+			atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+			return nil
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var (
+		conn transport.DialedConn
+		err  error
+	)
+	if t != nil {
+		conn, err = t.Dial(ctx, ep)
+	} else if udpT != nil {
+		conn, err = transport.DialTURNRelayViaUDP(udpT, ep)
+	} else {
+		err = fmt.Errorf("turn endpoint send: no turn or udp transport")
+	}
+	if err != nil {
+		tm.recordTierSend(SendTierJF9Fallback, nodeID, len(frame),
+			ep.String(), false, err)
+		return err
+	}
+
+	var closeOld transport.DialedConn
+	tm.mu.Lock()
+	if existing := tm.peerConns[nodeID]; existing != nil &&
+		existing.RemoteEndpoint() != nil &&
+		existing.RemoteEndpoint().Network() == "turn" &&
+		existing.RemoteEndpoint().String() == ep.String() {
+		tm.mu.Unlock()
+		_ = conn.Close()
+		err := existing.Send(frame)
+		tm.recordTierSend(SendTierCachedConn, nodeID, len(frame),
+			ep.String(), false, err)
+		if err == nil {
+			atomic.AddUint64(&tm.PktsSent, 1)
+			atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+		}
+		return err
+	}
+	if existing := tm.peerConns[nodeID]; existing != nil {
+		closeOld = existing
+	}
+	tm.peerConns[nodeID] = conn
+	tm.mu.Unlock()
+	if closeOld != nil {
+		_ = closeOld.Close()
+	}
+
+	err = conn.Send(frame)
+	tm.recordTierSend(SendTierJF9Fallback, nodeID, len(frame),
+		ep.String(), false, err)
+	if err == nil {
+		atomic.AddUint64(&tm.PktsSent, 1)
+		atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+	}
+	return err
 }
 
 // buildAuthKeyExchangeFrame builds an authenticated key exchange frame.
@@ -2182,12 +2331,17 @@ func (tm *TunnelManager) sendKeyExchangeToNode(peerNodeID uint32, observedSrc *n
 //	[8:40]    our X25519 pubkey (32B)
 //	[40:72]   our Ed25519 pubkey (32B)
 //	[72:136]  signature over "auth" || nodeID || X25519pub
-//	[136:]    OPTIONAL varint capability bitmap (see gossip.CapGossip)
+//	[136:]    OPTIONAL varint capability bitmap, then optional KEX flags
 //
 // Older daemons truncate at byte 136 and never read the trailing
-// varint, preserving backward compatibility; newer daemons read the
-// remainder as Uvarint and treat parse errors / absent bytes as 0.
+// varints, preserving backward compatibility; newer daemons read caps
+// first and then request/response flags. A flags-only frame emits caps=0
+// first so old peers do not confuse flags for gossip capabilities.
 func (tm *TunnelManager) buildAuthKeyExchangeFrame() []byte {
+	return tm.buildAuthKeyExchangeFrameWithFlags(0)
+}
+
+func (tm *TunnelManager) buildAuthKeyExchangeFrameWithFlags(kexFlags uint64) []byte {
 	tm.mu.RLock()
 	id := tm.identity
 	caps := tm.localCaps
@@ -2205,29 +2359,61 @@ func (tm *TunnelManager) buildAuthKeyExchangeFrame() []byte {
 	ed25519PubKey := []byte(id.PublicKey)
 
 	base := 4 + 4 + 32 + 32 + 64
-	var capsBuf [binary.MaxVarintLen64]byte
-	var capsLen int
-	if caps != 0 {
-		capsLen = binary.PutUvarint(capsBuf[:], caps)
+	var trailer [2 * binary.MaxVarintLen64]byte
+	var trailerLen int
+	if caps != 0 || kexFlags != 0 {
+		trailerLen += binary.PutUvarint(trailer[trailerLen:], caps)
 	}
-	frame := make([]byte, base+capsLen)
+	if kexFlags != 0 {
+		trailerLen += binary.PutUvarint(trailer[trailerLen:], kexFlags)
+	}
+	frame := make([]byte, base+trailerLen)
 	copy(frame[0:4], protocol.TunnelMagicAuthEx[:])
 	binary.BigEndian.PutUint32(frame[4:8], tm.loadNodeID())
 	copy(frame[8:40], tm.pubKey)
 	copy(frame[40:72], ed25519PubKey)
 	copy(frame[72:136], signature)
-	if capsLen > 0 {
-		copy(frame[136:], capsBuf[:capsLen])
+	if trailerLen > 0 {
+		copy(frame[136:], trailer[:trailerLen])
 	}
 	return frame
 }
 
-// recoveryPILAInterval bounds how often we emit an unsolicited
-// authenticated key-exchange (PILA) frame to a peer we have no
-// crypto state for. Short enough to recover within a single gossip
-// tick after a one-sided daemon restart, long enough that a
-// spoofed nodeID can't turn us into a PILA amplifier.
-const recoveryPILAInterval = 60 * time.Second
+const (
+	authKEXFlagRequest  uint64 = 1 << 0
+	authKEXFlagResponse uint64 = 1 << 1
+
+	// recoveryPILAInterval bounds how often we emit an unsolicited
+	// authenticated key-exchange (PILA) frame to a peer we have no
+	// crypto state for. Short enough to recover within a single gossip
+	// tick after a one-sided daemon restart, long enough that a
+	// spoofed nodeID can't turn us into a PILA amplifier.
+	recoveryPILAInterval = 60 * time.Second
+
+	// authKEXResponseInterval bounds repeated responses to verified
+	// same-key recovery requests. This closes the lost-first-response
+	// deadlock without turning duplicate PILA requests into a packet echo.
+	authKEXResponseInterval = 5 * time.Second
+)
+
+func parseAuthKEXTrailer(trailer []byte) (caps uint64, flags uint64) {
+	if len(trailer) == 0 {
+		return 0, 0
+	}
+	c, n := binary.Uvarint(trailer)
+	if n <= 0 {
+		return 0, 0
+	}
+	caps = c
+	if len(trailer) <= n {
+		return caps, 0
+	}
+	f, m := binary.Uvarint(trailer[n:])
+	if m > 0 {
+		flags = f
+	}
+	return caps, flags
+}
 
 // maybeSendRecoveryPILA emits an unsolicited PILA to the observed
 // source address when we receive an encrypted packet we cannot
@@ -2251,7 +2437,7 @@ const recoveryPILAInterval = 60 * time.Second
 // wrap the PILA in a MsgRelay envelope so it travels the same path
 // back. Direct-path senders see addr = peer's actual UDP endpoint and
 // viaRelay = false.
-func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr, viaRelay bool) {
+func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, from transport.Endpoint, viaRelay bool) {
 	// v1.9.0-jf.15.6: do NOT bail when addr==nil for the non-relay
 	// case. Frames delivered through pion TURN arrive at the inbound
 	// loop wrapped as *transport.TURNEndpoint, not *UDPEndpoint, so
@@ -2281,7 +2467,7 @@ func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr,
 	bAddr := tm.beaconAddr
 	tm.mu.Unlock()
 
-	frame := tm.buildAuthKeyExchangeFrame()
+	frame := tm.buildAuthKeyExchangeFrameWithFlags(authKEXFlagRequest)
 	if frame == nil {
 		// Identity or X25519 key isn't loaded yet — nothing to send.
 		return
@@ -2329,11 +2515,11 @@ func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr,
 	// writeFrame's caller-supplied addr precedence (jf.12) applies —
 	// but writeFrame will substitute path.direct or null-out addr per
 	// its existing tier rules (jf.10's hasTURNEp drop, etc).
-	if err := tm.writeFrame(nodeID, addr, frame); err != nil {
-		slog.Debug("recovery PILA send failed", "peer_node_id", nodeID, "addr", addr, "error", err)
+	if err := tm.writeFrameToEndpoint(nodeID, from, frame); err != nil {
+		slog.Debug("recovery PILA send failed", "peer_node_id", nodeID, "endpoint", from, "error", err)
 		return
 	}
-	slog.Info("sent recovery PILA to peer with unknown key", "peer_node_id", nodeID, "addr", addr)
+	slog.Info("sent recovery PILA to peer with unknown key", "peer_node_id", nodeID, "endpoint", from)
 }
 
 // buildKeyExchangeFrame builds an unauthenticated key exchange frame.
@@ -2541,6 +2727,7 @@ func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	delete(tm.peerTCP, nodeID)
 	delete(tm.peerTURN, nodeID)
 	delete(tm.lastRecoveryPILA, nodeID)
+	delete(tm.lastAuthKEXResponse, nodeID)
 	// peerConns owns a DialedConn — close before deleting so the
 	// underlying TCP/QUIC socket is released.
 	if conn, ok := tm.peerConns[nodeID]; ok {
@@ -2723,16 +2910,17 @@ func (tm *TunnelManager) handleRelayDeliver(data []byte) {
 	// use the fromRelay=true flag for path routing, not this addr;
 	// this addr only surfaces to IncomingPacket.From for logging.
 	srcAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	srcEP := transport.NewUDPEndpoint(srcAddr)
 
 	// Process the inner tunnel frame
 	magic := [4]byte{payload[0], payload[1], payload[2], payload[3]}
 	switch magic {
 	case protocol.TunnelMagicAuthEx:
-		tm.handleAuthKeyExchange(payload[4:], srcAddr, true)
+		tm.handleAuthKeyExchange(payload[4:], srcEP, true)
 	case protocol.TunnelMagicKeyEx:
-		tm.handleKeyExchange(payload[4:], srcAddr, true)
+		tm.handleKeyExchange(payload[4:], srcEP, true)
 	case protocol.TunnelMagicSecure:
-		tm.handleEncrypted(payload[4:], srcAddr, true /* fromRelay */)
+		tm.handleEncrypted(payload[4:], srcEP, true /* fromRelay */)
 	case protocol.TunnelMagic:
 		if len(payload) < 4+protocol.PacketHeaderSize() {
 			return
