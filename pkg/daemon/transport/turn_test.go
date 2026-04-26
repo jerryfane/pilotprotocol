@@ -442,6 +442,79 @@ func TestTURNTransport_CreatePermission(t *testing.T) {
 	}
 }
 
+func TestTURNTransport_CreatePermissionFailureKeepsDesiredPermission(t *testing.T) {
+	serverAddr, cleanup := turnTestServer(t, map[string]string{"u": "p"})
+	defer cleanup()
+
+	prov := newRotatingProvider(&turncreds.Credentials{
+		ServerAddr: serverAddr, Transport: "udp", Username: "u", Password: "p",
+	})
+	defer prov.Close()
+
+	sink := make(chan InboundFrame, 4)
+	tr := NewTURNTransport(prov, sink)
+	if err := tr.Listen("", sink); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer tr.Close()
+
+	tr.mu.RLock()
+	peerSock := tr.peerSock
+	tr.mu.RUnlock()
+	if peerSock == nil {
+		t.Fatalf("peerSock is nil after Listen")
+	}
+	_ = peerSock.Close()
+
+	const addr = "192.0.2.88:38000"
+	if err := tr.CreatePermission(addr); err == nil {
+		t.Fatalf("CreatePermission unexpectedly succeeded after closing peer socket")
+	}
+	if !stringInSlice(tr.PermittedAddrs(), addr) {
+		t.Fatalf("failed permission target %q not retained: %v", addr, tr.PermittedAddrs())
+	}
+}
+
+func TestTURNTransport_DialRecordsPermissionTarget(t *testing.T) {
+	serverAddr, cleanup := turnTestServer(t, map[string]string{"u": "p"})
+	defer cleanup()
+
+	prov := newRotatingProvider(&turncreds.Credentials{
+		ServerAddr: serverAddr, Transport: "udp", Username: "u", Password: "p",
+	})
+	defer prov.Close()
+
+	sink := make(chan InboundFrame, 4)
+	tr := NewTURNTransport(prov, sink)
+	if err := tr.Listen("", sink); err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer tr.Close()
+
+	const addr = "192.0.2.99:38000"
+	ep, err := NewTURNEndpoint(addr)
+	if err != nil {
+		t.Fatalf("NewTURNEndpoint: %v", err)
+	}
+	conn, err := tr.Dial(context.Background(), ep)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	_ = conn.Close()
+	if !stringInSlice(tr.PermittedAddrs(), addr) {
+		t.Fatalf("Dial did not record permission target %q: %v", addr, tr.PermittedAddrs())
+	}
+}
+
+func stringInSlice(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestTURNTransport_CreatePermission_BeforeListen locks in that
 // CreatePermission rejects calls made before Listen has allocated a
 // client. The error message is surfaced to callers so the asymmetric
@@ -592,4 +665,3 @@ func TestTURNTransport_PermissionSurvivesRotation(t *testing.T) {
 		t.Fatalf("permitAddr %q missing after rotation; perms=%v", permitAddr, perms)
 	}
 }
-

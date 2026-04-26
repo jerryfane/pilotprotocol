@@ -2,7 +2,9 @@ package transport
 
 import (
 	"errors"
+	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -64,6 +66,30 @@ func TestSelfHeal_ThresholdReachedButRecentSuccessDoesntNudge(t *testing.T) {
 		t.Fatalf("self-heal nudged inside the stale window (recent success)")
 	default:
 		// good — count threshold met but stale window not breached
+	}
+}
+
+func TestSelfHeal_FatalTURNErrorBypassesRecentSuccess(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.recordSuccess()
+	tr.recordTURNError(&net.OpError{Op: "write", Err: syscall.ENOBUFS})
+	select {
+	case <-tr.selfHealCh:
+		// good: local socket exhaustion is not transient TURN packet loss
+	default:
+		t.Fatalf("fatal TURN socket error did not nudge self-heal")
+	}
+}
+
+func TestSelfHeal_FatalTURNErrorTextFallback(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.recordSuccess()
+	tr.recordTURNError(errors.New("write udp4 0.0.0.0:52246->141.101.90.1:3478: sendto: cannot allocate memory"))
+	select {
+	case <-tr.selfHealCh:
+		// good: Darwin has surfaced this exact text in production logs
+	default:
+		t.Fatalf("fatal TURN socket text did not nudge self-heal")
 	}
 }
 
@@ -282,6 +308,74 @@ func TestSelfHeal_RecordHelpersExist(t *testing.T) {
 	if tr.consecutiveFailures.Load() != 0 {
 		t.Fatalf("recordSuccess didn't reset counter: %d",
 			tr.consecutiveFailures.Load())
+	}
+}
+
+type fakePacketConn struct {
+	writeErr error
+}
+
+func (f *fakePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+
+func (f *fakePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return len(p), nil
+}
+
+func (f *fakePacketConn) Close() error { return nil }
+
+func (f *fakePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}
+}
+
+func (f *fakePacketConn) SetDeadline(time.Time) error      { return nil }
+func (f *fakePacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (f *fakePacketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSelfHeal_TurnDialedConnSendFailureRecordsFailure(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.mu.Lock()
+	tr.relay = &fakePacketConn{writeErr: &net.OpError{Op: "write", Err: syscall.ENOBUFS}}
+	tr.mu.Unlock()
+
+	conn := &turnDialedConn{
+		peerAddr:  &net.UDPAddr{IP: net.ParseIP("192.0.2.55"), Port: 12345},
+		transport: tr,
+	}
+	if err := conn.Send([]byte("frame")); err == nil {
+		t.Fatalf("Send unexpectedly succeeded")
+	}
+	if got := tr.consecutiveFailures.Load(); got == 0 {
+		t.Fatalf("turnDialedConn.Send did not record failure")
+	}
+	select {
+	case <-tr.selfHealCh:
+		// good: fatal WriteTo error nudges self-heal
+	default:
+		t.Fatalf("turnDialedConn.Send fatal error did not nudge self-heal")
+	}
+}
+
+func TestSelfHeal_TurnDialedConnSendSuccessRecordsSuccess(t *testing.T) {
+	tr := NewTURNTransport(nil, nil)
+	tr.consecutiveFailures.Store(3)
+	tr.mu.Lock()
+	tr.relay = &fakePacketConn{}
+	tr.mu.Unlock()
+
+	conn := &turnDialedConn{
+		peerAddr:  &net.UDPAddr{IP: net.ParseIP("192.0.2.55"), Port: 12345},
+		transport: tr,
+	}
+	if err := conn.Send([]byte("frame")); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := tr.consecutiveFailures.Load(); got != 0 {
+		t.Fatalf("successful turnDialedConn.Send did not reset failures: %d", got)
 	}
 }
 

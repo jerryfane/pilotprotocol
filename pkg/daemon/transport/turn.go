@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/pion/logging"
@@ -145,9 +147,9 @@ func (e *TURNEndpoint) Addr() *net.UDPAddr {
 // deliver via the shared sink identically to UDP/TCP.
 type TURNTransport struct {
 	mu       sync.RWMutex
-	client   *turn.Client     // current pion TURN client; nil before Listen, nil after Close
-	relay    net.PacketConn   // current assigned relay socket
-	peerSock net.PacketConn   // raw socket underneath the client (kept for Close)
+	client   *turn.Client   // current pion TURN client; nil before Listen, nil after Close
+	relay    net.PacketConn // current assigned relay socket
+	peerSock net.PacketConn // raw socket underneath the client (kept for Close)
 	provider turncreds.Provider
 	sink     chan<- InboundFrame
 
@@ -157,8 +159,11 @@ type TURNTransport struct {
 
 	getTimeout time.Duration
 
-	// permittedAddrs records host:port strings for which we have
-	// issued a CreatePermission against the current pion client.
+	// permittedAddrs records host:port strings for which we want a
+	// CreatePermission on the current pion client. The address is
+	// recorded before the pion call succeeds so a broken allocation
+	// cannot make us forget the permission target; rotate/self-heal
+	// replays this desired set against the next allocation.
 	// Value is the wall-clock of the last refresh attempt; used only
 	// for diagnostics / future eviction. Protected by mu.
 	permittedAddrs map[string]time.Time
@@ -425,7 +430,7 @@ func (t *TURNTransport) SendViaOwnRelay(peerAddr net.Addr, frame []byte) error {
 	}
 	_, err := relay.WriteTo(frame, peerAddr)
 	if err != nil {
-		t.recordFailure()
+		t.recordTURNError(err)
 	} else {
 		t.recordSuccess()
 	}
@@ -471,16 +476,21 @@ func (t *TURNTransport) CreatePermission(addr string) error {
 		return errors.New("turn transport: not listening")
 	}
 
+	now := time.Now()
+	t.mu.Lock()
+	if t.permittedAddrs == nil {
+		t.permittedAddrs = make(map[string]time.Time)
+	}
+	t.permittedAddrs[addr] = now
+	t.mu.Unlock()
+
 	if err := client.CreatePermission(ua); err != nil {
-		t.recordFailure()
+		t.recordTURNError(err)
 		return fmt.Errorf("turn create permission %s: %w", addr, err)
 	}
 	t.recordSuccess()
 
 	t.mu.Lock()
-	if t.permittedAddrs == nil {
-		t.permittedAddrs = make(map[string]time.Time)
-	}
 	t.permittedAddrs[addr] = time.Now()
 	t.mu.Unlock()
 	return nil
@@ -567,7 +577,7 @@ func (t *TURNTransport) refreshAllPermissions() {
 			// triggered heal even when its internal permission
 			// refreshes were failing for hours. Now both code
 			// paths converge on the same health signal.
-			t.recordFailure()
+			t.recordTURNError(err)
 			continue
 		}
 		t.recordSuccess()
@@ -606,10 +616,9 @@ func (t *TURNTransport) Dial(ctx context.Context, ep Endpoint) (DialedConn, erro
 	}
 
 	t.mu.RLock()
-	client := t.client
 	hasRelay := t.relay != nil
 	t.mu.RUnlock()
-	if !hasRelay || client == nil {
+	if !hasRelay {
 		return nil, errors.New("turn transport: not listening")
 	}
 
@@ -619,8 +628,8 @@ func (t *TURNTransport) Dial(ctx context.Context, ep Endpoint) (DialedConn, erro
 	// CreatePermission. Without this step, the peer's Send indication
 	// arrives on our relay and is dropped by our allocation for lack
 	// of permission.
-	if err := client.CreatePermission(tep.addr); err != nil {
-		return nil, fmt.Errorf("turn create permission %s: %w", tep.addr, err)
+	if err := t.CreatePermission(tep.addr.String()); err != nil {
+		return nil, err
 	}
 
 	return &turnDialedConn{
@@ -920,7 +929,7 @@ func (t *TURNTransport) runConsentProbe() {
 	if _, err := client.SendBindingRequest(); err != nil {
 		slog.Debug("turn: consent probe failed",
 			"error", err)
-		t.recordFailure()
+		t.recordTURNError(err)
 		return
 	}
 	t.recordSuccess()
@@ -971,10 +980,47 @@ func (t *TURNTransport) recordFailure() {
 	}
 	// Non-blocking nudge: if the channel is already full, the loop
 	// will already process when it picks up the existing signal.
+	t.nudgeSelfHeal()
+}
+
+func (t *TURNTransport) recordTURNError(err error) {
+	if isFatalTURNError(err) {
+		t.recordFatalFailure(err)
+		return
+	}
+	t.recordFailure()
+}
+
+func (t *TURNTransport) recordFatalFailure(err error) {
+	t.consecutiveFailures.Add(1)
+	if t.nudgeSelfHeal() {
+		slog.Warn("turn: fatal transport error; triggering self-heal",
+			"error", err)
+	}
+}
+
+func (t *TURNTransport) nudgeSelfHeal() bool {
 	select {
 	case t.selfHealCh <- struct{}{}:
+		return true
 	default:
+		return false
 	}
+}
+
+func isFatalTURNError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "sendto: cannot allocate memory") ||
+		strings.Contains(text, "no buffer space available") ||
+		strings.Contains(text, "use of closed network connection")
 }
 
 // selfHealLoop is the goroutine that responds to recordFailure
@@ -1229,8 +1275,10 @@ func (c *turnDialedConn) Send(frame []byte) error {
 
 	_, err := relay.WriteTo(frame, c.peerAddr)
 	if err != nil {
+		c.transport.recordTURNError(err)
 		return fmt.Errorf("turn write to %s: %w", c.peerAddr, err)
 	}
+	c.transport.recordSuccess()
 	return nil
 }
 
