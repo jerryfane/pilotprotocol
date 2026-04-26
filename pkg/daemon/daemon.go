@@ -2571,6 +2571,20 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	// hammer the rendezvous on every retry of a stuck peer.
 	rendezvousQueried := false
 
+	// v1.9.0-jf.15.4: when directRetries=0 (set by jf.12.1's
+	// outbound-turn-only shortcut OR by the already-relay-active
+	// path), the original `retries == directRetries` gate at the
+	// timer-fire site is dead code — retries is always >=1 after
+	// the increment, so neither the rendezvous lookup nor the
+	// TCP/relay-switch fallback ever fires. Compute the actual
+	// trigger retry-count as max(directRetries, 1) so outbound-
+	// turn-only peers do exercise the fallback path on the first
+	// timer tick after the initial SYN, not silently never.
+	fallbackTriggerAt := directRetries
+	if fallbackTriggerAt < 1 {
+		fallbackTriggerAt = 1
+	}
+
 	// v1.9.0-jf.11a.3: Race direct + relay concurrently. While the
 	// main retry loop drives direct UDP retransmissions (phase 1),
 	// a parallel goroutine re-transmits the same SYN through the
@@ -2636,7 +2650,14 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 			// Switch fallback transport after direct UDP retries exhaust.
 			// Prefer TCP direct-connect (lower latency than relay) if the
 			// peer advertised a TCP endpoint; else fall back to relay.
-			if retries == directRetries && !relayActive {
+			//
+			// v1.9.0-jf.15.4: gate uses fallbackTriggerAt = max(directRetries, 1)
+			// to handle directRetries==0 correctly (outbound-turn-only and
+			// already-relay-active paths). The original `retries == directRetries`
+			// gate was dead code in those modes since retries is always >=1
+			// after the increment above. Once the block fires (relayActive=true
+			// or TCP switched), subsequent ticks fall through unchanged.
+			if retries == fallbackTriggerAt && !relayActive {
 				// v1.9.0-jf.14: before falling back to TCP/relay,
 				// consult the rendezvous service once per dial. The
 				// most common cause of phase-1 timeout for hide-ip

@@ -10,6 +10,119 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.4] - 2026-04-26
+
+Fix dead-code gate that prevented the rendezvous lookup AND the
+TCP/relay-switch fallback from ever firing in outbound-turn-only
+mode. Discovered while debugging why jf.15.3's bilateral cross-
+permission wasn't completing convergence: laptop's pilot showed
+zero "rendezvous installed fresh turn endpoint" log lines despite
+many entmoot reconcile retries.
+
+### Fixed
+
+- **`DialConnection`'s fallback gate fires correctly when
+  `directRetries==0`.** jf.12.1 introduced `directRetries=0` as a
+  shortcut for outbound-turn-only peers (skip the cosmetic
+  direct-UDP retry budget). jf.14 added the rendezvous lookup
+  hook inside `if retries == directRetries && !relayActive`.
+  But `retries` is incremented BEFORE that check, so when
+  `directRetries==0` the check `retries == 0` is **never true**
+  — both the rendezvous lookup and the TCP/relay-switch logic
+  are dead code in outbound-turn-only mode.
+
+  Live evidence 2026-04-26: laptop on jf.15.3 with
+  `-rendezvous-url` set, full debug logging, but `grep -E
+  "rendezvous installed fresh turn endpoint|rendezvous lookup"`
+  returned zero lines after dozens of entmoot reconcile retries.
+  VPS's transport_ad to laptop only carried TCP (no TURN
+  endpoint advertised by VPS's entmoot in non-hide-ip mode), so
+  laptop never installed VPS's TURN allocation address — the
+  exact case jf.14's rendezvous lookup was supposed to handle.
+  jf.15.3's `PermitTURNPeer(VPS_TURN_addr)` couldn't fire on
+  laptop because laptop never received the address through
+  any channel.
+
+  Fix: compute `fallbackTriggerAt := max(directRetries, 1)` once
+  at the top of the dial loop and gate the fallback block on
+  `retries == fallbackTriggerAt`. With `directRetries==3`
+  (normal mode), fires on retries==3 — same as before. With
+  `directRetries==0` (outbound-turn-only or already-relay), fires
+  on retries==1 — first timer tick after the initial SYN.
+
+### Why
+
+jf.12.1 ("skip phase-1 direct retries when outbound-turn-only is
+set") was a cosmetic-stall fix. It assumed the only consumer of
+`directRetries` was the retry-counter math. But jf.14's
+rendezvous-lookup hook landed three releases later with a
+`retries == directRetries` gate that silently broke when
+combined with directRetries=0. The two patches composed wrong.
+
+The interaction was invisible because:
+- VPS isn't outbound-turn-only, so VPS's rendezvous lookups
+  fired correctly (we observed them in jf.15.2's tier traces).
+- Laptop's outbound *to* VPS still worked via the
+  outbound-turn-only `SendViaOwnRelay` path which bypasses the
+  rendezvous-lookup gate entirely (it routes via VPS's real IP
+  from the registry).
+- Only the *return* direction (VPS→laptop via pion) needed
+  laptop to know VPS's TURN allocation address — which laptop
+  never learned because the rendezvous lookup was dead code.
+
+### Compat
+
+No wire-format changes. No protocol changes. No new flags. The
+fix preserves the existing once-per-dial fire semantics: with
+`directRetries==3` the block fires on `retries==3` exactly as
+before; with `directRetries==0` it now fires on `retries==1`
+(was: never).
+
+The TCP/relay-switch logic is also now correctly active for
+outbound-turn-only peers — though most tier-3 (TCP) and tier-3
+(beacon-relay) paths are skipped anyway in that mode (jf.10's
+`hasTURNEp` skip, jf.11a's outbound-turn-only fail-closed). The
+practical effect is just that the rendezvous lookup now fires.
+
+### Tests
+
+Full daemon + cmd/pilot-rendezvous suite green under `-race`.
+No new dedicated tests for this fix — the bug is a one-line
+gate condition, and the existing live-mesh evidence (no
+"rendezvous installed fresh turn endpoint" log lines on laptop
+despite many retry attempts) confirms both the bug and the fix.
+A regression test would require building out a full
+DialConnection harness with simulated retries; deferred unless
+the gate logic gets touched again.
+
+### Live verification
+
+After bumping all 3 nodes to jf.15.4:
+
+1. On laptop: `grep "rendezvous installed fresh turn endpoint"
+   ~/.pilot/pilot.log | tail -5`. Should show ≥1 line per
+   entmoot reconcile retry now (was: zero).
+2. On laptop: tier counters in `pilotctl info | jq
+   '.pkts_sent_by_tier'` should show `cached_conn` growing for
+   VPS — pion-to-pion path working bilaterally.
+3. On laptop: `pilotctl info | grep -i traffic` — `recv` count
+   growing (was: 0).
+4. **Acid test**: `entmootd query | head -5` on laptop — the 5
+   missing messages from yesterday's upgrade window should
+   appear within 1-2 reconcile ticks.
+
+### Out of scope (deferred)
+
+- **Rendezvous publish retry on 429** (laptop hit rate-limit
+  during jf.15.3 deployment burst). Not blocking convergence
+  per se — laptop's record DOES eventually update — but worth
+  cleaning up. ~10 LOC for jf.15.5 if it bites again.
+- **VPS's entmoot advertising TURN endpoint in transport_ads
+  even without `-hide-ip`.** Currently only hide-ip entmoot
+  peers advertise TURN. Could be made unconditional now that
+  bilateral cross-permission means non-hide-ip peers can
+  benefit too. Cross-cuts entmoot; defer.
+
 ## [v1.9.0-jf.15.3] - 2026-04-26
 
 Closes the cold-start bootstrap saga end-to-end. Diagnosed via
