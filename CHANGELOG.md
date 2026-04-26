@@ -10,6 +10,114 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.5] - 2026-04-26
+
+The recovery-PILA flow finally respects `-outbound-turn-only`.
+This was the actual blocker keeping the laptop↔VPS crypto state
+permanently asymmetric.
+
+### Fixed
+
+- **`maybeSendRecoveryPILA` now routes through `writeFrame`,
+  not raw `tm.udp.WriteToUDPAddr`.** When laptop receives an
+  encrypted frame from VPS with no matching crypto state
+  (typical after a one-sided daemon restart — VPS retains
+  laptop's session key, laptop generated a fresh X25519 on
+  restart), it correctly fires the unsolicited PILA recovery
+  flow. But the recovery PILA was being sent via the daemon's
+  raw UDP socket, **bypassing the outbound-turn-only routing
+  enforcement entirely**. Two consequences:
+
+  1. **The PILA never reached VPS.** Raw UDP from laptop's
+     main socket carries source = laptop's real IP. VPS's
+     TURN allocation only permissions laptop's TURN allocation
+     address (auto-permissioned by VPS's pion when VPS first
+     wrote to it). Cloudflare drops the recovery PILA at the
+     permission check.
+  2. **Even if it reached VPS, it would have leaked laptop's
+     real IP** — defeating the entire `-hide-ip` premise. The
+     recovery flow was a privacy regression hiding behind a
+     correctness bug.
+
+  Live evidence 2026-04-26: laptop on jf.15.4 received
+  continuous WARN-level `encrypted packet from node but no key
+  peer_node_id=45981` events from VPS but never recovered.
+  `pilotctl peers` showed VPS as `no/no` (encrypted/auth)
+  while VPS showed laptop as `yes/yes` — perfectly asymmetric
+  crypto state. Phobos↔VPS and laptop↔phobos were both fine
+  (neither involves the outbound-turn-only-from-real-IP path).
+
+  Fix: change the direct-path branch of `maybeSendRecoveryPILA`
+  to call `tm.writeFrame(nodeID, addr, frame)` instead of
+  `tm.udp.WriteToUDPAddr(frame, addr)`. writeFrame's
+  outbound-turn-only branch routes via our local TURN
+  allocation to the peer's path.direct (the peer's real
+  registry-published IP), which is reachable and where the
+  peer's pion auto-permissioned our TURN allocation address
+  on first write. For non-turn-only peers, writeFrame's
+  direct-UDP tier produces identical bytes-on-the-wire to the
+  old code path.
+
+### Why this took so long to surface
+
+The recovery flow had three load-bearing assumptions, only the
+first two of which were ever exercised in this fork before
+today:
+
+1. The trigger frame's source address is suitable to write
+   back to. ✓ Holds for normal NAT'd peers.
+2. The peer can receive raw UDP at that source address. ✓
+   Holds for peers without `-outbound-turn-only`.
+3. We have privacy permission to send raw UDP from our real
+   IP to that source. ❌ Holds only if WE aren't
+   `-outbound-turn-only`.
+
+When `-outbound-turn-only` was added in jf.11a, the recovery
+flow inherited assumption 3 unchecked. Until today, no live
+deployment had:
+
+- A daemon in `-outbound-turn-only` mode
+- That entered the asymmetric crypto state
+- And had the recovery flow trigger
+
+All three converged today after enough other bugs were peeled
+away that this one was finally in the critical path.
+
+### Compat
+
+No wire-format / protocol changes. Existing recovery flow
+semantics preserved for non-turn-only peers (writeFrame's
+direct-UDP tier is the same byte-emit). For
+`-outbound-turn-only` peers, recovery now works at all (was
+silently broken). Backwards-compatible end-to-end.
+
+### Tests
+
+Full daemon + cmd/pilot-rendezvous suite green under `-race`.
+Existing recovery PILA call-site test (if any) passes
+unchanged because the outbound bytes are equivalent for the
+non-turn-only path. No new test added — the change is a
+one-liner routing redirect, and the existing live mesh test
+(laptop's WARN logs converging to a successful key exchange)
+verifies it directly.
+
+### Live verification
+
+After bumping VPS, laptop, phobos to jf.15.5:
+
+1. On laptop: `grep "sent recovery PILA" ~/.pilot/pilot.log
+   | tail -5` — expect at least one INFO line per minute
+   while the asymmetric state lasts.
+2. On laptop: `~/.pilot/bin/pilotctl peers` — VPS (45981)
+   should flip to `yes/yes` (encrypted/auth) within seconds
+   of the first successful recovery PILA.
+3. On laptop: `entmootd query | head -5` — the 5 missing
+   messages from yesterday's upgrade window should appear
+   within 1-2 reconcile ticks.
+
+If step 3 succeeds, the cold-start saga AND the recovery
+asymmetry are both finally closed.
+
 ## [v1.9.0-jf.15.4] - 2026-04-26
 
 Fix dead-code gate that prevented the rendezvous lookup AND the

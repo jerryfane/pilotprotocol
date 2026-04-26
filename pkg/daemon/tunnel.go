@@ -2283,7 +2283,21 @@ func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr,
 		return
 	}
 
-	if _, err := tm.udp.WriteToUDPAddr(frame, addr); err != nil {
+	// v1.9.0-jf.15.5: route through writeFrame, NOT raw tm.udp.WriteToUDPAddr.
+	// For outbound-turn-only peers (e.g. -hide-ip), writeFrame respects
+	// the TURN-routing constraint: the PILA goes out via our local TURN
+	// allocation to the peer's known direct address (path.direct, e.g.
+	// the peer's real registry-published IP), where the peer is
+	// reachable. Bypassing writeFrame to send raw UDP from tm.udp would
+	// (a) emit from our real IP — leaking it through the recovery path
+	// and defeating -hide-ip — and (b) usually fail outright, because
+	// our real IP isn't permissioned on the peer's TURN allocation.
+	// For non-turn-only peers, writeFrame's direct-UDP tier produces
+	// identical behaviour to the old tm.udp call. Pass addr so
+	// writeFrame's caller-supplied addr precedence (jf.12) applies —
+	// but writeFrame will substitute path.direct or null-out addr per
+	// its existing tier rules (jf.10's hasTURNEp drop, etc).
+	if err := tm.writeFrame(nodeID, addr, frame); err != nil {
 		slog.Debug("recovery PILA send failed", "peer_node_id", nodeID, "addr", addr, "error", err)
 		return
 	}
