@@ -10,6 +10,133 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.7] - 2026-04-26
+
+Periodic peer-side rendezvous re-lookup. Closes the silent-death
+mode where Cloudflare TURN credential rotation (~30 min cadence)
+breaks the bilateral allocation path between two peers and the
+push-notification recovery (entmoot transport-ad over Pilot
+gossip) can't fire because the data path it needs just died.
+
+### Why
+
+Live evidence on 2026-04-26: VPS pilot started at 15:35 with
+allocation `104.30.149.241:12483`. At 16:05:07 Cloudflare
+rotated credentials and pilot's allocation became
+`104.30.150.209:36509`. Laptop's first rendezvous lookup at
+16:04:33 had installed the bilateral CreatePermission for the
+about-to-rotate value; once VPS started sending from the new
+allocation 34 s later, every send was silently dropped at
+laptop's allocation permission check. Pion's `Send` returns nil
+regardless of remote receipt, so neither side could detect the
+break locally. The push-notification path (VPS's entmoot
+republishes its transport ad over Pilot gossip after the jf.11b
+TURN-rotation hook fires) couldn't deliver because the gossip
+dial itself depends on the freshly-broken bilateral path.
+
+### Industry alignment
+
+The fix mirrors the periodic-refresh-via-signaling pattern
+every reviewed P2P stack uses:
+
+- **Tailscale magicsock**: continuous STUN probes against DERP
+  servers; periodic re-confirmation of own and peer addresses
+  through the always-up signaling pipe (DERP) independent of
+  the data path.
+- **iroh-net**: `netcheck` loop probing relays for fresh
+  address info, used to "heal connections after network
+  migration".
+- **WebRTC ICE Restart (RFC 8838 trickle ICE)**: candidate
+  re-gathering exchanged over the signaling channel, which
+  doesn't depend on the data path being healthy.
+
+Pilot's rendezvous service is the equivalent always-reachable
+signaling channel; the missing piece was a cadence to poll it.
+
+### Fixed
+
+- **`rendezvousLookupForDial` no longer suppresses cache-equal
+  results.** The previous `if fresh == current { return "" }`
+  guard skipped same-address re-installs, but the no-op was not
+  really a no-op — it gated the only path that re-issues
+  `PermitTURNPeer`'s `CreatePermission` and refreshes the
+  permission's timestamp on the local TURN allocation. Without
+  that periodic refresh, a permission can fall out of
+  `permittedAddrs` (allocation rotation, eviction, or
+  bookkeeping race) and never come back into
+  `permissionRefreshLoop`'s working set, silently expiring at
+  the TURN server's 5-min permission TTL. Now lookup returns
+  the fresh value unconditionally; eviction of cached conns
+  still gates on actual address change inside
+  `AddPeerTURNEndpoint`, so same-address calls remain cheap.
+
+### Added
+
+- **`rendezvousPeerRefreshLoop`** (~90 s cadence). Walks
+  `tm.KnownTURNPeers()` every tick and re-looks-up each peer
+  via the rendezvous service, feeding the result through
+  `AddPeerTURNEndpoint` → `PermitTURNPeer`. Catches Cloudflare
+  rotations within one cadence (≤ 90 s) and re-permits the
+  fresh allocation address before the previous permission
+  expires. Jittered first tick (0–30 s) so a fleet restarting
+  in lockstep doesn't synchronize lookups. No-op if
+  `RendezvousURL` is empty or no peers have a recorded TURN
+  endpoint.
+
+- **`TunnelManager.KnownTURNPeers() []uint32`**. Helper
+  enumerating peers with a non-nil `peerTURN` entry. Used by
+  the new refresh loop.
+
+### Constants
+
+- `DefaultRendezvousPeerRefreshInterval = 90 * time.Second` —
+  empirically tuned for Cloudflare's ~30 min credential
+  rotation: 20 chances per rotation cycle to re-permit before
+  the previous CreatePermission's 5-min TTL expires. Tunable
+  downward if rotation cadence tightens, upward if rendezvous
+  QPS becomes a concern.
+
+### Tests
+
+`pkg/daemon/daemon_rendezvous_test.go`:
+
+- `TestRendezvous_LookupForDial_ReturnsFreshEvenWhenCacheEqual`
+  pins the new behaviour: rendezvousLookupForDial returns the
+  fresh value even when the cache already has the same
+  endpoint, so the caller can re-issue `AddPeerTURNEndpoint`
+  and refresh the local CreatePermission. Replaces the
+  pre-jf.15.7 `…ReturnsEmptyOnSameAsCached` test that pinned
+  the old (buggy) behaviour.
+
+`pkg/daemon/tunnel_trace_test.go`:
+
+- `TestKnownTURNPeers_EnumeratesPeerTURNEntries` confirms the
+  new helper enumerates every peer with a non-nil peerTURN
+  entry and excludes never-installed nodeIDs.
+
+### Verification
+
+Live verification on the 3-machine mesh (post-deploy, both
+peers on jf.15.7 + a Cloudflare credential rotation observed):
+
+1. Bump VPS, laptop, phobos to jf.15.7 and restart pilot.
+2. Wait for at least one Cloudflare rotation cycle (~30 min)
+   on each peer with TURN.
+3. On any peer's pilot.log: expect `rendezvous peer refresh:
+   re-installed node_id=… addr=…` Debug entries every ~90 s
+   per known TURN peer.
+4. On rotation: expect a fresh `addr=` for the rotated peer
+   within 90 s, and `evicted stale peer conn after turn
+   endpoint change` showing the cached `turnDialedConn`
+   getting replaced.
+5. `pilotctl peers` should remain `yes/yes` across rotation
+   cycles (pre-jf.15.7 it would silently flip to `no/no`
+   within minutes of any rotation).
+
+If verification 5 holds for >2 rotation cycles (~1 hour
+sustained), the bilateral cold-start saga is closed for the
+steady-state case as well as the cold-start case.
+
 ## [v1.9.0-jf.15.6] - 2026-04-26
 
 Recovery PILA now fires when the trigger frame arrived through

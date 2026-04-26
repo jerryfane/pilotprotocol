@@ -761,6 +761,25 @@ func (tm *TunnelManager) PeerTURNEndpoint(nodeID uint32) string {
 	return ep.String()
 }
 
+// KnownTURNPeers returns the node IDs of every peer with a
+// recorded TURN endpoint. Used by the rendezvous peer-refresh
+// loop (v1.9.0-jf.15.7) to walk peers we should periodically
+// re-look-up — Cloudflare and similar TURN providers rotate
+// allocation addresses every ~30 min, and without a periodic
+// re-fetch our cached peerTURN points at a dead allocation the
+// moment the peer rotates. Snapshot is a copy; safe to mutate.
+func (tm *TunnelManager) KnownTURNPeers() []uint32 {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	out := make([]uint32, 0, len(tm.peerTURN))
+	for id, ep := range tm.peerTURN {
+		if ep != nil {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // DialTURNRelayForPeer is the asymmetric-TURN (v1.9.0-jf.9) analogue
 // of DialTURNForPeer for daemons without a local TURN allocation.
 // It sends raw UDP through the shared UDP socket to the peer's

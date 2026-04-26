@@ -1016,6 +1016,16 @@ func (d *Daemon) Start() error {
 	// is empty.
 	go d.rendezvousRefreshLoop()
 
+	// 10d. Start peer-side rendezvous refresh loop (v1.9.0-jf.15.7).
+	// Walks known TURN peers every ~90 s and re-fetches their
+	// published TURN endpoint, then re-installs to refresh the
+	// bilateral CreatePermission. Closes the chicken-and-egg
+	// where a peer's allocation rotation breaks the gossip path
+	// the push notification would have used, leaving our cached
+	// peerTURN pointing at the dead allocation. No-op if
+	// RendezvousURL is empty.
+	go d.rendezvousPeerRefreshLoop()
+
 	// 11. Start network sync (refreshes memberships/policies every 5 min)
 	go d.networkSyncLoop()
 
@@ -4061,6 +4071,97 @@ func (d *Daemon) rendezvousRefreshLoop() {
 	}
 }
 
+// DefaultRendezvousPeerRefreshInterval is how often the
+// rendezvousPeerRefreshLoop walks known TURN peers and re-fetches
+// their published TURN endpoint. Cloudflare credential rotation
+// observed live at ~30 min cadence; 90 s gives us roughly 20
+// chances to catch a rotation and re-permit the new allocation
+// address before the previous CreatePermission expires (5 min
+// TURN permission TTL). Tunable downward if rotation cadence
+// gets tighter; tunable upward if rendezvous QPS becomes a
+// concern. Mirrors the empirical cadence Tailscale uses for
+// continuous STUN-probes-against-DERP.
+const DefaultRendezvousPeerRefreshInterval = 90 * time.Second
+
+// rendezvousPeerRefreshLoop periodically re-fetches the TURN
+// endpoint of every known peer (peers with a non-nil peerTURN
+// entry) and re-issues AddPeerTURNEndpoint. The address-side is
+// idempotent (no eviction unless the address actually changed),
+// but the permission side refreshes the local TURN allocation's
+// CreatePermission and the permittedAddrs timestamp.
+//
+// Why this exists (v1.9.0-jf.15.7):
+//
+// Cloudflare TURN credentials rotate every ~30 min. The peer's
+// pion auto-publishes the new allocation address through the
+// jf.11b TURN-rotation hook → entmoot republishes its transport
+// ad → our entmoot delivers it to our pilot via SetPeerEndpoints
+// → we install + permit. That push path works WHEN entmoot's
+// gossip has a working transport. But during a transient
+// outage (the gossip dial itself depends on a working bilateral
+// TURN path, which the rotation just broke), the push silently
+// fails and our cached peerTURN points at the dead allocation
+// indefinitely.
+//
+// The pull (this loop) is the chicken-and-egg breaker: the
+// rendezvous service is reachable independent of any peer's
+// TURN state, so we can always discover a peer's fresh TURN
+// endpoint and pre-install the bilateral permission BEFORE the
+// data path goes silent. Mirrors:
+//
+//   - Tailscale's continuous STUN-probes-against-DERP cadence
+//     (devices periodically reconfirm their own and peers'
+//     reachable addresses via the always-up signaling pipe).
+//   - iroh's netcheck loop probing relays for fresh address
+//     info, used to "heal connections after network migration".
+//   - WebRTC's ICE-restart-via-signaling pattern, which
+//     re-gathers candidates over a signaling channel that
+//     doesn't depend on the data path being healthy.
+//
+// No-op if RendezvousURL is empty (rendezvousClient is nil).
+// No-op if there are no peers with a recorded TURN endpoint.
+func (d *Daemon) rendezvousPeerRefreshLoop() {
+	if d.rendezvousClient == nil {
+		return
+	}
+	// Jitter the first tick so a fleet restarting in lockstep
+	// doesn't synchronize peer-lookups.
+	jitter := time.Duration(rand.Int63n(int64(30 * time.Second)))
+	select {
+	case <-d.stopCh:
+		return
+	case <-time.After(jitter):
+	}
+	ticker := time.NewTicker(DefaultRendezvousPeerRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-d.stopCh:
+			return
+		case <-ticker.C:
+			peers := d.tunnels.KnownTURNPeers()
+			for _, nodeID := range peers {
+				select {
+				case <-d.stopCh:
+					return
+				default:
+				}
+				fresh := d.rendezvousLookupForDial(nodeID)
+				if fresh == "" {
+					continue
+				}
+				if err := d.tunnels.AddPeerTURNEndpoint(nodeID, fresh); err != nil {
+					slog.Debug("rendezvous peer refresh: install failed",
+						"node_id", nodeID, "addr", fresh, "error", err)
+					continue
+				}
+				slog.Debug("rendezvous peer refresh: re-installed",
+					"node_id", nodeID, "addr", fresh)
+			}
+		}
+	}
+}
+
 // rendezvousLookupForDial is the cold-dial helper used by
 // DialConnection to refresh a stale path entry just before the
 // dial loop falls back to relay retries. Returns the freshly-
@@ -4090,10 +4191,17 @@ func (d *Daemon) rendezvousLookupForDial(nodeID uint32) string {
 	if fresh == "" {
 		return ""
 	}
-	current := d.tunnels.PeerTURNEndpoint(nodeID)
-	if fresh == current {
-		return ""
-	}
+	// v1.9.0-jf.15.7: do NOT skip when fresh==current. Returning the
+	// address even on a no-change lookup lets the caller re-issue
+	// AddPeerTURNEndpoint → PermitTURNPeer, which refreshes the
+	// CreatePermission timestamp on our local allocation. Without
+	// that refresh, an entry that fell out of permittedAddrs (after
+	// allocation rotation, eviction, or bookkeeping race) never comes
+	// back into the refresh loop's working set and silently expires
+	// at the TURN server's 5-min permission TTL — even though we
+	// "still know" the address is current. Idempotent on the address
+	// side: AddPeerTURNEndpoint only evicts cached conns when the
+	// address actually changes, so same-address calls are cheap.
 	return fresh
 }
 

@@ -237,6 +237,36 @@ func TestAddPeerTURNEndpoint_RepeatedInstallNoCrash(t *testing.T) {
 	}
 }
 
+// TestKnownTURNPeers_EnumeratesPeerTURNEntries: jf.15.7's
+// peer-side rendezvous-refresh loop walks `KnownTURNPeers()` to
+// decide which nodeIDs to re-look-up. The helper must enumerate
+// every peer with a non-nil peerTURN entry, and must NOT include
+// peers whose entry was never installed.
+func TestKnownTURNPeers_EnumeratesPeerTURNEntries(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	if got := len(tm.KnownTURNPeers()); got != 0 {
+		t.Fatalf("fresh TM: KnownTURNPeers len=%d, want 0", got)
+	}
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
+	if err := tm.AddPeerTURNEndpoint(99, "9.8.7.6:5"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint: %v", err)
+	}
+	got := tm.KnownTURNPeers()
+	if len(got) != 2 {
+		t.Fatalf("after 2 adds: KnownTURNPeers len=%d, want 2 (got %v)", len(got), got)
+	}
+	seen := map[uint32]bool{}
+	for _, id := range got {
+		seen[id] = true
+	}
+	if !seen[7] || !seen[99] {
+		t.Fatalf("KnownTURNPeers missing expected ids: got %v, want both 7 and 99", got)
+	}
+}
+
 // TestMaybeSendRecoveryPILA_FiresWhenTURNDelivered: a packet that
 // arrived through pion TURN reaches handleEncrypted with addr=nil
 // (TURNEndpoint type-asserts to nil at the *UDPEndpoint cast in the

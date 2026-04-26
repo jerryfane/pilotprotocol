@@ -295,10 +295,18 @@ func TestRendezvous_LookupForDial_ReturnsFreshEndpoint(t *testing.T) {
 	}
 }
 
-// TestRendezvous_LookupForDial_ReturnsEmptyOnSameAsCached: if
-// the rendezvous response matches the cached endpoint, we don't
-// reinstall — empty return tells the dial loop to proceed.
-func TestRendezvous_LookupForDial_ReturnsEmptyOnSameAsCached(t *testing.T) {
+// TestRendezvous_LookupForDial_ReturnsFreshEvenWhenCacheEqual: the
+// jf.15.7 behaviour change. Previously, rendezvousLookupForDial
+// suppressed same-as-cached returns to skip a no-op
+// AddPeerTURNEndpoint. But the no-op was not really a no-op: it
+// gated PermitTURNPeer's CreatePermission re-issue — the only
+// thing that keeps a peer's address in our local allocation's
+// permittedAddrs working set across rotations and bookkeeping
+// races. Now lookup returns the fresh value unconditionally; the
+// caller re-issues AddPeerTURNEndpoint, which re-PermitTURNPeers,
+// which refreshes the permission timestamp without evicting
+// cached conns (eviction still gates on actual address change).
+func TestRendezvous_LookupForDial_ReturnsFreshEvenWhenCacheEqual(t *testing.T) {
 	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()
@@ -316,8 +324,8 @@ func TestRendezvous_LookupForDial_ReturnsEmptyOnSameAsCached(t *testing.T) {
 		t.Fatalf("AddPeerTURNEndpoint: %v", err)
 	}
 	got := d.rendezvousLookupForDial(555)
-	if got != "" {
-		t.Fatalf("rendezvousLookupForDial returned %q for cache-equal endpoint (want empty)", got)
+	if got != "10.20.30.40:443" {
+		t.Fatalf("rendezvousLookupForDial returned %q (want 10.20.30.40:443 — must return fresh even when cache-equal so caller can refresh PermitTURNPeer)", got)
 	}
 }
 
