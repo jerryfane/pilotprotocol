@@ -10,6 +10,17 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.10] - 2026-04-27
+
+### Fixed
+
+- **Pilot's Go driver no longer loses immediate stream closes.** If the daemon
+  emits `CloseOK` in the small window after `DialOK`/`AcceptedConn` but before
+  the client registers the conn's receive channel, the driver now records that
+  pending close and applies it during registration. Fast accept-and-close
+  streams still preserve existing TCP-like dial semantics, but callers now see
+  EOF immediately instead of a dead conn that waits for higher-level timeouts.
+
 ## [v1.9.0-jf.15.9] - 2026-04-26
 
 ### Fixed

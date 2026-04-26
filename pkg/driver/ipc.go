@@ -94,6 +94,7 @@ type ipcClient struct {
 	recvMu    sync.Mutex
 	recvChs   map[uint32]chan []byte // conn_id → data channel
 	pendRecv  map[uint32][][]byte    // conn_id → buffered data before recvCh registered
+	pendClose map[uint32]struct{}    // conn_id → CloseOK before recvCh registered
 	acceptMu  sync.Mutex
 	acceptChs map[uint16]chan []byte // H12 fix: per-port accept channels
 	dgCh      chan *Datagram         // incoming datagrams
@@ -111,6 +112,7 @@ func newIPCClient(socketPath string) (*ipcClient, error) {
 		handlers:  make(map[byte][]chan []byte),
 		recvChs:   make(map[uint32]chan []byte),
 		pendRecv:  make(map[uint32][][]byte),
+		pendClose: make(map[uint32]struct{}),
 		acceptChs: make(map[uint16]chan []byte),
 		dgCh:      make(chan *Datagram, 256),
 		doneCh:    make(chan struct{}),
@@ -162,6 +164,8 @@ func (c *ipcClient) readLoop() {
 				if ok {
 					delete(c.recvChs, connID)
 					close(ch)
+				} else {
+					c.pendClose[connID] = struct{}{}
 				}
 				c.recvMu.Unlock()
 			}
@@ -236,6 +240,12 @@ func (c *ipcClient) cleanup() {
 	for id, ch := range c.recvChs {
 		close(ch)
 		delete(c.recvChs, id)
+	}
+	for id := range c.pendRecv {
+		delete(c.pendRecv, id)
+	}
+	for id := range c.pendClose {
+		delete(c.pendClose, id)
 	}
 	c.recvMu.Unlock()
 
@@ -328,13 +338,20 @@ func (c *ipcClient) registerAcceptCh(port uint16) chan []byte {
 func (c *ipcClient) registerRecvCh(connID uint32) chan []byte {
 	ch := make(chan []byte, 256)
 	c.recvMu.Lock()
-	c.recvChs[connID] = ch
 	// Drain any data that arrived before registration
 	pending := c.pendRecv[connID]
 	delete(c.pendRecv, connID)
+	_, closed := c.pendClose[connID]
+	delete(c.pendClose, connID)
+	if !closed {
+		c.recvChs[connID] = ch
+	}
 	c.recvMu.Unlock()
 	for _, data := range pending {
 		ch <- data
+	}
+	if closed {
+		close(ch)
 	}
 	return ch
 }
@@ -343,4 +360,6 @@ func (c *ipcClient) unregisterRecvCh(connID uint32) {
 	c.recvMu.Lock()
 	defer c.recvMu.Unlock()
 	delete(c.recvChs, connID)
+	delete(c.pendRecv, connID)
+	delete(c.pendClose, connID)
 }
