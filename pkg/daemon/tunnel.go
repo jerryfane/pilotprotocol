@@ -2233,11 +2233,24 @@ const recoveryPILAInterval = 60 * time.Second
 // back. Direct-path senders see addr = peer's actual UDP endpoint and
 // viaRelay = false.
 func (tm *TunnelManager) maybeSendRecoveryPILA(nodeID uint32, addr *net.UDPAddr, viaRelay bool) {
-	// For direct sends we need a real address; for relay sends we
-	// need the beacon addr. Bail early if neither makes sense.
-	if !viaRelay && addr == nil {
-		return
-	}
+	// v1.9.0-jf.15.6: do NOT bail when addr==nil for the non-relay
+	// case. Frames delivered through pion TURN arrive at the inbound
+	// loop wrapped as *transport.TURNEndpoint, not *UDPEndpoint, so
+	// the type-assertion at handleAuthKeyExchange's caller site
+	// (tunnel.go ~1614) leaves `remote` nil. handleEncrypted then
+	// hands us (addr=nil, viaRelay=false) — the exact case the old
+	// guard rejected. That meant a laptop receiving VPS's encrypted
+	// frames via TURN could observe "no key" indefinitely without
+	// ever firing the recovery PILA, perpetuating the bilateral
+	// crypto-state deadlock the recovery path was specifically
+	// designed to break.
+	//
+	// writeFrame already resolves the destination by nodeID through
+	// its tier ladder (peerTURN, peerConns, pathDirect, own-relay)
+	// and returns an error when no path exists; we log Debug at the
+	// caller and the rate-limit cooldown still prevents amplifier
+	// abuse on truly unreachable peers. So the guard is no longer
+	// needed for the direct case.
 	tm.mu.Lock()
 	last := tm.lastRecoveryPILA[nodeID]
 	now := time.Now()

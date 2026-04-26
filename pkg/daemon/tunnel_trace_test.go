@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 // TestSendTier_NamesStableAcrossIndices: the tier name strings
@@ -233,6 +234,87 @@ func TestAddPeerTURNEndpoint_RepeatedInstallNoCrash(t *testing.T) {
 	}
 	if got := tm.PeerTURNEndpoint(7); got != "1.2.3.4:5" {
 		t.Fatalf("peer endpoint after repeated install: got %q", got)
+	}
+}
+
+// TestMaybeSendRecoveryPILA_FiresWhenTURNDelivered: a packet that
+// arrived through pion TURN reaches handleEncrypted with addr=nil
+// (TURNEndpoint type-asserts to nil at the *UDPEndpoint cast in the
+// inbound loop). Under v1.9.0-jf.15.5 and earlier, the early-return
+// guard `if !viaRelay && addr == nil` short-circuited the recovery
+// path for exactly this case — the bilateral crypto-state deadlock
+// (laptop sees encrypted-from-VPS but no key) couldn't break.
+//
+// The fix removes the guard. We can't easily exercise the full
+// writeFrame send path in a unit test (no real transports, no
+// identity), but we CAN observe whether the function got past the
+// rate-limit gate to stamp lastRecoveryPILA[nodeID]. Old code: never
+// stamps (returns at the guard). New code: stamps even when the
+// downstream frame build / transport check bails afterwards.
+//
+// (v1.9.0-jf.15.6 behaviour pin)
+func TestMaybeSendRecoveryPILA_FiresWhenTURNDelivered(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	const nodeID = uint32(45981)
+
+	// Precondition: lastRecoveryPILA[nodeID] is zero — never been
+	// stamped. After a call with (nodeID, addr=nil, viaRelay=false),
+	// we expect a fresh stamp.
+	tm.mu.RLock()
+	if !tm.lastRecoveryPILA[nodeID].IsZero() {
+		tm.mu.RUnlock()
+		t.Fatalf("precondition: lastRecoveryPILA[%d] should be zero", nodeID)
+	}
+	tm.mu.RUnlock()
+
+	// The call itself is harmless on a TM with no identity / no UDP
+	// transport; it'll bail at the buildAuthKeyExchangeFrame nil-check
+	// or the tm.udp == nil check. The point is that BEFORE those
+	// checks, the function must have stamped lastRecoveryPILA — i.e.
+	// it got past the now-removed guard.
+	tm.maybeSendRecoveryPILA(nodeID, nil, false)
+
+	tm.mu.RLock()
+	stamp := tm.lastRecoveryPILA[nodeID]
+	tm.mu.RUnlock()
+	if stamp.IsZero() {
+		t.Fatalf("after maybeSendRecoveryPILA(%d, nil, false): "+
+			"lastRecoveryPILA still zero — guard was not removed",
+			nodeID)
+	}
+	if time.Since(stamp) > 5*time.Second {
+		t.Fatalf("stamp not recent: %v ago", time.Since(stamp))
+	}
+}
+
+// TestMaybeSendRecoveryPILA_RespectsRateLimit: even under the
+// jf.15.6 fix, repeated calls within recoveryPILAInterval must NOT
+// re-stamp the timestamp. This guards the DoS-amplifier mitigation
+// — an attacker spamming undecryptable frames with a forged nodeID
+// must not cause us to emit a PILA per inbound packet.
+func TestMaybeSendRecoveryPILA_RespectsRateLimit(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	const nodeID = uint32(45981)
+
+	tm.maybeSendRecoveryPILA(nodeID, nil, false)
+	tm.mu.RLock()
+	first := tm.lastRecoveryPILA[nodeID]
+	tm.mu.RUnlock()
+	if first.IsZero() {
+		t.Fatalf("first call: stamp not set")
+	}
+
+	// Second call within the cooldown should be a no-op: the
+	// timestamp must not advance.
+	tm.maybeSendRecoveryPILA(nodeID, nil, false)
+	tm.mu.RLock()
+	second := tm.lastRecoveryPILA[nodeID]
+	tm.mu.RUnlock()
+	if !second.Equal(first) {
+		t.Fatalf("second call within cooldown advanced stamp: "+
+			"first=%v second=%v (expected equal)", first, second)
 	}
 }
 

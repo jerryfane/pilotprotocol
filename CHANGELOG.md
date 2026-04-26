@@ -10,6 +10,83 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.6] - 2026-04-26
+
+Recovery PILA now fires when the trigger frame arrived through
+pion TURN. This was the surviving blocker after jf.15.5 — the
+right routing (writeFrame) was wired up, but a stale early-return
+guard prevented the function from ever being entered.
+
+### Fixed
+
+- **`maybeSendRecoveryPILA` no longer short-circuits on
+  `addr == nil` for non-relay sends.** Frames delivered through
+  pion's TURN client arrive at the inbound loop wrapped as
+  `*transport.TURNEndpoint`, not `*transport.UDPEndpoint`, so the
+  type assertion at `tunnel.go:1614` leaves `remote` nil. That
+  nil propagates into `handleEncrypted` → `maybeSendRecoveryPILA`,
+  which then hit the guard `if !viaRelay && addr == nil { return }`
+  and bailed before stamping the rate-limit timestamp or even
+  attempting the send.
+
+  Net effect: a laptop receiving VPS's encrypted frames over
+  Cloudflare TURN logged `encrypted packet from node but no key
+  peer_node_id=45981` repeatedly, but never emitted the recovery
+  PILA that would have re-bootstrapped its crypto state. The
+  bilateral deadlock the recovery path was specifically designed
+  to break — couldn't break.
+
+  Live evidence 2026-04-26 (post-jf.15.5 deploy): laptop's
+  `pilotctl info` showed 12.5 MB received from VPS, all of it
+  un-decryptable PILS frames. Tier counters confirmed laptop was
+  sending to VPS via `outbound_turn_only_own_relay` (laptop's
+  pion TURN → VPS's real UDP → VPS receives, authenticates,
+  replies). VPS's replies arrived at laptop's pion as
+  TURNEndpoint-wrapped frames, were decoded as encrypted
+  (correctly), found no crypto state (correctly), and triggered
+  `maybeSendRecoveryPILA(45981, nil, false)` — which then
+  silently no-op'd at the guard.
+
+  Fix: drop the `if !viaRelay && addr == nil { return }` guard.
+  `writeFrame` resolves the destination by nodeID via its
+  existing tier ladder (`peerTURN`, `peerConns`, `pathDirect`,
+  own-relay) and returns its own error if no path exists; we log
+  Debug at the caller and the rate-limit cooldown still prevents
+  amplifier abuse on truly unreachable peers. The guard predated
+  jf.15.5's writeFrame migration and was never updated to
+  recognize that nil-addr sends are now valid.
+
+### Tests
+
+`pkg/daemon/tunnel_trace_test.go`:
+
+- `TestMaybeSendRecoveryPILA_FiresWhenTURNDelivered` — with the
+  guard removed, calling `maybeSendRecoveryPILA(nodeID, nil,
+  false)` stamps `lastRecoveryPILA[nodeID]`. Pre-jf.15.6, the
+  early-return left the timestamp unset.
+- `TestMaybeSendRecoveryPILA_RespectsRateLimit` — the DoS-
+  amplifier mitigation (60 s cooldown per peer) survives the
+  guard removal: a second call within the cooldown does not
+  advance the timestamp.
+
+### Verification
+
+Live verification on the 3-machine mesh (post-deploy):
+
+1. Bump VPS, laptop, phobos to jf.15.6 and restart pilot.
+2. On laptop within ~60 s: expect `sent recovery PILA to peer
+   with unknown key peer_node_id=45981 addr=...` and a
+   subsequent `encrypted tunnel established auth=true
+   peer_node_id=45981 endpoint=... relay=false`.
+3. `pilotctl peers | grep 45981` should flip from `no/no` to
+   `yes/yes` within 1–2 seconds of the recovery PILA emission.
+4. `entmootd query | head -5` should show the missing messages
+   from the cold-start window once gossip resumes.
+
+If verification 4 lands, the entire jf.13 → jf.15.6 chain is
+end-to-end validated and the bilateral cold-start crypto-state
+deadlock is closed.
+
 ## [v1.9.0-jf.15.5] - 2026-04-26
 
 The recovery-PILA flow finally respects `-outbound-turn-only`.
