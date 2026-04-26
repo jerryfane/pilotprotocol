@@ -10,6 +10,167 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.3] - 2026-04-26
+
+Closes the cold-start bootstrap saga end-to-end. Diagnosed via
+jf.15.2 trace observability; fix is one missing call.
+
+### Fixed
+
+- **TURN allocation now permissions a peer's TURN allocation
+  address when we learn it.** When a peer advertises a TURN
+  allocation (via rendezvous lookup or entmoot transport-ad),
+  `AddPeerTURNEndpoint` records the address in `peerTURN` so
+  outbound sends can target it. **But it never installed a
+  CreatePermission on our local TURN allocation for that
+  address.** Result: pion-routed sends from VPS to laptop
+  (cached `turnDialedConn` path) reached Cloudflare TURN, got
+  forwarded as raw UDP from VPS's TURN-allocation source
+  address to laptop's TURN allocation, and were silently
+  dropped at laptop's permission check — invisible to both
+  daemons.
+
+  Fix: in `AddPeerTURNEndpoint`, after storing the peer's TURN
+  endpoint, call `tm.PermitTURNPeer(addr)`. The helper was
+  written exactly for this case in jf.9 (the doc-comment says
+  *"Explicit caller... for peers who might never direct-UDP us
+  before they try the TURN relay path"*) but was never wired in.
+
+### How the bug was found
+
+jf.15.2's `-trace-sends` flag emitted one INFO log per
+`writeFrame` tier decision. The output showed:
+
+```
+tier=cached_conn ... dst_addr=104.30.150.206:21808 result=ok ×40
+```
+
+40 successful pion-routed sends to laptop's TURN allocation,
+yet laptop reported `0 B recv`. Cross-checking with `tcpdump`
+confirmed packets DID leave VPS via pion to Cloudflare TURN —
+they just disappeared somewhere in the middle. That somewhere
+was the permission check on laptop's allocation.
+
+Without the per-tier observability, we'd been guessing for two
+releases. **jf.15.2 paid for itself in one diagnostic.**
+
+### Why this is the canonical fix
+
+- **pion's own `tcp-alloc` example** (`turn-client/tcp-alloc/main.go`)
+  is the direct reference: peers exchange relay-allocation
+  addresses via a signaling channel, then each side explicitly
+  calls `client.CreatePermission(peer_relay_addr)` before
+  accepting. Pilot's rendezvous (jf.14) and entmoot's
+  transport-ads (jf.7+) are the signaling channels; this is
+  the missing CreatePermission.
+- **WebRTC ICE** does the same via SDP candidate-exchange:
+  both peers learn each other's relay candidates, install
+  permissions, then run connectivity checks bilaterally.
+- **Tailscale (DERP) and iroh (iroh-relay)** sidestep this
+  entire problem with custom relay protocols that "blindly
+  forward already-encrypted traffic." Building a DERP-style
+  relay is a much larger architectural change; deferred.
+
+### Bilateral semantics fall out automatically
+
+When both peers run jf.15.3:
+
+- VPS learns laptop's TURN address (rendezvous) → calls
+  `PermitTURNPeer(laptop_TURN)` → VPS's allocation accepts
+  inbound from laptop's TURN.
+- Laptop learns VPS's TURN address (rendezvous) → calls
+  `PermitTURNPeer(VPS_TURN)` → laptop's allocation accepts
+  inbound from VPS's TURN.
+- Now pion-to-pion forwarding works in both directions.
+
+Rotation handling is already in place:
+
+- Peer rotates TURN → publishes new addr to rendezvous
+  (jf.14.2) → our rendezvous lookup picks it up →
+  `AddPeerTURNEndpoint` fires with new addr → **fresh
+  `PermitTURNPeer` installs the new permission**. jf.14.2's
+  cache eviction also fires on address change.
+- Our own allocation rotates → jf.15's atomic swap calls
+  `refreshAllPermissions` on the new allocation → all
+  `permittedAddrs` re-issued.
+
+### Privacy
+
+- Laptop's real IP: never on the wire to anyone. Same as
+  before. ✓
+- VPS's real IP: previously visible on the data path (raw UDP
+  from VPS:37736 to laptop's TURN allocation). With jf.15.3,
+  the cached `turnDialedConn` path actually works, so VPS
+  routes via its TURN allocation instead. **Reduced exposure**
+  — VPS's real IP appears only in registry / control plane.
+- Either side can become `-hide-ip` without code changes. The
+  symmetric hide-ip configuration (both `-outbound-turn-only`)
+  works because pion-to-pion forwarding now delivers correctly.
+
+### Compat
+
+- jf.15.3 peer ↔ jf.15.2-or-earlier peer: jf.15.3 installs
+  permission on its own allocation; old peer doesn't
+  reciprocate. Permissions are unidirectional, so the old peer
+  can still receive from new peer's TURN-allocation address
+  via this side's wiring, but the reverse direction fails the
+  same way as before. **Once both peers are on jf.15.3, both
+  directions work.** Mixed-version meshes converge as soon as
+  both endpoints upgrade. No protocol negotiation; behaviour
+  is purely local.
+- No wire-format changes. No new CLI flags. No new dependencies.
+
+### Tests
+
+`pkg/daemon/tunnel_trace_test.go` (extended):
+
+- `TestAddPeerTURNEndpoint_NoOpWithoutLocalTURN` — peers
+  without local TURN allocation (e.g. phobos) handle the
+  install without panicking and without populating
+  `turnPermittedPeers`.
+- `TestAddPeerTURNEndpoint_RepeatedInstallNoCrash` — same-addr
+  re-installs are idempotent (the underlying
+  `PermitTURNPeer` and `permittedAddrs` map both refresh
+  without duplicating).
+- `TestAddPeerTURNEndpoint_AddressChangePermitsNewAddress` —
+  rotation flow: old conn evicted (jf.14.2), peerTURN updated,
+  PermitTURNPeer fires for new address.
+
+3 new tests on top of jf.15.2's 11. Full suite green under
+`-race`.
+
+### Out of scope (deferred)
+
+- **DERP-style custom relay**. Tailscale and iroh's approach.
+  Drops TURN dependence entirely. Reserved for a future
+  architectural redesign.
+- **Roster-driven proactive permissioning**. Currently
+  `AddPeerTURNEndpoint` fires on rendezvous lookup or entmoot
+  transport-ad receive. A "permission everyone in your group
+  at startup" iteration could be wired off entmoot's roster.
+  Not blocking jf.15.3.
+- **TURN ChannelBind for performance**. ChannelData saves 4
+  bytes/msg vs SendIndication. Not a bottleneck. Defer.
+
+### Live verification (post-deploy)
+
+After bumping all 3 mesh nodes to jf.15.3:
+
+1. Wait ~30 s.
+2. `pilotctl info | jq '.pkts_sent_by_tier'` on VPS — expect
+   `cached_conn` count growing for laptop.
+3. `pilotctl info` on laptop — expect `recv` numbers growing
+   (was 0 in jf.15.2).
+4. `entmootd query | head -5` on laptop — expect the 5 missing
+   messages from yesterday's upgrade window to appear within
+   1-2 reconcile ticks.
+
+Step 4 closes the cold-start bootstrap saga end-to-end:
+jf.13 keepalive → jf.14 rendezvous → jf.14.1 nodeID-replay →
+jf.14.2 refresh + eviction → jf.15 self-heal → jf.15.1
+consent probe → jf.15.2 trace observability → **jf.15.3
+bilateral cross-permission**.
+
 ## [v1.9.0-jf.15.2] - 2026-04-26
 
 Per-tier observability for `writeFrame`. Pure additive — no

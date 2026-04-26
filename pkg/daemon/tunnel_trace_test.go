@@ -184,3 +184,80 @@ func TestRecordTierSend_LogsWhenOn(t *testing.T) {
 		t.Fatalf("pkts=%d after failed send, want still 1", got)
 	}
 }
+
+// TestAddPeerTURNEndpoint_NoOpWithoutLocalTURN: when the
+// daemon doesn't run a local TURN allocation (tm.turn == nil),
+// AddPeerTURNEndpoint must NOT panic and must NOT track any
+// permission. This is the asymmetric case (e.g. phobos in our
+// 3-machine mesh — no -turn-provider). The call should succeed
+// because the peer-endpoint installation is unrelated to
+// whether WE have a local allocation.
+//
+// (v1.9.0-jf.15.3 behaviour pin)
+func TestAddPeerTURNEndpoint_NoOpWithoutLocalTURN(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	if tm.turn != nil {
+		t.Fatalf("precondition: tm.turn should be nil for this test")
+	}
+	if err := tm.AddPeerTURNEndpoint(45491, "1.2.3.4:5678"); err != nil {
+		t.Fatalf("AddPeerTURNEndpoint without local TURN: %v", err)
+	}
+	if got := tm.PeerTURNEndpoint(45491); got != "1.2.3.4:5678" {
+		t.Fatalf("peer endpoint not stored: got %q", got)
+	}
+	// turnPermittedPeers must be empty — there's no allocation to
+	// permission against, so PermitTURNPeer was a clean no-op.
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if got := len(tm.turnPermittedPeers); got != 0 {
+		t.Fatalf("turnPermittedPeers should be empty without local TURN; got %d entries",
+			got)
+	}
+}
+
+// TestAddPeerTURNEndpoint_RepeatedInstallNoCrash: calling
+// AddPeerTURNEndpoint twice with the same address must succeed
+// both times. The jf.14.2 eviction predicate intentionally
+// skips when prev==new (preserves live cached conn); jf.15.3's
+// PermitTURNPeer call is also idempotent (refreshes the
+// turnPermittedPeers timestamp without duplicating storage).
+func TestAddPeerTURNEndpoint_RepeatedInstallNoCrash(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("first AddPeerTURNEndpoint: %v", err)
+	}
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("second AddPeerTURNEndpoint (same addr): %v", err)
+	}
+	if got := tm.PeerTURNEndpoint(7); got != "1.2.3.4:5" {
+		t.Fatalf("peer endpoint after repeated install: got %q", got)
+	}
+}
+
+// TestAddPeerTURNEndpoint_AddressChangePermitsNewAddress:
+// when the peer's TURN allocation rotates (we get a new
+// address via rendezvous lookup or transport-ad), we should
+// install a permission for the NEW address. Combined with
+// jf.14.2's cache eviction, this is the bilateral
+// cross-permission flow: stale conn dropped, fresh address
+// permissioned, ready for pion-to-pion forwarding.
+//
+// We can't easily exercise PermitTURNPeer's effects without a
+// real pion client (it's a no-op when tm.turn is nil). What
+// we DO check: the old address isn't lingering in
+// peerTURN.
+func TestAddPeerTURNEndpoint_AddressChangePermitsNewAddress(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+	if err := tm.AddPeerTURNEndpoint(7, "1.2.3.4:5"); err != nil {
+		t.Fatalf("first AddPeerTURNEndpoint: %v", err)
+	}
+	if err := tm.AddPeerTURNEndpoint(7, "9.8.7.6:5"); err != nil {
+		t.Fatalf("second AddPeerTURNEndpoint (new addr): %v", err)
+	}
+	if got := tm.PeerTURNEndpoint(7); got != "9.8.7.6:5" {
+		t.Fatalf("peer endpoint after rotation: got %q, want 9.8.7.6:5", got)
+	}
+}

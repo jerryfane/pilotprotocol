@@ -700,6 +700,39 @@ func (tm *TunnelManager) AddPeerTURNEndpoint(nodeID uint32, addr string) error {
 		slog.Debug("evicted stale peer conn after turn endpoint change",
 			"node_id", nodeID, "old_addr", prevEp.String(), "new_addr", newAddr)
 	}
+
+	// v1.9.0-jf.15.3: bilateral CreatePermission. When we learn a
+	// peer's TURN allocation address (from the rendezvous lookup or
+	// entmoot transport-ad path), install a CreatePermission on our
+	// own TURN allocation for that address. Without this, our
+	// allocation drops inbound packets that Cloudflare's TURN
+	// forwards to us from the peer's TURN allocation — even though
+	// we know about the peer and have authenticated successfully.
+	//
+	// The mechanism: when peer X sends to us via their pion TURN
+	// client, pion wraps the data in a SendIndication and the TURN
+	// server forwards it as raw UDP from X's TURN allocation
+	// address Y to our allocation address. Our TURN allocation only
+	// admits inbound from sources on its permission list. If we've
+	// never explicitly permissioned Y, the packet is silently
+	// dropped at the TURN server side — invisible to both peers.
+	//
+	// Mirrors pion's own tcp-alloc example: peers exchange
+	// relay-allocation addresses via a signaling channel, then
+	// each side explicitly CreatePermission's the peer's relay
+	// addr before accepting. The rendezvous (jf.14) and entmoot
+	// transport-ad (jf.7+) are our signaling channels; this is
+	// the missing CreatePermission call.
+	//
+	// PermitTURNPeer is a no-op when tm.turn is nil (peers without
+	// their own TURN allocation, e.g. phobos). Errors are logged at
+	// Debug — non-fatal; the existing permissionRefreshLoop and
+	// allocation-rotation paths re-issue from the stored
+	// permittedAddrs set on the next tick.
+	if err := tm.PermitTURNPeer(newAddr); err != nil {
+		slog.Debug("permit turn peer on endpoint install failed",
+			"node_id", nodeID, "addr", newAddr, "error", err)
+	}
 	return nil
 }
 
