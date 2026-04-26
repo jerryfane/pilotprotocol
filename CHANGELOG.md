@@ -10,6 +10,19 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.11] - 2026-04-27
+
+### Fixed
+
+- **TURN-ingress stream replies now reach the routing ladder.** `TunnelManager.Send`
+  no longer rejects peers whose authenticated ingress path has no direct UDP
+  address but does have a peer TURN endpoint or cached transport connection.
+  Those sends now flow into `writeFrame`, which can choose TURN, cached conn,
+  direct UDP, own relay, or return the real routing error.
+- **Inbound stream SYNs no longer create fake established conns when SYN-ACK
+  cannot be sent.** Pilot now checks SYN-ACK send failures, closes the half-open
+  conn, and avoids exposing it to IPC listeners as `ESTABLISHED`.
+
 ## [v1.9.0-jf.15.10] - 2026-04-27
 
 ### Fixed

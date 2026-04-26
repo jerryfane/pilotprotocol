@@ -2593,18 +2593,25 @@ func (tm *TunnelManager) encryptFrame(pc *peerCrypto, plaintext []byte) []byte {
 func (tm *TunnelManager) Send(nodeID uint32, pkt *protocol.Packet) error {
 	tm.mu.RLock()
 	p := tm.paths[nodeID]
+	hasTURNEp := tm.peerTURN[nodeID] != nil
+	cachedConn := tm.peerConns[nodeID]
 	tm.mu.RUnlock()
 
-	// Accept relay-only paths (direct=nil, viaRelay=true) because
-	// writeFrame will route via the beacon without needing a direct
-	// endpoint. Reject only if we have no entry at all, or an entry
-	// with neither direct nor relay viable.
-	if p == nil || (p.direct == nil && !p.viaRelay) {
+	// Accept any known peer path and let writeFrame's transport ladder
+	// decide the concrete route. TURN-ingress peers can have
+	// direct=nil/viaRelay=false while still being reachable through
+	// peerTURN or a cached DialedConn; rejecting that shape here skips
+	// the very tiers that know how to route it.
+	if p == nil && !hasTURNEp && cachedConn == nil {
 		return fmt.Errorf("no tunnel to node %d", nodeID)
 	}
 	// addr is non-nil only for direct peers; writeFrame ignores it for
 	// relay peers (routes via beaconAddr instead).
-	return tm.SendTo(p.direct, nodeID, pkt)
+	var direct *net.UDPAddr
+	if p != nil {
+		direct = p.direct
+	}
+	return tm.SendTo(direct, nodeID, pkt)
 }
 
 // SendTo sends a packet to a specific UDP address (relay-aware).

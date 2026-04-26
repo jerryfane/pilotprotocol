@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
+	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
 // The tests below lock down the v1.9.0-jf.4 reply-on-ingress routing
@@ -297,6 +298,34 @@ func TestWriteFrame_UsesCachedTURNConn(t *testing.T) {
 	last := stub.last.Load().([]byte)
 	if string(last) != string(payload) {
 		t.Fatalf("payload mismatch: %x vs %x", last, payload)
+	}
+}
+
+func TestSend_AllowsCachedConnWithoutDirectPath(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 4242
+	stub := &stubDialedConn{network: "turn", remote: "198.51.100.77:3478"}
+	tm.mu.Lock()
+	tm.paths[peer] = &peerPath{}
+	tm.peerConns[peer] = stub
+	tm.mu.Unlock()
+
+	pkt := &protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagSYN | protocol.FlagACK,
+		Protocol: protocol.ProtoStream,
+		Src:      protocol.Addr{Node: 1},
+		Dst:      protocol.Addr{Node: peer},
+		SrcPort:  protocol.PortManagedScore,
+		DstPort:  49152,
+	}
+	if err := tm.Send(peer, pkt); err != nil {
+		t.Fatalf("Send with cached conn and no direct path: %v", err)
+	}
+	if got := stub.sends.Load(); got != 1 {
+		t.Fatalf("stub.sends=%d, want 1", got)
 	}
 }
 

@@ -2041,7 +2041,15 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 				Ack:      eAck,
 				Window:   existing.RecvWindow(),
 			}
-			d.tunnels.Send(pkt.Src.Node, synack)
+			if err := d.tunnels.Send(pkt.Src.Node, synack); err != nil {
+				slog.Warn("resend SYN-ACK failed",
+					"src_node", pkt.Src.Node,
+					"src_addr", pkt.Src,
+					"src_port", pkt.SrcPort,
+					"dst_port", pkt.DstPort,
+					"conn_id", existing.ID,
+					"err", err)
+			}
 			return
 		}
 
@@ -2139,7 +2147,18 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			Ack:      conn.RecvAck,
 			Window:   conn.RecvWindow(),
 		}
-		d.tunnels.Send(pkt.Src.Node, synack)
+		if err := d.tunnels.Send(pkt.Src.Node, synack); err != nil {
+			conn.Mu.Unlock()
+			d.abortConnection(conn)
+			slog.Warn("SYN-ACK send failed, closing half-open connection",
+				"src_node", pkt.Src.Node,
+				"src_addr", pkt.Src,
+				"src_port", pkt.SrcPort,
+				"dst_port", pkt.DstPort,
+				"conn_id", conn.ID,
+				"err", err)
+			return
+		}
 		conn.SendSeq++
 		conn.State = StateEstablished
 		conn.Mu.Unlock()
