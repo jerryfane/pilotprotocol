@@ -2728,6 +2728,15 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	}
 }
 
+func (d *Daemon) abortConnection(conn *Connection) {
+	conn.CloseRecvBuf()
+	conn.Mu.Lock()
+	conn.State = StateClosed
+	conn.LastActivity = time.Now()
+	conn.Mu.Unlock()
+	d.ports.RemoveConnection(conn.ID)
+}
+
 // racingRelaySYN re-transmits the SYN packet through the beacon relay
 // in parallel with DialConnection's main direct-retry loop (v1.9.0-
 // jf.11a.3). Waits DialRelayHeadStart first so direct wins

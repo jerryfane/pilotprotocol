@@ -384,6 +384,7 @@ func (s *IPCServer) handleSend(conn *ipcConn, payload []byte) {
 	}
 
 	if err := s.daemon.SendData(c, data); err != nil {
+		s.daemon.abortConnection(c)
 		s.sendError(conn, fmt.Sprintf("send: %v", err))
 	}
 }

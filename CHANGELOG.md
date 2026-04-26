@@ -10,6 +10,17 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.8] - 2026-04-26
+
+### Fixed
+
+- **Failed IPC stream sends now poison the affected virtual connection.**
+  When daemon-side `SendData` rejects a `CmdSend`, Pilot closes/removes that
+  conn instead of leaving stale state behind for future writes. This preserves
+  existing `DialConnection` semantics for peers that accept and immediately
+  close, while ensuring yamux/request-response clients observe EOF and stop
+  reusing the dead stream.
+
 ## [v1.9.0-jf.15.7] - 2026-04-26
 
 Periodic peer-side rendezvous re-lookup. Closes the silent-death
