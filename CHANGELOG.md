@@ -10,6 +10,27 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.19] - 2026-04-27
+
+### Fixed
+
+- **Pilot stream accept now waits for the full three-way handshake.** Passive
+  stream opens remain in `SYN_RECV` after sending `SYN-ACK` and are only
+  exposed to IPC listeners after the peer's final ACK arrives. This prevents
+  Entmoot from accepting half-open `:1004` streams that can later surface as
+  premature EOF, `connection not found`, or zero-byte accepted sessions during
+  reconcile.
+- **Stale passive stream handshakes are now reaped.** Lost-final-ACK cases no
+  longer leave `SYN_RECV` connections around indefinitely; outbound `SYN_SENT`
+  remains owned by `DialConnection` so active dial timeout errors stay
+  explicit.
+
+### Tests
+
+- Added stream lifecycle coverage proving inbound SYN does not queue an accept
+  before final ACK, duplicate final ACKs do not duplicate accepts, and stale
+  passive handshakes are cleaned up without stealing active dial timeouts.
+
 ## [v1.9.0-jf.15.18] - 2026-04-27
 
 ### Fixed
