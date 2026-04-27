@@ -28,14 +28,67 @@ func TestDuplicateInboundSYNDoesNotDuplicateAccept(t *testing.T) {
 	d.handleStreamPacket(pkt)
 	d.handleStreamPacket(pkt)
 
+	if got := len(ln.AcceptCh); got != 0 {
+		t.Fatalf("accept queue depth = %d, want 0 before final ACK", got)
+	}
+
+	d.handleStreamPacket(finalACKPkt(2, 49152, protocol.PortManagedScore, 1))
+	d.handleStreamPacket(finalACKPkt(2, 49152, protocol.PortManagedScore, 1))
+
 	if got := len(ln.AcceptCh); got != 1 {
-		t.Fatalf("accept queue depth = %d, want 1 after duplicate SYN", got)
+		t.Fatalf("accept queue depth = %d, want 1 after duplicate final ACK", got)
 	}
 	if got := d.ports.TotalActiveConnections(); got != 1 {
 		t.Fatalf("active connections = %d, want 1 after duplicate SYN", got)
 	}
 
 	conn := <-ln.AcceptCh
+	d.ports.RemoveConnection(conn.ID)
+}
+
+func TestInboundSYNDoesNotQueueAcceptBeforeFinalACK(t *testing.T) {
+	d := New(Config{
+		Email:        "stream-cleanup@example.com",
+		Public:       true,
+		SYNRateLimit: AcceptQueueLen * 4,
+	})
+	ln, err := d.ports.Bind(protocol.PortManagedScore)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	rec := installRecordingTunnelConn(d, 2)
+
+	d.handleStreamPacket(inboundSYNPkt(2, 49152, 100))
+	if got := len(ln.AcceptCh); got != 0 {
+		t.Fatalf("accept queue depth = %d, want 0 before handshake final ACK", got)
+	}
+	conn := d.ports.FindConnection(protocol.PortManagedScore, protocol.Addr{Node: 2}, 49152)
+	if conn == nil {
+		t.Fatal("passive connection not created")
+	}
+	conn.Mu.Lock()
+	state := conn.State
+	conn.Mu.Unlock()
+	if state != StateSynReceived {
+		t.Fatalf("state = %s, want SYN_RECV before final ACK", state)
+	}
+
+	pkts := rec.packets(t)
+	if len(pkts) != 1 || !pkts[0].HasFlag(protocol.FlagSYN) || !pkts[0].HasFlag(protocol.FlagACK) {
+		t.Fatalf("sent packets = %d, want one SYN-ACK", len(pkts))
+	}
+
+	d.handleStreamPacket(finalACKPkt(2, 49152, protocol.PortManagedScore, 1))
+	if got := len(ln.AcceptCh); got != 1 {
+		t.Fatalf("accept queue depth = %d, want 1 after final ACK", got)
+	}
+	conn = <-ln.AcceptCh
+	conn.Mu.Lock()
+	state = conn.State
+	conn.Mu.Unlock()
+	if state != StateEstablished {
+		t.Fatalf("state = %s, want ESTABLISHED after final ACK", state)
+	}
 	d.ports.RemoveConnection(conn.ID)
 }
 
@@ -55,7 +108,9 @@ func TestInboundSYNFullAcceptQueueRemovesRejectedConnection(t *testing.T) {
 	for i := 0; i < AcceptQueueLen+8; i++ {
 		nodeID := uint32(1000 + i)
 		installCleanupTunnelConn(d, nodeID)
-		d.handleStreamPacket(inboundSYNPkt(nodeID, uint16(49152+i), uint32(100+i)))
+		srcPort := uint16(49152 + i)
+		d.handleStreamPacket(inboundSYNPkt(nodeID, srcPort, uint32(100+i)))
+		d.handleStreamPacket(finalACKPkt(nodeID, srcPort, protocol.PortManagedScore, 1))
 	}
 
 	if got := len(ln.AcceptCh); got != AcceptQueueLen {
@@ -282,6 +337,10 @@ func TestInboundStreamRecordsQueueAndAcceptLifecycle(t *testing.T) {
 	installCleanupTunnelConn(d, 2)
 
 	d.handleStreamPacket(inboundSYNPkt(2, 49152, 100))
+	if got := len(ln.AcceptCh); got != 0 {
+		t.Fatalf("accept queue depth = %d, want 0 before final ACK", got)
+	}
+	d.handleStreamPacket(finalACKPkt(2, 49152, protocol.PortManagedScore, 1))
 
 	var conn *Connection
 	select {
@@ -546,6 +605,20 @@ func inboundSYNPkt(srcNode uint32, srcPort uint16, seq uint32) *protocol.Packet 
 		SrcPort:  srcPort,
 		DstPort:  protocol.PortManagedScore,
 		Seq:      seq,
+		Window:   512,
+	}
+}
+
+func finalACKPkt(srcNode uint32, srcPort uint16, dstPort uint16, ack uint32) *protocol.Packet {
+	return &protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagACK,
+		Protocol: protocol.ProtoStream,
+		Src:      protocol.Addr{Node: srcNode},
+		Dst:      protocol.Addr{Node: 1},
+		SrcPort:  srcPort,
+		DstPort:  dstPort,
+		Ack:      ack,
 		Window:   512,
 	}
 }

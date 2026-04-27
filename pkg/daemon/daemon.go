@@ -2169,24 +2169,6 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		conn.SendSeq++
 		conn.Mu.Unlock()
 		d.traceStream("synack.sent", conn)
-		d.setConnState(conn, StateEstablished, "synack sent")
-		d.webhook.Emit("conn.established", map[string]interface{}{
-			"src_addr": pkt.Src.String(), "src_port": pkt.SrcPort,
-			"dst_port": pkt.DstPort, "conn_id": conn.ID,
-		})
-
-		d.startRetxLoop(conn)
-		// Non-blocking push to accept queue — if full, clean up and RST
-		select {
-		case ln.AcceptCh <- conn:
-			d.markConnAcceptQueued(conn)
-		default:
-			slog.Warn("accept queue full after SYN-ACK, closing connection", "port", pkt.DstPort, "src_addr", pkt.Src)
-			d.traceStream("accept.full", conn)
-			d.setConnState(conn, StateClosed, "accept queue full")
-			d.removeConnection(conn, "accept queue full")
-			d.sendRST(pkt)
-		}
 		return
 	}
 
@@ -2340,6 +2322,27 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		conn := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort)
 		if conn == nil {
 			return
+		}
+
+		conn.Mu.Lock()
+		st := conn.State
+		sendSeq := conn.SendSeq
+		conn.Mu.Unlock()
+		if st == StateSynReceived {
+			if pkt.Ack < sendSeq {
+				d.traceStream("synack.final_ack_stale", conn, "ack", pkt.Ack, "send_seq", sendSeq)
+				return
+			}
+			d.setConnState(conn, StateEstablished, "final ack received")
+			d.traceStream("synack.final_ack", conn)
+			d.webhook.Emit("conn.established", map[string]interface{}{
+				"src_addr": pkt.Src.String(), "src_port": pkt.SrcPort,
+				"dst_port": pkt.DstPort, "conn_id": conn.ID,
+			})
+			d.startRetxLoop(conn)
+			if !d.queueAcceptedStream(conn, pkt) {
+				return
+			}
 		}
 
 		conn.Mu.Lock()
@@ -2565,6 +2568,42 @@ func (d *Daemon) sendRST(orig *protocol.Packet) {
 		DstPort:  orig.SrcPort,
 	}
 	d.tunnels.Send(orig.Src.Node, rst)
+}
+
+func (d *Daemon) queueAcceptedStream(conn *Connection, orig *protocol.Packet) bool {
+	conn.Mu.Lock()
+	alreadyQueued := !conn.AcceptQueuedAt.IsZero()
+	localPort := conn.LocalPort
+	remoteAddr := conn.RemoteAddr
+	conn.Mu.Unlock()
+	if alreadyQueued {
+		return true
+	}
+
+	ln := d.ports.GetListener(localPort)
+	if ln == nil {
+		d.traceStream("accept.listener_missing", conn)
+		d.abortConnection(conn)
+		if orig != nil {
+			d.sendRST(orig)
+		}
+		return false
+	}
+
+	select {
+	case ln.AcceptCh <- conn:
+		d.markConnAcceptQueued(conn)
+		return true
+	default:
+		slog.Warn("accept queue full after stream established", "port", localPort, "src_addr", remoteAddr)
+		d.traceStream("accept.full", conn)
+		d.setConnState(conn, StateClosed, "accept queue full")
+		d.removeConnection(conn, "accept queue full")
+		if orig != nil {
+			d.sendRST(orig)
+		}
+		return false
+	}
 }
 
 // DialConnection initiates a connection to a remote address:port.
