@@ -6,11 +6,27 @@ import (
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
+	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
 	"github.com/TeoSlayer/pilotprotocol/pkg/eventstream"
+	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
 // disableES disables the built-in eventstream service so tests can bind port 1002 via driver.
 func disableES(cfg *daemon.Config) { cfg.DisableEventStream = true }
+
+func subscribeEventually(t *testing.T, d *driver.Driver, addr protocol.Addr, topic string) *eventstream.Client {
+	t.Helper()
+
+	var client *eventstream.Client
+	if err := eventually(t, 5*time.Second, 50*time.Millisecond, fmt.Sprintf("eventstream subscribe %s", topic), func() error {
+		var err error
+		client, err = eventstream.Subscribe(d, addr, topic)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
 
 func TestEventStream(t *testing.T) {
 	t.Parallel()
@@ -361,16 +377,10 @@ func TestEventStreamSequentialMessages(t *testing.T) {
 	srv := eventstream.NewServer(a.Driver)
 	go srv.ListenAndServe()
 
-	sub, err := eventstream.Subscribe(b.Driver, a.Daemon.Addr(), "seq-topic")
-	if err != nil {
-		t.Fatalf("subscribe: %v", err)
-	}
+	sub := subscribeEventually(t, b.Driver, a.Daemon.Addr(), "seq-topic")
 	defer sub.Close()
 
-	pub, err := eventstream.Subscribe(c.Driver, a.Daemon.Addr(), "seq-topic")
-	if err != nil {
-		t.Fatalf("connect publisher: %v", err)
-	}
+	pub := subscribeEventually(t, c.Driver, a.Daemon.Addr(), "seq-topic")
 	defer pub.Close()
 
 	recv := make(chan *eventstream.Event, 20)

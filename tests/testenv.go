@@ -13,6 +13,7 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/pkg/beacon"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon"
 	"github.com/TeoSlayer/pilotprotocol/pkg/driver"
+	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 	"github.com/TeoSlayer/pilotprotocol/pkg/registry"
 )
 
@@ -143,11 +144,9 @@ func (env *TestEnv) AddDaemon(opts ...func(*daemon.Config)) *DaemonInfo {
 	}
 	env.daemons = append(env.daemons, d)
 
-	drv, err := driver.Connect(sockPath)
-	if err != nil {
-		env.t.Fatalf("driver %d connect: %v", idx, err)
-	}
+	drv := env.waitDriverReady(idx, sockPath, d.NodeID())
 	env.drivers = append(env.drivers, drv)
+	env.waitRegistryReady(idx, d.NodeID())
 
 	return &DaemonInfo{Daemon: d, Driver: drv, SocketPath: sockPath}
 }
@@ -181,8 +180,102 @@ func (env *TestEnv) AddDaemonOnly(opts ...func(*daemon.Config)) (*daemon.Daemon,
 		env.t.Fatalf("daemon %d start: %v", idx, err)
 	}
 	env.daemons = append(env.daemons, d)
+	env.waitRegistryReady(idx, d.NodeID())
 
 	return d, sockPath
+}
+
+func (env *TestEnv) waitDriverReady(idx int, sockPath string, nodeID uint32) *driver.Driver {
+	env.t.Helper()
+
+	var drv *driver.Driver
+	if err := eventually(env.t, 5*time.Second, 20*time.Millisecond, fmt.Sprintf("daemon %d driver ready", idx), func() error {
+		if drv != nil {
+			drv.Close()
+			drv = nil
+		}
+		var err error
+		drv, err = driver.Connect(sockPath)
+		if err != nil {
+			return err
+		}
+		info, err := drv.Info()
+		if err != nil {
+			return err
+		}
+		got, ok := info["node_id"].(float64)
+		if !ok || uint32(got) != nodeID {
+			return fmt.Errorf("info node_id=%v, want %d", info["node_id"], nodeID)
+		}
+		return nil
+	}); err != nil {
+		env.t.Fatal(err)
+	}
+	return drv
+}
+
+func (env *TestEnv) waitRegistryReady(idx int, nodeID uint32) {
+	env.t.Helper()
+
+	if err := eventually(env.t, 5*time.Second, 20*time.Millisecond, fmt.Sprintf("daemon %d registry lookup", idx), func() error {
+		rc, err := registry.Dial(env.RegistryAddr)
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+
+		resp, err := rc.Lookup(nodeID)
+		if err != nil {
+			return err
+		}
+		if resp["error"] != nil {
+			return fmt.Errorf("lookup node %d: %v", nodeID, resp["error"])
+		}
+		return nil
+	}); err != nil {
+		env.t.Fatal(err)
+	}
+}
+
+func (env *TestEnv) DialAddrEventually(src *driver.Driver, dst protocol.Addr, port uint16) *driver.Conn {
+	env.t.Helper()
+
+	var conn *driver.Conn
+	if err := eventually(env.t, 5*time.Second, 50*time.Millisecond, fmt.Sprintf("dial %s:%d", dst, port), func() error {
+		var err error
+		conn, err = src.DialAddr(dst, port)
+		if err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		env.t.Fatal(err)
+	}
+	return conn
+}
+
+func eventually(t *testing.T, timeout, interval time.Duration, label string, fn func() error) error {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	if testDeadline, ok := t.Deadline(); ok {
+		if until := time.Until(testDeadline) / 4; until > 0 && until < timeout {
+			deadline = time.Now().Add(until)
+		}
+	}
+
+	var lastErr error
+	for {
+		if err := fn(); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s did not become ready within %s: %w", label, timeout, lastErr)
+		}
+		time.Sleep(interval)
+	}
 }
 
 // SocketPath returns a unique socket path within the temp directory.

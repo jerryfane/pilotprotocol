@@ -59,10 +59,7 @@ func TestCmdPeers(t *testing.T) {
 	}
 	defer ln.Close()
 
-	conn, err := a.Driver.DialAddr(b.Daemon.Addr(), 8100)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
+	conn := env.DialAddrEventually(a.Driver, b.Daemon.Addr(), 8100)
 	conn.Write([]byte("hello"))
 	conn.Close()
 
