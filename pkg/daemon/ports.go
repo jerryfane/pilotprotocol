@@ -118,6 +118,7 @@ const (
 type Connection struct {
 	Mu           sync.Mutex // protects State, SendSeq, RecvAck, LastActivity, Stats
 	ID           uint32
+	CreatedAt    time.Time
 	LocalAddr    protocol.Addr // our virtual address
 	LocalPort    uint16
 	RemoteAddr   protocol.Addr
@@ -331,6 +332,7 @@ func (pm *PortManager) NewConnection(localPort uint16, remoteAddr protocol.Addr,
 
 	conn := &Connection{
 		ID:           pm.nextConnID,
+		CreatedAt:    time.Now(),
 		LocalPort:    localPort,
 		RemoteAddr:   remoteAddr,
 		RemotePort:   remotePort,
@@ -769,10 +771,11 @@ func seqAfterOrEqual(a, b uint32) bool {
 // ACK number (next expected seq).
 //
 // Three-phase design to avoid both deadlock and sequence leaks:
-//   Phase 1: Collect segments to deliver under RecvMu (don't advance ExpectedSeq).
-//   Phase 2: Deliver outside lock (prevents routeLoop deadlock, C1 fix).
-//   Phase 3: Re-acquire lock, advance ExpectedSeq only for delivered segments,
-//            re-buffer undelivered OOO segments.
+//
+//	Phase 1: Collect segments to deliver under RecvMu (don't advance ExpectedSeq).
+//	Phase 2: Deliver outside lock (prevents routeLoop deadlock, C1 fix).
+//	Phase 3: Re-acquire lock, advance ExpectedSeq only for delivered segments,
+//	         re-buffer undelivered OOO segments.
 //
 // Safe because routeLoop is single-goroutine — no concurrent DeliverInOrder
 // calls for the same connection between Phase 2 and Phase 3.

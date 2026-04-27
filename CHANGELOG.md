@@ -12,6 +12,12 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ### Changed
 
+- **Port-level stream diagnostics are now explicit and opt-in.** The daemon
+  has a new `-trace-streams` flag that emits structured INFO logs for virtual
+  stream lifecycle events: SYN/SYN-ACK, state transitions, accept queue
+  pressure, IPC close/send failures, timeout cleanup, RST/FIN, and connection
+  removal. This gives Entmoot `:1004` debugging a separate signal from TURN
+  route selection and packet-tier tracing.
 - **TURN route selection is now centralized in a policy layer.**
   `TunnelManager.writeFrame` and `Daemon.DialConnection` now delegate route
   precedence to a shared policy helper instead of carrying separate

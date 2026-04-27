@@ -162,6 +162,12 @@ type Config struct {
 	// always-on observability spine; this flag adds per-event
 	// detail. (v1.9.0-jf.15.2)
 	TraceSends bool
+
+	// TraceStreams, when true, gates per-stream lifecycle INFO logs.
+	// This is intentionally separate from TraceSends: route/tier
+	// decisions explain how packets leave the node, while stream traces
+	// explain the virtual L4 lifecycle exposed to IPC clients.
+	TraceStreams bool
 }
 
 // Default tuning constants (used when Config fields are zero).
@@ -1377,11 +1383,9 @@ func (d *Daemon) doStop() {
 			d.tunnels.Send(conn.RemoteAddr.Node, fin)
 		}
 		// On shutdown, skip TIME_WAIT and remove immediately
-		conn.Mu.Lock()
-		conn.State = StateClosed
-		conn.Mu.Unlock()
+		d.setConnState(conn, StateClosed, "daemon shutdown")
 		conn.CloseRecvBuf()
-		d.ports.RemoveConnection(conn.ID)
+		d.removeConnection(conn, "daemon shutdown")
 	}
 	if len(conns) > 0 {
 		slog.Info("closed active connections", "count", len(conns))
@@ -2024,6 +2028,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 
 		// Check for retransmitted SYN (connection already exists for this 4-tuple)
 		if existing := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort); existing != nil {
+			d.traceStream("syn.duplicate", existing)
 			// Resend SYN-ACK for the existing connection
 			existing.Mu.Lock()
 			eSeq := existing.SendSeq
@@ -2050,6 +2055,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 					"conn_id", existing.ID,
 					"err", err)
 			}
+			d.traceStream("synack.resent", existing)
 			return
 		}
 
@@ -2123,6 +2129,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		conn.RecvAck = pkt.Seq + 1
 		conn.ExpectedSeq = pkt.Seq + 1 // first data segment after SYN
 		conn.Mu.Unlock()
+		d.traceStream("syn.recv", conn, "new_state", StateSynReceived.String())
 		d.webhook.Emit("conn.syn_received", map[string]interface{}{
 			"src_addr": pkt.Src.String(), "src_port": pkt.SrcPort,
 			"dst_port": pkt.DstPort, "conn_id": conn.ID,
@@ -2160,8 +2167,11 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			return
 		}
 		conn.SendSeq++
+		old := conn.State
 		conn.State = StateEstablished
 		conn.Mu.Unlock()
+		d.traceStream("synack.sent", conn)
+		d.traceStreamTransition(conn, old, StateEstablished, "synack sent")
 		d.webhook.Emit("conn.established", map[string]interface{}{
 			"src_addr": pkt.Src.String(), "src_port": pkt.SrcPort,
 			"dst_port": pkt.DstPort, "conn_id": conn.ID,
@@ -2171,12 +2181,12 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Non-blocking push to accept queue — if full, clean up and RST
 		select {
 		case ln.AcceptCh <- conn:
+			d.traceStream("accept.queued", conn)
 		default:
 			slog.Warn("accept queue full after SYN-ACK, closing connection", "port", pkt.DstPort, "src_addr", pkt.Src)
-			conn.Mu.Lock()
-			conn.State = StateClosed
-			conn.Mu.Unlock()
-			d.ports.RemoveConnection(conn.ID)
+			d.traceStream("accept.full", conn)
+			d.setConnState(conn, StateClosed, "accept queue full")
+			d.removeConnection(conn, "accept queue full")
 			d.sendRST(pkt)
 		}
 		return
@@ -2194,10 +2204,13 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			return
 		}
 		conn.RecvAck = pkt.Seq + 1
+		old := conn.State
 		conn.State = StateEstablished
 		sendSeq := conn.SendSeq
 		recvAck := conn.RecvAck
 		conn.Mu.Unlock()
+		d.traceStreamTransition(conn, old, StateEstablished, "synack received")
+		d.traceStream("synack.recv", conn)
 
 		conn.RecvMu.Lock()
 		conn.ExpectedSeq = pkt.Seq + 1 // first data segment after SYN-ACK
@@ -2231,6 +2244,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		if conn != nil {
 			conn.CloseRecvBuf()
 			conn.Mu.Lock()
+			old := conn.State
 			wasFinWait := conn.State == StateFinWait
 			wasTimeWait := conn.State == StateTimeWait
 			conn.State = StateTimeWait
@@ -2238,6 +2252,8 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			conn.KeepaliveUnacked = 0
 			sendSeq := conn.SendSeq
 			conn.Mu.Unlock()
+			d.traceStreamTransition(conn, old, StateTimeWait, "fin received")
+			d.traceStream("fin.recv", conn)
 			// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
 			if wasFinWait {
 				conn.RetxMu.Lock()
@@ -2273,11 +2289,10 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 	if pkt.HasFlag(protocol.FlagRST) {
 		conn := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort)
 		if conn != nil {
-			conn.Mu.Lock()
-			conn.State = StateClosed
-			conn.Mu.Unlock()
+			d.setConnState(conn, StateClosed, "rst received")
+			d.traceStream("rst.recv", conn)
 			conn.CloseRecvBuf()
-			d.ports.RemoveConnection(conn.ID)
+			d.removeConnection(conn, "rst received")
 			d.webhook.Emit("conn.rst", map[string]interface{}{
 				"remote_addr": pkt.Src.String(), "remote_port": pkt.SrcPort,
 				"local_port": pkt.DstPort, "conn_id": conn.ID,
@@ -2550,6 +2565,7 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	conn.LocalAddr = protocol.Addr{Network: dstAddr.Network, Node: d.NodeID()}
 	conn.State = StateSynSent
 	conn.Mu.Unlock()
+	d.traceStream("syn.sent", conn, "new_state", StateSynSent.String())
 
 	// Send SYN with our receive window
 	syn := &protocol.Packet{
@@ -2565,7 +2581,7 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	}
 
 	if err := d.tunnels.Send(dstAddr.Node, syn); err != nil {
-		d.ports.RemoveConnection(conn.ID)
+		d.removeConnection(conn, "syn send failed")
 		return nil, fmt.Errorf("send SYN: %w", err)
 	}
 	conn.Mu.Lock()
@@ -2739,7 +2755,8 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 			}
 
 			if retries > maxRetries {
-				d.ports.RemoveConnection(conn.ID)
+				d.traceStream("dial.timeout", conn, "retries", retries)
+				d.removeConnection(conn, "dial timeout")
 				return nil, protocol.ErrDialTimeout
 			}
 			// Resend SYN (uses relay if relayActive)
@@ -2758,11 +2775,11 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 
 func (d *Daemon) abortConnection(conn *Connection) {
 	conn.CloseRecvBuf()
+	d.setConnState(conn, StateClosed, "abort")
 	conn.Mu.Lock()
-	conn.State = StateClosed
 	conn.LastActivity = time.Now()
 	conn.Mu.Unlock()
-	d.ports.RemoveConnection(conn.ID)
+	d.removeConnection(conn, "abort")
 }
 
 // racingRelaySYN re-transmits the SYN packet through the beacon relay
@@ -3056,7 +3073,7 @@ func (d *Daemon) retxLoop(conn *Connection) {
 			} else if st == StateClosed {
 				// Connection abandoned (max retransmit) — clean up immediately
 				conn.CloseRecvBuf()
-				d.ports.RemoveConnection(conn.ID)
+				d.removeConnection(conn, "retransmit closed")
 				return
 			} else {
 				// TIME_WAIT or other non-active state — stop retransmitting
@@ -3104,9 +3121,7 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 				if conn.RetxSend != nil {
 					conn.RetxSend(rst)
 				}
-				conn.Mu.Lock()
-				conn.State = StateClosed
-				conn.Mu.Unlock()
+				d.setConnState(conn, StateClosed, "max retransmits")
 				return
 			}
 
@@ -3216,9 +3231,11 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	}
 	conn.CloseRecvBuf()
 	conn.Mu.Lock()
+	old := conn.State
 	conn.State = StateFinWait
 	conn.LastActivity = time.Now()
 	conn.Mu.Unlock()
+	d.traceStreamTransition(conn, old, StateFinWait, "close requested")
 }
 
 // SendDatagram sends an unreliable packet.
@@ -3765,7 +3782,7 @@ func (d *Daemon) idleSweepLoop() {
 			stale := d.ports.StaleConnections(timeWaitDur)
 			for _, conn := range stale {
 				conn.CloseRecvBuf()
-				d.ports.RemoveConnection(conn.ID)
+				d.removeConnection(conn, "stale cleanup")
 			}
 
 			// Close connections idle beyond timeout
@@ -3808,11 +3825,9 @@ func (d *Daemon) idleSweepLoop() {
 						DstPort:  conn.RemotePort,
 					}
 					d.tunnels.Send(conn.RemoteAddr.Node, rst)
-					conn.Mu.Lock()
-					conn.State = StateClosed
-					conn.Mu.Unlock()
+					d.setConnState(conn, StateClosed, "dead peer")
 					conn.CloseRecvBuf()
-					d.ports.RemoveConnection(conn.ID)
+					d.removeConnection(conn, "dead peer")
 					d.webhook.Emit("conn.dead_peer", map[string]interface{}{
 						"remote_addr": conn.RemoteAddr.String(), "remote_port": conn.RemotePort,
 						"local_port": conn.LocalPort, "conn_id": conn.ID,

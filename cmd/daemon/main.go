@@ -79,6 +79,7 @@ func main() {
 	peerKeepalive := flag.Duration("peer-keepalive", 0, `interval for per-peer tunnel keepalives (default 25s; set to a negative duration like -1s to disable). Sends one tiny encrypted control packet per authenticated peer to keep TURN allocation permissions (RFC 8656 §9, 5-min TTL) and NAT mappings fresh in both directions. Closes the post-rotation chicken-and-egg deadlock between peers behind TURN. (v1.9.0-jf.13)`)
 	rendezvousURL := flag.String("rendezvous-url", "", `base URL of a Pkarr-style endpoint rendezvous service (e.g. "https://rendezvous.example.com"; empty = disabled). When set, the daemon publishes its TURN endpoint on every rotation and consults the rendezvous on cold-dial fallback to refresh stale cached endpoints. Composes with -hide-ip + -outbound-turn-only + -no-registry-endpoint to fix the cold-start bootstrap deadlock that survives jf.13 keepalive. See cmd/pilot-rendezvous for the companion server. (v1.9.0-jf.14)`)
 	traceSends := flag.Bool("trace-sends", false, `emit one INFO log per writeFrame tier decision and per SendTo "queued pending key exchange" branch. High volume (~10 events/min/peer-pair in steady state, more during dial storms). Off by default; turn on for short-lived diagnostic windows. Per-tier counters in 'pilotctl info' are populated regardless. (v1.9.0-jf.15.2)`)
+	traceStreams := flag.Bool("trace-streams", false, `emit INFO logs for virtual stream lifecycle events (SYN/SYN-ACK/ESTABLISHED/FIN/RST/IPC close/removal). High volume during dial storms; intended for short diagnostic windows when debugging port-level sessions such as Entmoot :1004.`)
 	turnProvider := flag.String("turn-provider", "", `TURN credential provider ("" disables TURN; "static"=long-lived creds; "cloudflare"=short-lived Cloudflare Realtime TURN)`)
 	turnServer := flag.String("turn-server", "", "TURN server host:port (required when -turn-provider=static)")
 	turnTransport := flag.String("turn-transport", "udp", "TURN client→server transport: udp|tcp|tls")
@@ -170,6 +171,7 @@ func main() {
 		PeerKeepaliveInterval: *peerKeepalive,
 		RendezvousURL:         *rendezvousURL,
 		TraceSends:            *traceSends,
+		TraceStreams:          *traceStreams,
 	})
 
 	if err := d.Start(); err != nil {
