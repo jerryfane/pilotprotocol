@@ -452,9 +452,11 @@ func (pm *PortManager) ConnectionList() []ConnectionInfo {
 	return list
 }
 
-// StaleConnections returns connections in a terminal state that should be cleaned up.
-// CLOSED, FIN_WAIT, CLOSE_WAIT are cleaned up immediately.
-// TIME_WAIT connections are cleaned up after timeWaitDur.
+// StaleConnections returns connections that should be cleaned up.
+// CLOSED and CLOSE_WAIT are cleaned up immediately. FIN_WAIT, TIME_WAIT,
+// and passive half-open SYN_RECV connections are cleaned up after
+// timeWaitDur. Outbound SYN_SENT is intentionally left to DialConnection's
+// retry budget so active dials can report their own timeout reason.
 func (pm *PortManager) StaleConnections(timeWaitDur time.Duration) []*Connection {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -468,7 +470,7 @@ func (pm *PortManager) StaleConnections(timeWaitDur time.Duration) []*Connection
 		switch st {
 		case StateClosed, StateCloseWait:
 			stale = append(stale, c)
-		case StateFinWait, StateTimeWait:
+		case StateFinWait, StateTimeWait, StateSynReceived:
 			if now.Sub(la) > timeWaitDur {
 				stale = append(stale, c)
 			}

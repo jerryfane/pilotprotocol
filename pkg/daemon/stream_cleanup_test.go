@@ -143,13 +143,27 @@ func TestPortManagerStaleConnectionsFINWaitAndTIMEWAIT(t *testing.T) {
 	setConnStateAndActivity(staleTimeWait, StateTimeWait, now.Add(-2*time.Hour))
 	closed := pm.NewConnection(4004, protocol.Addr{Node: 6}, 5004)
 	setConnStateAndActivity(closed, StateClosed, now)
+	staleSynRecv := pm.NewConnection(4005, protocol.Addr{Node: 7}, 5005)
+	setConnStateAndActivity(staleSynRecv, StateSynReceived, now.Add(-2*time.Hour))
+	freshSynRecv := pm.NewConnection(4006, protocol.Addr{Node: 8}, 5006)
+	setConnStateAndActivity(freshSynRecv, StateSynReceived, now)
+	synSent := pm.NewConnection(4007, protocol.Addr{Node: 9}, 5007)
+	setConnStateAndActivity(synSent, StateSynSent, now.Add(-2*time.Hour))
 
 	stale := pm.StaleConnections(time.Hour)
 	assertStaleIDs(t, stale, map[uint32]bool{
 		staleFin.ID:      true,
 		staleTimeWait.ID: true,
 		closed.ID:        true,
+		staleSynRecv.ID:  true,
 	})
+	for _, id := range []uint32{freshSynRecv.ID, synSent.ID} {
+		for _, got := range stale {
+			if got.ID == id {
+				t.Fatalf("connection %d unexpectedly stale in state %s", id, got.State)
+			}
+		}
+	}
 }
 
 func TestDialConnectionRejectsClosingState(t *testing.T) {
