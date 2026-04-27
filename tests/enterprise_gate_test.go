@@ -456,7 +456,7 @@ func TestPoloScoreConcurrent(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -629,7 +629,7 @@ func TestClearKeyExpiry(t *testing.T) {
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -4228,7 +4228,7 @@ func TestPersistenceEnterprisePolicyWithPorts(t *testing.T) {
 	// Phase 1: create enterprise network with policy
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -4265,7 +4265,7 @@ func TestPersistenceEnterprisePolicyWithPorts(t *testing.T) {
 	// Phase 2: restart and verify
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -4814,7 +4814,7 @@ func TestExternalIdentityIntegration(t *testing.T) {
 	// Phase 1: Set up registry with identity webhook
 	reg := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -4947,7 +4947,7 @@ func TestExternalIdentityIntegration(t *testing.T) {
 
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -5428,7 +5428,7 @@ func TestBlueprintPersistence(t *testing.T) {
 	// Start first server with persistence
 	srv1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	srv1.SetAdminToken(TestAdminToken)
-	go srv1.ListenAndServe(":0")
+	go srv1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-srv1.Ready():
 	case <-time.After(5 * time.Second):
@@ -5467,7 +5467,7 @@ func TestBlueprintPersistence(t *testing.T) {
 	// Start second server from persisted state
 	srv2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	srv2.SetAdminToken(TestAdminToken)
-	go srv2.ListenAndServe(":0")
+	go srv2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-srv2.Ready():
 	case <-time.After(5 * time.Second):

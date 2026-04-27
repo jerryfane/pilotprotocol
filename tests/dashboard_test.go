@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -109,20 +108,13 @@ func TestDashboardHTTPEndpoints(t *testing.T) {
 	r := registry.New("127.0.0.1:9001")
 	defer r.Close()
 
-	// Find a free port for the dashboard
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 
 	// Wait for dashboard to start
 	var client http.Client
 	client.Timeout = 2 * time.Second
 	var resp *http.Response
+	var err error
 	for i := 0; i < 20; i++ {
 		resp, err = client.Get(fmt.Sprintf("http://%s/api/stats", dashAddr))
 		if err == nil {
@@ -194,19 +186,12 @@ func TestDashboardNoIPLeak(t *testing.T) {
 	addr := r.Addr().String()
 	dashRegisterNode(t, addr, "leak-test")
 
-	// Find a free port for the dashboard
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 
 	var client http.Client
 	client.Timeout = 2 * time.Second
 	var resp *http.Response
+	var err error
 	for i := 0; i < 20; i++ {
 		resp, err = client.Get(fmt.Sprintf("http://%s/api/stats", dashAddr))
 		if err == nil {

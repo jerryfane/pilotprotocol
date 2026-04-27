@@ -17,7 +17,7 @@ func TestPoloScoreDefault(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -27,7 +27,7 @@ func TestPoloScoreDefault(t *testing.T) {
 
 	// Start local registry for testing
 	reg := registry.NewWithStore(b.Addr().String(), "")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -77,7 +77,7 @@ func TestPoloScoreUpdate(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -87,7 +87,7 @@ func TestPoloScoreUpdate(t *testing.T) {
 
 	// Start local registry for testing
 	reg := registry.NewWithStore(b.Addr().String(), "")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -162,7 +162,7 @@ func TestPoloScoreSet(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -172,7 +172,7 @@ func TestPoloScoreSet(t *testing.T) {
 
 	// Start local registry for testing
 	reg := registry.NewWithStore(b.Addr().String(), "")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -247,7 +247,7 @@ func TestPoloScoreGet(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -257,7 +257,7 @@ func TestPoloScoreGet(t *testing.T) {
 
 	// Start local registry for testing
 	reg := registry.NewWithStore(b.Addr().String(), "")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -325,7 +325,7 @@ func TestPoloScorePersistence(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -343,7 +343,7 @@ func TestPoloScorePersistence(t *testing.T) {
 
 	// Phase 1: Start registry, register node, set polo
 	reg1 := registry.NewWithStore(beaconAddr, storePath)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -378,7 +378,7 @@ func TestPoloScorePersistence(t *testing.T) {
 
 	// Phase 2: Start new registry loading from the same store
 	reg2 := registry.NewWithStore(beaconAddr, storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -410,7 +410,7 @@ func TestPoloScoreNonExistentNode(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -420,7 +420,7 @@ func TestPoloScoreNonExistentNode(t *testing.T) {
 
 	// Start local registry for testing
 	reg := registry.NewWithStore(b.Addr().String(), "")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -462,7 +462,7 @@ func TestPoloScoreEdgeCases(t *testing.T) {
 
 	// Start beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -472,7 +472,7 @@ func TestPoloScoreEdgeCases(t *testing.T) {
 
 	// Start local registry for testing
 	reg := registry.NewWithStore(b.Addr().String(), "")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

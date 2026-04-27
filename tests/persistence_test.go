@@ -24,7 +24,7 @@ func TestRegistryPersistence(t *testing.T) {
 	// Phase 1: start registry, register nodes, create network
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -81,7 +81,7 @@ func TestRegistryPersistence(t *testing.T) {
 
 	// Phase 2: start new registry from the same store file
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -165,7 +165,7 @@ func TestPersistenceEnterpriseData(t *testing.T) {
 	// Phase 1: set up enterprise state
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -254,7 +254,7 @@ func TestPersistenceEnterpriseData(t *testing.T) {
 	// Phase 2: restart and verify
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):

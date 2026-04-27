@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// ServeDashboard starts an HTTP server serving the dashboard UI and stats API.
-func (s *Server) ServeDashboard(addr string) error {
+// DashboardHandler returns the dashboard UI and stats API handler.
+func (s *Server) DashboardHandler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -219,8 +219,13 @@ func (s *Server) ServeDashboard(addr string) error {
 	mux.HandleFunc("/debug/pprof/symbol", localhostOnly(pprof.Symbol))
 	mux.HandleFunc("/debug/pprof/trace", localhostOnly(pprof.Trace))
 
+	return mux
+}
+
+// ServeDashboard starts an HTTP server serving the dashboard UI and stats API.
+func (s *Server) ServeDashboard(addr string) error {
 	slog.Info("dashboard listening", "addr", addr)
-	return http.ListenAndServe(addr, mux)
+	return http.ListenAndServe(addr, s.DashboardHandler())
 }
 
 const dashboardHTML = `<!DOCTYPE html>

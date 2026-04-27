@@ -232,7 +232,7 @@ func TestInvitePersistence(t *testing.T) {
 	// Phase 1: start registry, create invite-only network, invite target
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -264,7 +264,7 @@ func TestInvitePersistence(t *testing.T) {
 	// Phase 2: restart, poll invites — should still be there
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):

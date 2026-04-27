@@ -211,7 +211,7 @@ func TestNetworkPolicyPersistence(t *testing.T) {
 	// Phase 1: start registry, create network, set policy
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -255,7 +255,7 @@ func TestNetworkPolicyPersistence(t *testing.T) {
 	// Phase 2: restart registry from same store file
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):

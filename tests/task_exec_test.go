@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -198,14 +197,7 @@ func TestSetTaskExecDashboardAPI(t *testing.T) {
 		t.Fatalf("set task_exec: %v", err)
 	}
 
-	// Start dashboard
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 
 	var client http.Client
 	client.Timeout = 2 * time.Second

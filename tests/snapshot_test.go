@@ -22,7 +22,7 @@ func TestSnapshotStructure(t *testing.T) {
 
 	// Start registry with persistence enabled
 	reg := registry.NewWithStore(":0", snapPath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 
 	select {
 	case <-reg.Ready():
@@ -248,7 +248,7 @@ func TestSnapshotSaveLoad(t *testing.T) {
 	// === Phase 1: Start registry and seed data ===
 	t.Log("Phase 1: Starting registry and seeding data...")
 	reg1 := registry.NewWithStore(":0", snapPath)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 
 	select {
 	case <-reg1.Ready():
@@ -437,7 +437,7 @@ func TestManualSnapshotTrigger(t *testing.T) {
 
 	// Start registry with persistence
 	reg := registry.NewWithStore(":0", snapPath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 
 	select {
 	case <-reg.Ready():
@@ -447,45 +447,7 @@ func TestManualSnapshotTrigger(t *testing.T) {
 	defer reg.Close()
 
 	regAddr := reg.Addr().String()
-
-	// Start dashboard on a different listener
-	go func() {
-		if err := reg.ServeDashboard("127.0.0.1:0"); err != nil {
-			t.Logf("dashboard error: %v", err)
-		}
-	}()
-
-	// Wait for dashboard to start
-	time.Sleep(500 * time.Millisecond)
-
-	// Get dashboard address from the server (we need to extract it)
-	// For now, use a fixed port for testing
-	dashAddr := "127.0.0.1:18080"
-
-	// Restart with explicit dashboard port
-	reg.Close()
-	time.Sleep(200 * time.Millisecond)
-
-	reg = registry.NewWithStore(":0", snapPath)
-	go reg.ListenAndServe(":0")
-
-	select {
-	case <-reg.Ready():
-	case <-time.After(5 * time.Second):
-		t.Fatal("registry failed to restart")
-	}
-	defer reg.Close()
-
-	regAddr = reg.Addr().String()
-
-	// Start dashboard with known port
-	go func() {
-		if err := reg.ServeDashboard(dashAddr); err != nil {
-			t.Logf("dashboard error: %v", err)
-		}
-	}()
-
-	time.Sleep(300 * time.Millisecond)
+	dashAddr := startTestDashboard(t, reg)
 
 	// Seed some data
 	client, err := registry.Dial(regAddr)

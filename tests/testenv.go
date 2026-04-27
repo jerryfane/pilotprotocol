@@ -86,7 +86,7 @@ func NewTestEnv(t *testing.T) *TestEnv {
 
 	// Start beacon on OS-assigned port
 	env.Beacon = beacon.New()
-	go env.Beacon.ListenAndServe(":0")
+	go env.Beacon.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-env.Beacon.Ready():
 	case <-time.After(5 * time.Second):
@@ -98,7 +98,7 @@ func NewTestEnv(t *testing.T) *TestEnv {
 	env.Registry = registry.New(env.BeaconAddr)
 	env.Registry.SetAdminToken(TestAdminToken)
 	env.AdminToken = TestAdminToken
-	go env.Registry.ListenAndServe(":0")
+	go env.Registry.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-env.Registry.Ready():
 	case <-time.After(5 * time.Second):

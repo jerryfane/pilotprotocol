@@ -24,6 +24,13 @@ Each entry is intended to be upstream-able as a discrete bug fix.
   and delegates beacon/cached/TURN/direct sends to small executors.
   `writeFrameToTURNEndpoint` keeps its explicit-endpoint semantics while
   sharing the common send accounting and cached-conn eviction helpers.
+- **The integration test harness no longer leaks dashboard listeners or parses
+  Go test flags through custom config flagsets.** Registry dashboard routes can
+  now be mounted through `DashboardHandler`, letting tests use closable
+  `httptest` servers, and the secure-channel integration test now waits for
+  port 443 to bind before dialing. Test registry and beacon listeners now bind
+  explicitly to IPv4 loopback so wildcard `:0` ports cannot be confused with
+  unrelated IPv4 HTTP listeners on dual-stack hosts.
 
 ## [v1.9.0-jf.15.11] - 2026-04-27
 

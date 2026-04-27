@@ -24,7 +24,7 @@ func TestChunkedReap(t *testing.T) {
 	clk := newTestClock()
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -75,7 +75,7 @@ func TestFlushSaveUnderConcurrentHeartbeat(t *testing.T) {
 	storePath := filepath.Join(tmpDir, "registry.json")
 
 	reg := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 
 	rc, err := registry.Dial(resolveLocalAddr(reg.Addr()))
@@ -120,7 +120,7 @@ func TestFlushSaveUnderConcurrentHeartbeat(t *testing.T) {
 
 	// Verify the snapshot is loadable
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	<-reg2.Ready()
 	defer reg2.Close()
 
@@ -146,7 +146,7 @@ func TestShardedLockHeartbeatConcurrency(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -207,7 +207,7 @@ func TestShardedLockCrossShardResolve(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -250,7 +250,7 @@ func TestHeartbeatSkipVerificationWhenRecent(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -292,7 +292,7 @@ func TestHeartbeatRequireVerificationAfterGap(t *testing.T) {
 	clk := newTestClock()
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -337,7 +337,7 @@ func TestBinaryWireNegotiation(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -384,7 +384,7 @@ func TestBinaryHeartbeatRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -443,7 +443,7 @@ func TestBinaryLookupRoundTrip(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -506,7 +506,7 @@ func TestBinaryResolveRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -570,7 +570,7 @@ func TestBinaryResolvePrivateDenied(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -619,7 +619,7 @@ func TestBinaryJSONPassthrough(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -684,7 +684,7 @@ func TestBinaryAndJSONClientsCoexist(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -750,7 +750,7 @@ func TestBinaryHeartbeatBadSignature(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -791,7 +791,7 @@ func TestBinaryLookupNodeNotFound(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 	defer reg.Close()
 
@@ -820,7 +820,7 @@ func TestBinaryClientReconnect(t *testing.T) {
 	storePath := filepath.Join(tmpDir, "registry.json")
 
 	reg := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	<-reg.Ready()
 
 	addr := resolveLocalAddr(reg.Addr())

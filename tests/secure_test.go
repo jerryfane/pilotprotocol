@@ -1,10 +1,10 @@
 package tests
 
 import (
-	"net"
 	"testing"
 	"time"
 
+	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 	"github.com/TeoSlayer/pilotprotocol/pkg/secure"
 )
 
@@ -15,21 +15,35 @@ func TestSecureChannel(t *testing.T) {
 	a := env.AddDaemon()
 	b := env.AddDaemon()
 
-	// Secure server on A
 	received := make(chan string, 1)
-	srv := secure.NewServer(a.Driver, func(conn net.Conn) {
-		defer conn.Close()
+	ln, err := a.Driver.Listen(protocol.PortSecure)
+	if err != nil {
+		t.Fatalf("secure listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		sc, err := secure.Handshake(conn, true)
+		if err != nil {
+			t.Logf("secure handshake: %v", err)
+			conn.Close()
+			return
+		}
+		defer sc.Close()
 		buf := make([]byte, 65535)
-		n, err := conn.Read(buf)
+		n, err := sc.Read(buf)
 		if err != nil {
 			t.Logf("server read: %v", err)
 			return
 		}
 		msg := string(buf[:n])
 		received <- msg
-		conn.Write([]byte("secure-echo: " + msg))
-	})
-	go srv.ListenAndServe()
+		sc.Write([]byte("secure-echo: " + msg))
+	}()
 
 	// Secure client on B
 	sc, err := secure.Dial(b.Driver, a.Daemon.Addr())

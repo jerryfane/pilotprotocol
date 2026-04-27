@@ -12,7 +12,6 @@ import (
 	"io"
 	"log"
 	"math/big"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -565,7 +564,7 @@ func TestIntegration_PrometheusMetricsScrape(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	defer reg.Close()
 	select {
 	case <-reg.Ready():
@@ -573,13 +572,7 @@ func TestIntegration_PrometheusMetricsScrape(t *testing.T) {
 		t.Fatal("registry failed to start")
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go reg.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, reg)
 	waitDashboard(t, dashAddr)
 
 	rc, err := registry.Dial(reg.Addr().String())
@@ -668,7 +661,7 @@ func TestIntegration_HealthzEndpoint(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	defer reg.Close()
 	select {
 	case <-reg.Ready():
@@ -676,13 +669,7 @@ func TestIntegration_HealthzEndpoint(t *testing.T) {
 		t.Fatal("registry failed to start")
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go reg.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, reg)
 	waitDashboard(t, dashAddr)
 
 	client := http.Client{Timeout: 2 * time.Second}
@@ -1065,7 +1052,7 @@ func TestIntegration_MetricsReflectOperations(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	defer reg.Close()
 	select {
 	case <-reg.Ready():
@@ -1073,13 +1060,7 @@ func TestIntegration_MetricsReflectOperations(t *testing.T) {
 		t.Fatal("registry failed to start")
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go reg.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, reg)
 	waitDashboard(t, dashAddr)
 
 	rc, err := registry.Dial(reg.Addr().String())

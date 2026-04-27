@@ -24,7 +24,7 @@ func TestAuditLogAPI(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -120,7 +120,7 @@ func TestAuditLogRingBuffer(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -196,7 +196,7 @@ func TestAuditEvents(t *testing.T) {
 	// Start registry
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -328,7 +328,7 @@ func TestAuditInviteActions(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -406,7 +406,7 @@ func TestAuditEventHasRequiredFields(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -451,7 +451,7 @@ func TestAuditConcurrentMutations(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -505,7 +505,7 @@ func TestAuditKeyRotated(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -567,7 +567,7 @@ func TestAuditHandshakeRelayedAndResponded(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -661,7 +661,7 @@ func TestAuditLogPersistence(t *testing.T) {
 	storePath := filepath.Join(tmpDir, "registry.json")
 
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -673,7 +673,7 @@ func TestAuditLogPersistence(t *testing.T) {
 	// Phase 1: Start registry, generate audit events
 	reg1 := registry.NewWithStore(beaconAddr, storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -706,7 +706,7 @@ func TestAuditLogPersistence(t *testing.T) {
 	// Phase 2: Restart registry and verify audit log survived
 	reg2 := registry.NewWithStore(beaconAddr, storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -753,7 +753,7 @@ func TestAuditMemberOperations(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -858,7 +858,7 @@ func TestAuditEnterpriseToggle(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -944,7 +944,7 @@ func TestAuditDeleteNetworkEnriched(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

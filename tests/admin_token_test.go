@@ -118,7 +118,7 @@ func TestAdminTokenNotConfigured(t *testing.T) {
 
 	// Start a registry WITHOUT setting an admin token
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

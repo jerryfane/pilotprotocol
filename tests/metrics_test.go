@@ -113,14 +113,7 @@ func TestMetricsEndpointExists(t *testing.T) {
 	r := registry.New("127.0.0.1:9001")
 	defer r.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 	waitDashboard(t, dashAddr)
 
 	body := fetchMetrics(t, dashAddr)
@@ -153,14 +146,7 @@ func TestMetricsRequestCounting(t *testing.T) {
 
 	regAddr := r.Addr().String()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 	waitDashboard(t, dashAddr)
 
 	// Register a node (generates a "register" request)
@@ -211,14 +197,7 @@ func TestMetricsGauges(t *testing.T) {
 
 	regAddr := r.Addr().String()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 	waitDashboard(t, dashAddr)
 
 	// Register 2 nodes and report trust between them
@@ -276,14 +255,7 @@ func TestMetricsErrorCounting(t *testing.T) {
 
 	regAddr := r.Addr().String()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 	waitDashboard(t, dashAddr)
 
 	// Send a lookup for a nonexistent node (should error)
@@ -321,14 +293,7 @@ func TestMetricsEnterprise(t *testing.T) {
 
 	regAddr := r.Addr().String()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 	waitDashboard(t, dashAddr)
 
 	// Register owner and create enterprise network
@@ -441,7 +406,7 @@ func TestPerNetworkMetrics(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -450,13 +415,7 @@ func TestPerNetworkMetrics(t *testing.T) {
 	defer reg.Close()
 
 	// Start dashboard
-	dashLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dashAddr := dashLn.Addr().String()
-	dashLn.Close()
-	go reg.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, reg)
 	waitDashboard(t, dashAddr)
 
 	rc, err := registry.Dial(reg.Addr().String())

@@ -26,7 +26,7 @@ func TestEndpointCacheFallback(t *testing.T) {
 
 	// Start beacon + registry
 	bsrv := beacon.New()
-	go bsrv.ListenAndServe(":0")
+	go bsrv.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-bsrv.Ready():
 	case <-time.After(5 * time.Second):
@@ -36,7 +36,7 @@ func TestEndpointCacheFallback(t *testing.T) {
 	beaconAddr := resolveLocalAddr(bsrv.Addr())
 
 	reg := registry.New(beaconAddr)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -118,7 +118,7 @@ func TestRegistryReconnect(t *testing.T) {
 
 	// Start a beacon
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -129,7 +129,7 @@ func TestRegistryReconnect(t *testing.T) {
 
 	// Start registry
 	reg := registry.NewWithStore(beaconAddr, storePath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -229,7 +229,7 @@ func TestDaemonSurvivesRegistryRestart(t *testing.T) {
 
 	// Start beacon
 	bsrv := beacon.New()
-	go bsrv.ListenAndServe(":0")
+	go bsrv.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-bsrv.Ready():
 	case <-time.After(5 * time.Second):
@@ -240,7 +240,7 @@ func TestDaemonSurvivesRegistryRestart(t *testing.T) {
 
 	// Start registry 1
 	reg1 := registry.NewWithStore(beaconAddr, storePath)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -347,7 +347,7 @@ func TestEndpointCachePopulated(t *testing.T) {
 
 	// Start beacon + registry
 	bsrv := beacon.New()
-	go bsrv.ListenAndServe(":0")
+	go bsrv.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-bsrv.Ready():
 	case <-time.After(5 * time.Second):
@@ -357,7 +357,7 @@ func TestEndpointCachePopulated(t *testing.T) {
 	beaconAddr := resolveLocalAddr(bsrv.Addr())
 
 	reg := registry.New(beaconAddr)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -438,7 +438,7 @@ func TestRegistryClientReconnectOnBrokenConn(t *testing.T) {
 
 	// Start beacon
 	bsrv := beacon.New()
-	go bsrv.ListenAndServe(":0")
+	go bsrv.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-bsrv.Ready():
 	case <-time.After(5 * time.Second):
@@ -449,7 +449,7 @@ func TestRegistryClientReconnectOnBrokenConn(t *testing.T) {
 
 	// Start registry
 	reg := registry.NewWithStore(beaconAddr, storePath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

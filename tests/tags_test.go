@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -260,14 +259,7 @@ func TestSetTagsDashboardAPI(t *testing.T) {
 		t.Fatalf("set tags: %v", err)
 	}
 
-	// Start dashboard
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 
 	var client http.Client
 	client.Timeout = 2 * time.Second
@@ -306,18 +298,12 @@ func TestSetTagsDashboardNoHostname(t *testing.T) {
 	regAddr := r.Addr().String()
 	dashRegisterNode(t, regAddr, "test-host")
 
-	// Get dashboard stats via API
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 
 	var client http.Client
 	client.Timeout = 2 * time.Second
 	var httpResp *http.Response
+	var err error
 	for i := 0; i < 20; i++ {
 		httpResp, err = client.Get(fmt.Sprintf("http://%s/api/stats", dashAddr))
 		if err == nil {
@@ -350,17 +336,12 @@ func TestSetTagsDashboardNoIPLeak(t *testing.T) {
 	regAddr := r.Addr().String()
 	dashRegisterNode(t, regAddr, "")
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("find free port: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-	go r.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, r)
 
 	var client http.Client
 	client.Timeout = 2 * time.Second
 	var httpResp *http.Response
+	var err error
 	for i := 0; i < 20; i++ {
 		httpResp, err = client.Get(fmt.Sprintf("http://%s/api/stats", dashAddr))
 		if err == nil {

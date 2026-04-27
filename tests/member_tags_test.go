@@ -176,7 +176,7 @@ func TestMemberTagsPersistence(t *testing.T) {
 
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	<-reg1.Ready()
 
 	rc1, err := registry.Dial(resolveLocalAddr(reg1.Addr()))
@@ -201,7 +201,7 @@ func TestMemberTagsPersistence(t *testing.T) {
 
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg2.SetAdminToken(TestAdminToken)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	<-reg2.Ready()
 	defer reg2.Close()
 

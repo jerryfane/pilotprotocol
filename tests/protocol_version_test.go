@@ -95,7 +95,7 @@ func TestRegistryProtocolVersion(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New(":0")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 
 	select {
 	case <-reg.Ready():
@@ -141,7 +141,7 @@ func TestSnapshotVersion(t *testing.T) {
 	snapPath := filepath.Join(snapDir, "registry-snapshot.json")
 
 	reg := registry.NewWithStore(":0", snapPath)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 
 	select {
 	case <-reg.Ready():

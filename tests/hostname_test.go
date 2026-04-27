@@ -14,7 +14,7 @@ import (
 func startTestRegistry(t *testing.T) (*registry.Client, *registry.Server, func()) {
 	t.Helper()
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -188,7 +188,7 @@ func TestHostnamePersistence(t *testing.T) {
 
 	// Phase 1: start registry, register node, set hostname
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -218,7 +218,7 @@ func TestHostnamePersistence(t *testing.T) {
 
 	// Phase 2: restart from store, verify hostname survives
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):

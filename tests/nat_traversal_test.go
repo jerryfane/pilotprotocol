@@ -20,7 +20,7 @@ func TestBeaconPunchRequest(t *testing.T) {
 
 	// Start a beacon
 	srv := beacon.New()
-	go srv.ListenAndServe(":0")
+	go srv.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-srv.Ready():
 	case <-time.After(5 * time.Second):
@@ -359,7 +359,7 @@ func TestBeaconRelayDeliver(t *testing.T) {
 
 	// Start beacon
 	srv := beacon.New()
-	go srv.ListenAndServe(":0")
+	go srv.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-srv.Ready():
 	case <-time.After(5 * time.Second):

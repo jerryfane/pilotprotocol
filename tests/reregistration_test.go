@@ -30,7 +30,7 @@ func TestReRegistrationAfterRegistryRestart(t *testing.T) {
 
 	// Start a beacon (needed for registry constructor)
 	b := beacon.New()
-	go b.ListenAndServe(":0")
+	go b.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-b.Ready():
 	case <-time.After(5 * time.Second):
@@ -48,7 +48,7 @@ func TestReRegistrationAfterRegistryRestart(t *testing.T) {
 
 	// --- Phase 1: Start registry, register node, record node_id ---
 	reg1 := registry.NewWithStore(beaconAddr, storePath)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -82,7 +82,7 @@ func TestReRegistrationAfterRegistryRestart(t *testing.T) {
 
 	// --- Phase 3: Start NEW registry from same store path ---
 	reg2 := registry.NewWithStore(beaconAddr, storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):

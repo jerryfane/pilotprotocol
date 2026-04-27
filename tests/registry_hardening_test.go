@@ -21,7 +21,7 @@ func TestRegistryResolveNotRateLimited(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -77,7 +77,7 @@ func TestRegistryMessageSizeLimit(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -138,7 +138,7 @@ func TestRegistrySnapshotChecksum(t *testing.T) {
 	// Start registry with persistence
 	reg := registry.NewWithStore("127.0.0.1:9001", snapPath)
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -204,7 +204,7 @@ func TestRegistrySnapshotChecksum(t *testing.T) {
 
 	// Verify the snapshot can be loaded by a new registry
 	reg2 := registry.NewWithStore("127.0.0.1:9001", snapPath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -235,7 +235,7 @@ func TestRegistryConnectionLimit(t *testing.T) {
 	reg := registry.New("127.0.0.1:9001")
 	// Set a very low connection limit for testing
 	reg.SetMaxConnections(5)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

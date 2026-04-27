@@ -2,7 +2,6 @@ package tests
 
 import (
 	"encoding/json"
-	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -18,7 +17,7 @@ func TestRegistryHealthEndpoint(t *testing.T) {
 
 	// Start a registry server
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -39,15 +38,7 @@ func TestRegistryHealthEndpoint(t *testing.T) {
 		t.Fatalf("register node: %v", err)
 	}
 
-	// Start the dashboard (which serves /healthz)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go reg.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, reg)
 
 	// Wait for dashboard to be ready
 	var client http.Client
@@ -115,7 +106,7 @@ func TestRegistryHealthEndpointNoNodes(t *testing.T) {
 	t.Parallel()
 
 	reg := registry.New("127.0.0.1:9001")
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -123,18 +114,12 @@ func TestRegistryHealthEndpointNoNodes(t *testing.T) {
 	}
 	defer reg.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go reg.ServeDashboard(dashAddr)
+	dashAddr := startTestDashboard(t, reg)
 
 	var client http.Client
 	client.Timeout = 2 * time.Second
 	var resp *http.Response
+	var err error
 	for i := 0; i < 20; i++ {
 		resp, err = client.Get("http://" + dashAddr + "/healthz")
 		if err == nil {

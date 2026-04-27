@@ -213,15 +213,7 @@ func TestRegistryServerDashboardHTTP(t *testing.T) {
 	s := startTestServer(t)
 	defer s.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go s.ServeDashboard(dashAddr)
-	time.Sleep(100 * time.Millisecond)
+	dashAddr := startTestDashboard(t, s)
 
 	resp, err := http.Get("http://" + dashAddr + "/api/stats")
 	if err != nil {
@@ -242,15 +234,7 @@ func TestRegistryServerDashboardBadges(t *testing.T) {
 	s := startTestServer(t)
 	defer s.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go s.ServeDashboard(dashAddr)
-	time.Sleep(100 * time.Millisecond)
+	dashAddr := startTestDashboard(t, s)
 
 	badges := []string{"nodes", "trust", "requests"}
 	for _, badge := range badges {
@@ -272,15 +256,7 @@ func TestRegistryServerDashboardRoot(t *testing.T) {
 	s := startTestServer(t)
 	defer s.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go s.ServeDashboard(dashAddr)
-	time.Sleep(100 * time.Millisecond)
+	dashAddr := startTestDashboard(t, s)
 
 	resp, err := http.Get("http://" + dashAddr + "/")
 	if err != nil {
@@ -299,15 +275,7 @@ func TestRegistryServerDashboard404(t *testing.T) {
 	s := startTestServer(t)
 	defer s.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go s.ServeDashboard(dashAddr)
-	time.Sleep(100 * time.Millisecond)
+	dashAddr := startTestDashboard(t, s)
 
 	resp, err := http.Get("http://" + dashAddr + "/nonexistent")
 	if err != nil {
@@ -323,15 +291,7 @@ func TestRegistryServerDashboardSnapshotMethodNotAllowed(t *testing.T) {
 	s := startTestServer(t)
 	defer s.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go s.ServeDashboard(dashAddr)
-	time.Sleep(100 * time.Millisecond)
+	dashAddr := startTestDashboard(t, s)
 
 	resp, err := http.Get("http://" + dashAddr + "/api/snapshot")
 	if err != nil {
@@ -347,15 +307,7 @@ func TestRegistryServerDashboardSnapshotPOST(t *testing.T) {
 	s, _ := startTestServerWithStore(t)
 	defer s.Close()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	dashAddr := ln.Addr().String()
-	ln.Close()
-
-	go s.ServeDashboard(dashAddr)
-	time.Sleep(100 * time.Millisecond)
+	dashAddr := startTestDashboard(t, s)
 
 	resp, err := http.Post("http://"+dashAddr+"/api/snapshot", "", nil)
 	if err != nil {

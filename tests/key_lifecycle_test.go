@@ -387,7 +387,7 @@ func TestKeyInfoPersistence(t *testing.T) {
 	// Phase 1: start registry, register node, rotate key, set expiry
 	reg1 := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg1.SetAdminToken(TestAdminToken)
-	go reg1.ListenAndServe(":0")
+	go reg1.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg1.Ready():
 	case <-time.After(5 * time.Second):
@@ -458,7 +458,7 @@ func TestKeyInfoPersistence(t *testing.T) {
 
 	// Phase 2: start new registry from the same store file
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
@@ -518,7 +518,7 @@ func TestKeyExpiryEnforcementOnHeartbeat(t *testing.T) {
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -599,7 +599,7 @@ func TestKeyExpiryWarningOnHeartbeat(t *testing.T) {
 
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

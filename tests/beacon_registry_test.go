@@ -85,7 +85,7 @@ func TestBeaconListFiltersExpired(t *testing.T) {
 	clk := newTestClock()
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -140,7 +140,7 @@ func TestReapStaleNodes(t *testing.T) {
 	clk := newTestClock()
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -189,7 +189,7 @@ func TestReapStaleBeacons(t *testing.T) {
 	clk := newTestClock()
 	reg := registry.New("127.0.0.1:9001")
 	reg.SetClock(clk.Now)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):

@@ -120,7 +120,7 @@ func TestFlushSaveChecksumRoundTrip(t *testing.T) {
 	// Start registry with persistence, register a node, and close
 	reg := registry.NewWithStore("127.0.0.1:9001", storePath)
 	reg.SetAdminToken(TestAdminToken)
-	go reg.ListenAndServe(":0")
+	go reg.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg.Ready():
 	case <-time.After(5 * time.Second):
@@ -173,7 +173,7 @@ func TestFlushSaveChecksumRoundTrip(t *testing.T) {
 
 	// Verify the snapshot reloads correctly (NewWithStore loads from storePath)
 	reg2 := registry.NewWithStore("127.0.0.1:9001", storePath)
-	go reg2.ListenAndServe(":0")
+	go reg2.ListenAndServe("127.0.0.1:0")
 	select {
 	case <-reg2.Ready():
 	case <-time.After(5 * time.Second):
