@@ -10,6 +10,8 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.21] - 2026-04-27
+
 ### Fixed
 
 - **Rendezvous publishes now retry after rate limits instead of waiting for
