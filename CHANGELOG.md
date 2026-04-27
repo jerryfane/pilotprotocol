@@ -10,6 +10,22 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.18] - 2026-04-27
+
+### Fixed
+
+- **Pilot stream segments now fit UDP/TURN paths.** The virtual stream MSS is
+  reduced from 4096 bytes to 1024 bytes so encrypted Pilot packets leave room
+  for packet, AEAD, and TURN framing overhead instead of relying on IP
+  fragmentation. This targets the production `:1004` reconcile failure where
+  small frames ACKed successfully but 4096-byte responder segments stalled
+  until max retransmit and RST.
+
+### Tests
+
+- Added stream segmentation coverage for both no-delay and Nagle send paths,
+  asserting emitted stream payloads never exceed `MaxSegmentSize`.
+
 ## [v1.9.0-jf.15.17] - 2026-04-27
 
 ### Changed

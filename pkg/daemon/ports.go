@@ -97,11 +97,14 @@ type recvSegment struct {
 
 // Default window parameters
 const (
-	InitialCongWin = 10 * MaxSegmentSize          // 40 KB initial congestion window (IW10, RFC 6928)
-	MaxCongWin     = 1024 * 1024                  // 1 MB max congestion window
-	MaxSegmentSize = 4096                         // MTU for virtual segments
+	InitialCongWin = 10 * MaxSegmentSize // IW10 initial congestion window (RFC 6928)
+	MaxCongWin     = 1024 * 1024         // 1 MB max congestion window
+	// MaxSegmentSize is the inner stream payload size. Keep it below the
+	// practical UDP/TURN datagram target because Pilot adds packet,
+	// encryption, and TURN framing overhead around each segment.
+	MaxSegmentSize = 1024
 	RecvBufSize    = 512                          // receive buffer channel capacity (segments)
-	MaxRecvWin     = RecvBufSize * MaxSegmentSize // 2 MB max receive window
+	MaxRecvWin     = RecvBufSize * MaxSegmentSize // max receive window
 	MaxOOOBuf      = 128                          // max out-of-order segments buffered per connection
 	AcceptQueueLen = 64                           // listener accept channel capacity
 	SendBufLen     = 256                          // send buffer channel capacity (segments)

@@ -346,6 +346,35 @@ func TestRetransmitMaxAttemptsClosesConnectionAndSendsRST(t *testing.T) {
 	}
 }
 
+func TestSendDataSegmentsPayloadAtMaxSegmentSize(t *testing.T) {
+	t.Run("no delay", func(t *testing.T) {
+		d := New(Config{Email: "stream-segment@example.com", Public: true})
+		rec := installRecordingTunnelConn(d, 2)
+		conn := newEstablishedStreamTestConn(d, 4000, 2, 49152)
+		conn.NoDelay = true
+
+		payload := deterministicPayload(MaxSegmentSize*2 + 17)
+		if err := d.SendData(conn, payload); err != nil {
+			t.Fatalf("SendData: %v", err)
+		}
+
+		assertSegmentPayloads(t, rec.packets(t), payload)
+	})
+
+	t.Run("nagle", func(t *testing.T) {
+		d := New(Config{Email: "stream-segment@example.com", Public: true})
+		rec := installRecordingTunnelConn(d, 2)
+		conn := newEstablishedStreamTestConn(d, 4000, 2, 49152)
+
+		payload := deterministicPayload(MaxSegmentSize + 17)
+		if err := d.SendData(conn, payload); err != nil {
+			t.Fatalf("SendData: %v", err)
+		}
+
+		assertSegmentPayloads(t, rec.packets(t), payload)
+	})
+}
+
 func TestIPCClientDisconnectCleansOwnedPortAndConnection(t *testing.T) {
 	d := New(Config{Email: "ipc-cleanup@example.com"})
 	installCleanupTunnelConn(d, 99)
@@ -470,6 +499,40 @@ func TestIPCUnbindReleasesOwnedPortWithoutDisconnect(t *testing.T) {
 	readOK(CmdBindOK, port)
 	if got := d.ports.GetListener(port); got == nil {
 		t.Fatalf("listener not rebound after explicit unbind")
+	}
+}
+
+func newEstablishedStreamTestConn(d *Daemon, localPort uint16, remoteNode uint32, remotePort uint16) *Connection {
+	conn := d.ports.NewConnection(localPort, protocol.Addr{Node: remoteNode}, remotePort)
+	conn.LocalAddr = protocol.Addr{Node: 1}
+	conn.Mu.Lock()
+	conn.State = StateEstablished
+	conn.Mu.Unlock()
+	return conn
+}
+
+func deterministicPayload(n int) []byte {
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	return data
+}
+
+func assertSegmentPayloads(t *testing.T, pkts []*protocol.Packet, want []byte) {
+	t.Helper()
+	var got []byte
+	for i, pkt := range pkts {
+		if len(pkt.Payload) == 0 {
+			continue
+		}
+		if len(pkt.Payload) > MaxSegmentSize {
+			t.Fatalf("packet %d payload length = %d, want <= %d", i, len(pkt.Payload), MaxSegmentSize)
+		}
+		got = append(got, pkt.Payload...)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("reassembled payload length = %d, want %d", len(got), len(want))
 	}
 }
 
