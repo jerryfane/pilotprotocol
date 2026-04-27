@@ -56,6 +56,8 @@ const (
 	// out-of-band from the central registry.
 	cmdSetPeerEndpoints   byte = 0x25
 	cmdSetPeerEndpointsOK byte = 0x26
+	cmdUnbind             byte = 0x27
+	cmdUnbindOK           byte = 0x28
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -337,6 +339,22 @@ func (c *ipcClient) registerAcceptCh(port uint16) chan []byte {
 	defer c.acceptMu.Unlock()
 	c.acceptChs[port] = ch
 	return ch
+}
+
+func (c *ipcClient) unregisterAcceptCh(port uint16) {
+	c.acceptMu.Lock()
+	defer c.acceptMu.Unlock()
+	delete(c.acceptChs, port)
+}
+
+func (c *ipcClient) unbindPort(port uint16) error {
+	msg := make([]byte, 3)
+	msg[0] = cmdUnbind
+	binary.BigEndian.PutUint16(msg[1:3], port)
+	if _, err := c.sendAndWaitTimeout(msg, cmdUnbindOK, 2*time.Second); err != nil {
+		return fmt.Errorf("unbind: %w", err)
+	}
+	return nil
 }
 
 func (c *ipcClient) registerRecvCh(connID uint32) chan []byte {

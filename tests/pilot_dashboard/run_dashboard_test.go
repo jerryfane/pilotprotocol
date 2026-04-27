@@ -1,8 +1,11 @@
 package pilot_dashboard
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,11 +19,17 @@ import (
 // TestRunDashboardWithSeed is a manual test that starts a local rendezvous server,
 // seeds it with test data, and keeps it running for manual dashboard inspection.
 //
-// Run with: go test -v -run TestRunDashboardWithSeed -timeout=0 ./tests/pilot_dashboard
+// Run with:
 //
-// The dashboard will be available at: http://127.0.0.1:8080
+//	PILOT_MANUAL_DASHBOARD=1 go test -v -run TestRunDashboardWithSeed -timeout=0 ./tests/pilot_dashboard
+//
+// The dashboard will be available on an ephemeral localhost port printed by the
+// test.
 // Press Ctrl+C to stop the server.
 func TestRunDashboardWithSeed(t *testing.T) {
+	if os.Getenv("PILOT_MANUAL_DASHBOARD") != "1" {
+		t.Skip("manual dashboard test; set PILOT_MANUAL_DASHBOARD=1 to run")
+	}
 	if testing.Short() {
 		t.Skip("skipping manual dashboard test in short mode")
 	}
@@ -31,15 +40,25 @@ func TestRunDashboardWithSeed(t *testing.T) {
 	env := tests.NewTestEnv(t)
 
 	// Start dashboard on the registry
-	dashboardAddr := "127.0.0.1:8080"
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("dashboard listen: %v", err)
+	}
+	dashboardAddr := ln.Addr().String()
+	srv := &http.Server{Handler: env.Registry.DashboardHandler()}
+	errCh := make(chan error, 1)
 	go func() {
-		if err := env.Registry.ServeDashboard(dashboardAddr); err != nil {
-			log.Printf("dashboard error: %v", err)
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			errCh <- err
 		}
 	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
 
-	// Wait a bit for dashboard to start
-	time.Sleep(500 * time.Millisecond)
+	waitDashboardReady(t, dashboardAddr, errCh)
 
 	// Seed the registry with test data
 	log.Println("\nSeeding registry with test data...")
@@ -62,4 +81,29 @@ func TestRunDashboardWithSeed(t *testing.T) {
 	<-sigChan
 
 	log.Println("\nShutting down...")
+}
+
+func waitDashboardReady(t *testing.T, addr string, errCh <-chan error) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	url := "http://" + addr + "/api/stats"
+	for {
+		select {
+		case err := <-errCh:
+			t.Fatalf("dashboard serve: %v", err)
+		case <-deadline:
+			t.Fatalf("dashboard did not become ready at %s", url)
+		case <-tick.C:
+			resp, err := http.Get(url)
+			if err != nil {
+				continue
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+	}
 }

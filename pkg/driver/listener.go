@@ -63,13 +63,16 @@ func (l *Listener) Accept() (net.Conn, error) {
 }
 
 func (l *Listener) Close() error {
+	var err error
 	l.mu.Lock()
 	if !l.closed {
 		l.closed = true
 		close(l.done) // unblock Accept() (H13 fix)
+		l.ipc.unregisterAcceptCh(l.port)
+		err = l.ipc.unbindPort(l.port)
 	}
 	l.mu.Unlock()
-	return nil
+	return err
 }
 
 func (l *Listener) Addr() net.Addr {

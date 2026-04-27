@@ -10,6 +10,33 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.16] - 2026-04-27
+
+### Added
+
+- **Pilot IPC now has an explicit listener unbind command.** Drivers can send
+  `Unbind` / `UnbindOK` when closing a listener, releasing the daemon-side
+  virtual port immediately instead of waiting for the whole IPC connection to
+  disconnect. This removes stale port ownership after Entmoot restarts and
+  fixes the operational `port 1004 already bound` failure mode.
+
+### Changed
+
+- **Driver listener close now releases daemon state.** The Go driver unregisters
+  the local accept channel and sends `Unbind` under a bounded timeout, so
+  repeated restart cycles can re-bind the same service port cleanly.
+- **The manual dashboard seed test no longer breaks the full test suite.** It
+  is gated behind `PILOT_MANUAL_DASHBOARD=1`, uses an ephemeral localhost port,
+  performs a bounded readiness check, and shuts its HTTP server down via test
+  cleanup.
+
+### Tests
+
+- Added regression coverage for explicit IPC unbind followed by rebinding the
+  same port on the same client connection.
+- `go test -timeout 2m ./...` now passes with the manual dashboard test
+  skipped by default.
+
 ## [v1.9.0-jf.15.15] - 2026-04-27
 
 ### Changed

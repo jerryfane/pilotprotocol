@@ -60,6 +60,8 @@ const (
 	// from the central registry. (v1.9.0-jf.7)
 	CmdSetPeerEndpoints   byte = 0x25
 	CmdSetPeerEndpointsOK byte = 0x26
+	CmdUnbind             byte = 0x27
+	CmdUnbindOK           byte = 0x28
 
 	// v1.9.0-jf.11b: pub/sub state-change push primitives.
 	// CmdNotify is server-initiated and bypasses the request-reply
@@ -120,6 +122,18 @@ func (c *ipcConn) trackPort(port uint16) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 	c.ports = append(c.ports, port)
+}
+
+func (c *ipcConn) untrackPort(port uint16) bool {
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	for i, owned := range c.ports {
+		if owned == port {
+			c.ports = append(c.ports[:i], c.ports[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 func (c *ipcConn) trackConn(connID uint32) {
@@ -252,6 +266,8 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 		switch cmd {
 		case CmdBind:
 			s.handleBind(conn, payload)
+		case CmdUnbind:
+			s.handleUnbind(conn, payload)
 		case CmdDial:
 			s.handleDial(conn, payload)
 		case CmdSend:
@@ -339,6 +355,26 @@ func (s *IPCServer) handleBind(conn *ipcConn, payload []byte) {
 			s.startRecvPusher(conn, c)
 		}
 	}()
+}
+
+func (s *IPCServer) handleUnbind(conn *ipcConn, payload []byte) {
+	if len(payload) < 2 {
+		s.sendError(conn, "unbind: missing port")
+		return
+	}
+	port := binary.BigEndian.Uint16(payload[0:2])
+	if !conn.untrackPort(port) {
+		s.sendError(conn, fmt.Sprintf("unbind: port %d not owned by client", port))
+		return
+	}
+	s.daemon.ports.Unbind(port)
+
+	resp := make([]byte, 3)
+	resp[0] = CmdUnbindOK
+	binary.BigEndian.PutUint16(resp[1:3], port)
+	if err := conn.ipcWrite(resp); err != nil {
+		slog.Debug("IPC unbind reply failed", "port", port, "err", err)
+	}
 }
 
 func (s *IPCServer) handleDial(conn *ipcConn, payload []byte) {

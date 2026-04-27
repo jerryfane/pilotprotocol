@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TeoSlayer/pilotprotocol/internal/ipcutil"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
@@ -288,6 +289,73 @@ func TestIPCClientDisconnectCleansOwnedPortAndConnection(t *testing.T) {
 		t.Fatalf("owned connection RecvBuf was not closed after IPC disconnect")
 	}
 	d.ports.RemoveConnection(conn.ID)
+}
+
+func TestIPCUnbindReleasesOwnedPortWithoutDisconnect(t *testing.T) {
+	d := New(Config{Email: "ipc-unbind@example.com"})
+	s := NewIPCServer("", d)
+
+	serverSide, clientSide := net.Pipe()
+	defer clientSide.Close()
+	ipc := &ipcConn{Conn: serverSide}
+	s.clients[ipc] = true
+
+	done := make(chan struct{})
+	go func() {
+		s.handleClient(ipc)
+		close(done)
+	}()
+	defer func() {
+		_ = clientSide.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatalf("handleClient did not exit")
+		}
+	}()
+
+	writeFrame := func(cmd byte, port uint16) {
+		t.Helper()
+		msg := []byte{cmd, 0, 0}
+		msg[1] = byte(port >> 8)
+		msg[2] = byte(port)
+		if err := ipcutil.Write(clientSide, msg); err != nil {
+			t.Fatalf("write cmd 0x%02x: %v", cmd, err)
+		}
+	}
+	readOK := func(want byte, port uint16) {
+		t.Helper()
+		resp, err := ipcutil.Read(clientSide)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		if len(resp) != 3 || resp[0] != want {
+			t.Fatalf("response = %x, want cmd 0x%02x", resp, want)
+		}
+		got := uint16(resp[1])<<8 | uint16(resp[2])
+		if got != port {
+			t.Fatalf("response port = %d, want %d", got, port)
+		}
+	}
+
+	const port uint16 = 4521
+	writeFrame(CmdBind, port)
+	readOK(CmdBindOK, port)
+	if got := d.ports.GetListener(port); got == nil {
+		t.Fatalf("listener not bound after bind")
+	}
+
+	writeFrame(CmdUnbind, port)
+	readOK(CmdUnbindOK, port)
+	if got := d.ports.GetListener(port); got != nil {
+		t.Fatalf("listener still bound after explicit unbind")
+	}
+
+	writeFrame(CmdBind, port)
+	readOK(CmdBindOK, port)
+	if got := d.ports.GetListener(port); got == nil {
+		t.Fatalf("listener not rebound after explicit unbind")
+	}
 }
 
 func inboundSYNPkt(srcNode uint32, srcPort uint16, seq uint32) *protocol.Packet {
