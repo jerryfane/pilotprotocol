@@ -560,7 +560,7 @@ func TestWriteFrame_FallsBackToTURNRelay(t *testing.T) {
 	}
 
 	const peer uint32 = 123
-	if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.200:37500"); err != nil {
+	if err := tm.AddPeerTURNEndpoint(peer, "127.0.0.1:37500"); err != nil {
 		t.Fatalf("AddPeerTURNEndpoint: %v", err)
 	}
 
@@ -613,7 +613,7 @@ func TestWriteFrame_SkipsBeaconWhenTURNAdvertised(t *testing.T) {
 	// Advertise a TURN endpoint for this peer. From v1.9.0-jf.10 this
 	// MUST cause writeFrame to bypass the beacon tier and engage the
 	// turn-relay tier instead.
-	if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.200:37500"); err != nil {
+	if err := tm.AddPeerTURNEndpoint(peer, "127.0.0.1:37500"); err != nil {
 		t.Fatalf("AddPeerTURNEndpoint: %v", err)
 	}
 

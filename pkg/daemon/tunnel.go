@@ -1229,232 +1229,147 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	}
 	bAddr := tm.beaconAddr
 	cachedConn := tm.peerConns[nodeID]
-	hasTURNEp := tm.peerTURN[nodeID] != nil
+	cachedNet := dialedConnNetwork(cachedConn)
+	hasPeerTURN := tm.peerTURN[nodeID] != nil
+	hasLocalTURN := tm.turn != nil
 	turnOnly := tm.outboundTURNOnly
 	tm.mu.RUnlock()
 
-	// v1.9.0-jf.11a: OutboundTURNOnly mode — force all outbound frames
-	// through the local TURN allocation. Reject every tier that would
-	// route via beacon (leaks metadata to beacon operator) or direct
-	// UDP (leaks our source IP to the peer). Fail-closed: if no TURN
-	// path exists, return an error rather than silently falling back.
-	if turnOnly {
-		// Use cached turn/turn-relay conn if present (populated by
-		// DialTURNForPeer or DialTURNRelayForPeer).
-		if cachedConn != nil {
-			net := cachedConn.RemoteEndpoint().Network()
-			if net == "turn" || net == "turn-relay" {
-				err := cachedConn.Send(frame)
-				tm.recordTierSend(SendTierOutboundTurnOnlyCached,
-					nodeID, len(frame),
-					cachedConn.RemoteEndpoint().String(), relay, err)
-				if err == nil {
-					atomic.AddUint64(&tm.PktsSent, 1)
-					atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
-					return nil
-				}
-				// Cached TURN conn failed. Evict and fall through to dial.
-				tm.mu.Lock()
-				if tm.peerConns[nodeID] == cachedConn {
-					delete(tm.peerConns, nodeID)
-					_ = cachedConn.Close()
-				}
-				tm.mu.Unlock()
-				slog.Debug("outbound-turn-only: cached turn conn failed, re-dialling",
-					"node_id", nodeID, "network", net, "error", err)
+	plan := planFrameRoutes(frameRoutePolicyInput{
+		outboundTURNOnly: turnOnly,
+		relay:            relay,
+		hasBeacon:        bAddr != nil,
+		hasLocalTURN:     hasLocalTURN,
+		hasPeerTURN:      hasPeerTURN,
+		cachedConnNet:    cachedNet,
+		callerAddr:       addr,
+		pathDirect:       pathDirect,
+	})
+
+	for _, candidate := range plan.candidates {
+		switch candidate.kind {
+		case routeCandidateBeacon:
+			if bAddr == nil {
+				continue
 			}
-		}
-		// Lazily dial turn-relay if the peer advertised a TURN endpoint.
-		// The jf.9 fallback path; reuses DialTURNRelayForPeer which in
-		// turn uses the local TURN client's allocation (or raw UDP if
-		// tm.turn is nil, per jf.9's asymmetric mode).
-		if hasTURNEp {
+			msg := make([]byte, 1+4+4+len(frame))
+			msg[0] = protocol.BeaconMsgRelay
+			binary.BigEndian.PutUint32(msg[1:5], tm.loadNodeID())
+			binary.BigEndian.PutUint32(msg[5:9], nodeID)
+			copy(msg[9:], frame)
+			n, err := tm.udp.WriteToUDPAddr(msg, bAddr)
+			tm.recordTierSend(candidate.tier, nodeID, len(frame),
+				bAddr.String(), relay, err)
+			if err == nil {
+				atomic.AddUint64(&tm.PktsSent, 1)
+				atomic.AddUint64(&tm.BytesSent, uint64(n))
+			}
+			return err
+
+		case routeCandidateCachedConn:
+			if cachedConn == nil || cachedConn.RemoteEndpoint() == nil {
+				continue
+			}
+			err := cachedConn.Send(frame)
+			tm.recordTierSend(candidate.tier, nodeID, len(frame),
+				cachedConn.RemoteEndpoint().String(), relay, err)
+			if err == nil {
+				atomic.AddUint64(&tm.PktsSent, 1)
+				atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+				return nil
+			}
+			tm.evictCachedConnIfSame(nodeID, cachedConn)
+			slog.Debug("cached peer conn failed, falling back",
+				"node_id", nodeID,
+				"network", cachedConn.RemoteEndpoint().Network(),
+				"error", err)
+
+		case routeCandidatePeerTURN:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			dialErr := tm.DialTURNRelayForPeer(ctx, nodeID)
 			cancel()
-			if dialErr == nil {
-				tm.mu.RLock()
-				cc := tm.peerConns[nodeID]
-				tm.mu.RUnlock()
-				if cc != nil {
-					err := cc.Send(frame)
-					tm.recordTierSend(SendTierOutboundTurnOnlyJF9,
-						nodeID, len(frame),
-						cc.RemoteEndpoint().String(), relay, err)
-					if err == nil {
-						atomic.AddUint64(&tm.PktsSent, 1)
-						atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
-						return nil
-					}
-				}
-			} else {
-				tm.recordTierSend(SendTierOutboundTurnOnlyJF9,
-					nodeID, len(frame), "", relay, dialErr)
-				slog.Debug("outbound-turn-only: turn-relay dial failed",
+			if dialErr != nil {
+				tm.recordTierSend(candidate.tier, nodeID, len(frame),
+					"", relay, dialErr)
+				slog.Debug("turn-relay fallback dial failed",
 					"node_id", nodeID, "error", dialErr)
+				continue
 			}
+			tm.mu.RLock()
+			cc := tm.peerConns[nodeID]
+			tm.mu.RUnlock()
+			if cc == nil || cc.RemoteEndpoint() == nil || cc.RemoteEndpoint().Network() == "udp" {
+				continue
+			}
+			err := cc.Send(frame)
+			tm.recordTierSend(candidate.tier, nodeID, len(frame),
+				cc.RemoteEndpoint().String(), relay, err)
+			if err == nil {
+				atomic.AddUint64(&tm.PktsSent, 1)
+				atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+				return nil
+			}
+			tm.evictCachedConnIfSame(nodeID, cc)
+			slog.Debug("turn-relay send failed, falling back",
+				"node_id", nodeID,
+				"network", cc.RemoteEndpoint().Network(),
+				"error", err)
+
+		case routeCandidateOwnTURNRelay:
+			if tm.turn == nil || candidate.addr == nil {
+				continue
+			}
+			err := tm.turn.SendViaOwnRelay(candidate.addr, frame)
+			tm.recordTierSend(candidate.tier, nodeID, len(frame),
+				candidate.addr.String(), relay, err)
+			if err == nil {
+				atomic.AddUint64(&tm.PktsSent, 1)
+				atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
+				return nil
+			}
+			slog.Debug("outbound-turn-only: send via own relay failed",
+				"node_id", nodeID, "peer_addr", candidate.addr.String(),
+				"error", err)
+
+		case routeCandidateDirectUDP:
+			if candidate.addr == nil {
+				continue
+			}
+			n, err := tm.udp.WriteToUDPAddr(frame, candidate.addr)
+			tm.recordTierSend(candidate.tier, nodeID, len(frame),
+				candidate.addr.String(), relay, err)
+			if err == nil {
+				atomic.AddUint64(&tm.PktsSent, 1)
+				atomic.AddUint64(&tm.BytesSent, uint64(n))
+			}
+			return err
 		}
-		// v1.9.0-jf.11a.2: peer did not advertise TURN, but WE have our
-		// own TURN allocation. Route via our own relay to the peer's
-		// real UDP address — the canonical WebRTC
-		// iceTransportPolicy='relay' semantic (RFC 8828 Mode 3). Peer
-		// sees source = our TURN anycast, never our real IP.
-		//
-		// Address priority: caller-supplied > pathDirect.
-		// (peerTCP isn't useful here — TURN forwards UDP; the peer's
-		// TCP endpoint isn't UDP-reachable even at the same host:port.)
-		//
-		// pion's auto-CreatePermission on first WriteTo per destination
-		// IP handles the TURN protocol dance transparently. Refresh
-		// every ~4 min; no manual plumbing needed.
-		if tm.turn != nil {
-			var peerAddr *net.UDPAddr
-			switch {
-			case addr != nil:
-				peerAddr = addr
-			case pathDirect != nil:
-				peerAddr = pathDirect
-			}
-			if peerAddr != nil {
-				err := tm.turn.SendViaOwnRelay(peerAddr, frame)
-				tm.recordTierSend(SendTierOutboundTurnOnlyOwnRelay,
-					nodeID, len(frame),
-					peerAddr.String(), relay, err)
-				if err == nil {
-					atomic.AddUint64(&tm.PktsSent, 1)
-					atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
-					return nil
-				}
-				slog.Debug("outbound-turn-only: send via own relay failed",
-					"node_id", nodeID, "peer_addr", peerAddr.String(),
-					"error", err)
-			}
-		}
+	}
+
+	if plan.failClosed {
 		return fmt.Errorf("outbound-turn-only: no TURN path for node %d "+
 			"(peer advertised no TURN endpoint, local TURN allocation "+
 			"missing or dial failed, and no known UDP-reachable address "+
 			"for this peer; tunnel traffic refused rather than leak "+
 			"source IP via direct UDP or beacon)", nodeID)
 	}
+	return fmt.Errorf("no address for node %d", nodeID)
+}
 
-	// Tier 1 (beacon relay) — SKIPPED when this peer advertised a
-	// TURN endpoint (v1.9.0-jf.10). A TURN advertisement is an
-	// explicit "route me through TURN, not via any third-party
-	// relay" signal from the peer, typically paired with -hide-ip.
-	// Honouring beacon would leak routing metadata to the beacon's
-	// operator (defeating the hide-ip purpose). Fall through to the
-	// cached-conn tier → turn-relay fallback tier instead. Beacon
-	// stays the default for all peers that did NOT advertise TURN.
-	if relay && bAddr != nil && !hasTURNEp {
-		// MsgRelay: [0x05][senderNodeID(4)][destNodeID(4)][frame...]
-		msg := make([]byte, 1+4+4+len(frame))
-		msg[0] = protocol.BeaconMsgRelay
-		binary.BigEndian.PutUint32(msg[1:5], tm.loadNodeID())
-		binary.BigEndian.PutUint32(msg[5:9], nodeID)
-		copy(msg[9:], frame)
-		n, err := tm.udp.WriteToUDPAddr(msg, bAddr)
-		tm.recordTierSend(SendTierBeaconRelay, nodeID, len(frame),
-			bAddr.String(), relay, err)
-		if err == nil {
-			atomic.AddUint64(&tm.PktsSent, 1)
-			atomic.AddUint64(&tm.BytesSent, uint64(n))
-		}
-		return err
+func dialedConnNetwork(conn transport.DialedConn) string {
+	if conn == nil || conn.RemoteEndpoint() == nil {
+		return ""
 	}
+	return conn.RemoteEndpoint().Network()
+}
 
-	// If path has a direct addr recorded (from the last authenticated
-	// decrypt), prefer it over the caller-supplied addr. This is what
-	// keeps v1.9.0-jf.2's NAT-drift refresh effective: writeFrame
-	// follows the last-known-good endpoint even if the caller
-	// snapshotted a stale one before a NAT rotation.
-	//
-	// v1.9.0-jf.10: skip direct UDP too when peerTURN is advertised.
-	// Otherwise a stale pathDirect (from before the peer went
-	// -hide-ip) would bypass turn-relay and leak the peer's IP back
-	// to them. Honour the "route me via TURN" signal strictly.
-	if hasTURNEp {
-		addr = nil
-	} else if addr == nil && pathDirect != nil {
-		// v1.9.0-jf.12: only fall back to the cached pathDirect when
-		// the caller didn't supply an explicit addr. A non-nil caller
-		// arg (typically the source addr of the most-recent
-		// authenticated inbound frame, threaded through by handshake
-		// reply paths — the WireGuard endpoint-learning rule) is the
-		// freshest evidence of where the peer is reachable, so it
-		// must override the cache. Pre-jf.12 behaviour is preserved
-		// for callers passing nil.
-		addr = pathDirect
+func (tm *TunnelManager) evictCachedConnIfSame(nodeID uint32, conn transport.DialedConn) {
+	tm.mu.Lock()
+	if tm.peerConns[nodeID] == conn {
+		delete(tm.peerConns, nodeID)
+		_ = conn.Close()
 	}
-
-	// Phase 4: if a cached non-UDP conn exists for this peer, use it
-	// first. The cache is populated by DialTCPForPeer, DialTURNForPeer,
-	// and (v1.9.0-jf.9) DialTURNRelayForPeer. UDP conns are not cached
-	// here — they're effectively free to re-issue via WriteToUDPAddr.
-	if cachedConn != nil && cachedConn.RemoteEndpoint().Network() != "udp" {
-		err := cachedConn.Send(frame)
-		tm.recordTierSend(SendTierCachedConn, nodeID, len(frame),
-			cachedConn.RemoteEndpoint().String(), relay, err)
-		if err == nil {
-			atomic.AddUint64(&tm.PktsSent, 1)
-			atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
-			return nil
-		}
-		// Cached conn is dead (e.g. peer closed TCP). Drop it so the
-		// next sender can re-dial, and fall through to UDP.
-		tm.mu.Lock()
-		if tm.peerConns[nodeID] == cachedConn {
-			delete(tm.peerConns, nodeID)
-			_ = cachedConn.Close()
-		}
-		tm.mu.Unlock()
-		slog.Debug("cached peer conn failed, falling back",
-			"node_id", nodeID,
-			"network", cachedConn.RemoteEndpoint().Network(),
-			"error", err)
-	}
-
-	if addr == nil {
-		// v1.9.0-jf.9: last-resort asymmetric-TURN fallback. If the peer
-		// advertised a TURN endpoint and we have no UDP destination,
-		// lazily build a turn-relay conn and retry the cached-conn
-		// path. Avoids re-dialling if a conn was installed by a racing
-		// writer between our initial read and this tier.
-		if hasTURNEp {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			dialErr := tm.DialTURNRelayForPeer(ctx, nodeID)
-			cancel()
-			if dialErr == nil {
-				tm.mu.RLock()
-				cc := tm.peerConns[nodeID]
-				tm.mu.RUnlock()
-				if cc != nil && cc.RemoteEndpoint().Network() != "udp" {
-					err := cc.Send(frame)
-					tm.recordTierSend(SendTierJF9Fallback, nodeID,
-						len(frame), cc.RemoteEndpoint().String(),
-						relay, err)
-					if err == nil {
-						atomic.AddUint64(&tm.PktsSent, 1)
-						atomic.AddUint64(&tm.BytesSent, uint64(len(frame)))
-						return nil
-					}
-					return fmt.Errorf("turn-relay send after dial: %w", err)
-				}
-			} else {
-				tm.recordTierSend(SendTierJF9Fallback, nodeID,
-					len(frame), "", relay, dialErr)
-				slog.Debug("turn-relay fallback dial failed", "node_id", nodeID, "error", dialErr)
-			}
-		}
-		return fmt.Errorf("no address for node %d", nodeID)
-	}
-	n, err := tm.udp.WriteToUDPAddr(frame, addr)
-	tm.recordTierSend(SendTierDirectUDP, nodeID, len(frame),
-		addr.String(), relay, err)
-	if err == nil {
-		atomic.AddUint64(&tm.PktsSent, 1)
-		atomic.AddUint64(&tm.BytesSent, uint64(n))
-	}
-	return err
+	tm.mu.Unlock()
 }
 
 // DialTCPForPeer establishes (or reuses) a TCP connection to the peer

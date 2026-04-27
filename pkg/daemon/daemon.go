@@ -177,9 +177,9 @@ const (
 
 // Dial and retransmission constants.
 const (
-	DialDirectRetries    = 3                      // direct connection attempts before relay
-	DialMaxRetries       = 6                      // total attempts (direct + relay)
-	DialInitialRTO       = 1 * time.Second        // initial SYN retransmission timeout
+	DialDirectRetries = 3               // direct connection attempts before relay
+	DialMaxRetries    = 6               // total attempts (direct + relay)
+	DialInitialRTO    = 1 * time.Second // initial SYN retransmission timeout
 	// DialRelayInitialRTO is the initial SYN retransmission timeout when
 	// the peer is in relay mode. Beacon-relayed traffic takes 2-3× the
 	// RTT of direct UDP (the frame must hop through a US-based beacon
@@ -187,8 +187,8 @@ const (
 	// ~80ms direct). The 1s direct-RTO budget was too tight for the
 	// relay path and caused spurious dial timeouts even when the
 	// tunnel itself was healthy.
-	DialRelayInitialRTO = 3 * time.Second
-	DialMaxRTO          = 8 * time.Second        // max backoff for SYN retransmission
+	DialRelayInitialRTO  = 3 * time.Second
+	DialMaxRTO           = 8 * time.Second        // max backoff for SYN retransmission
 	DialCheckInterval    = 10 * time.Millisecond  // poll interval for state changes during dial
 	RetxCheckInterval    = 100 * time.Millisecond // retransmission check ticker
 	MaxRetxAttempts      = 8                      // abandon connection after this many retransmissions
@@ -315,27 +315,27 @@ type resolveEntry struct {
 }
 
 type Daemon struct {
-	config     Config
-	addrMu     sync.RWMutex // protects nodeID, addr, registrationAddr (H6 fix)
-	nodeID     uint32
-	addr       protocol.Addr
+	config Config
+	addrMu sync.RWMutex // protects nodeID, addr, registrationAddr (H6 fix)
+	nodeID uint32
+	addr   protocol.Addr
 	// registrationAddr is the host:port the daemon registered with — either
 	// -endpoint, the STUN-observed endpoint, or the resolved local address.
 	// Heartbeats echo this back to the registry so a server-side real_addr
 	// refresh can detect drift without a full re-registration round trip.
 	registrationAddr string
-	identity   *crypto.Identity
-	regConn    *registry.Client
-	tunnels    *TunnelManager
-	ports      *PortManager
-	ipc        *IPCServer
-	handshakes *HandshakeManager
-	webhook    *WebhookClient
-	taskQueue  *TaskQueue
-	startTime  time.Time
-	stopCh     chan struct{} // closed on Stop() to signal goroutines
-	stopOnce   sync.Once     // ensures stopCh is closed exactly once
-	lanAddrs   []string      // LAN addresses for same-network peer detection
+	identity         *crypto.Identity
+	regConn          *registry.Client
+	tunnels          *TunnelManager
+	ports            *PortManager
+	ipc              *IPCServer
+	handshakes       *HandshakeManager
+	webhook          *WebhookClient
+	taskQueue        *TaskQueue
+	startTime        time.Time
+	stopCh           chan struct{} // closed on Stop() to signal goroutines
+	stopOnce         sync.Once     // ensures stopCh is closed exactly once
+	lanAddrs         []string      // LAN addresses for same-network peer detection
 
 	// Endpoint cache: nodeID -> last-known endpoint (peer resilience)
 	epCacheMu sync.RWMutex
@@ -2631,7 +2631,10 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	// route exclusively via TURN).
 	raceStop := make(chan struct{})
 	defer close(raceStop)
-	if !relayActive && d.config.BeaconAddr != "" {
+	if !relayActive && allowRacingBeaconRelay(dialFallbackPolicyInput{
+		outboundTURNOnly: d.config.OutboundTURNOnly,
+		hasBeacon:        d.config.BeaconAddr != "",
+	}) {
 		// Copy the SYN so the racing goroutine's Marshal is
 		// race-free against the main loop's `syn.Seq = …` write.
 		// Packet is a value-struct and SYN's Payload is nil, so a
@@ -2687,6 +2690,12 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 			// after the increment above. Once the block fires (relayActive=true
 			// or TCP switched), subsequent ticks fall through unchanged.
 			if retries == fallbackTriggerAt && !relayActive {
+				fallback := planDialFallback(dialFallbackPolicyInput{
+					outboundTURNOnly: d.config.OutboundTURNOnly,
+					hasRendezvous:    d.rendezvousClient != nil,
+					hasTCP:           d.tunnels.HasTCPEndpoint(dstAddr.Node),
+					hasBeacon:        d.config.BeaconAddr != "",
+				})
 				// v1.9.0-jf.14: before falling back to TCP/relay,
 				// consult the rendezvous service once per dial. The
 				// most common cause of phase-1 timeout for hide-ip
@@ -2694,7 +2703,7 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 				// from before the peer rotated. A fresh fetch from
 				// the rendezvous unblocks the next retry without
 				// burning the full relay-fallback budget.
-				if !rendezvousQueried && d.rendezvousClient != nil {
+				if fallback.queryRendezvous && !rendezvousQueried {
 					rendezvousQueried = true
 					if fresh := d.rendezvousLookupForDial(dstAddr.Node); fresh != "" {
 						if err := d.tunnels.AddPeerTURNEndpoint(dstAddr.Node, fresh); err != nil {
@@ -2707,7 +2716,7 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 					}
 				}
 				switched := false
-				if d.tunnels.HasTCPEndpoint(dstAddr.Node) {
+				if fallback.tryTCP {
 					dctx, cancel := context.WithTimeout(context.Background(), DialTCPFallbackTimeout)
 					err := d.tunnels.DialTCPForPeer(dctx, dstAddr.Node)
 					cancel()
@@ -2719,7 +2728,7 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 						slog.Debug("tcp fallback dial failed", "node_id", dstAddr.Node, "error", err)
 					}
 				}
-				if !switched && d.config.BeaconAddr != "" {
+				if !switched && fallback.switchToBeacon {
 					slog.Info("direct dial timed out, switching to relay", "node_id", dstAddr.Node)
 					d.tunnels.SetRelayPeer(dstAddr.Node, true)
 					relayActive = true
