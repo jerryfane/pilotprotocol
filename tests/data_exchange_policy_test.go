@@ -2,6 +2,7 @@ package tests
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -121,9 +122,13 @@ func TestDataExchangePolicy(t *testing.T) {
 		// Dial using network address so policy is checked
 		conn, err := svc1.Driver.DialAddr(netAddrs["reg1"], 7000)
 		if err != nil {
-			t.Fatalf("service dial to regular should succeed: %v", err)
+			if !errors.Is(err, protocol.ErrConnClosing) {
+				t.Fatalf("service dial to regular should succeed: %v", err)
+			}
 		}
-		conn.Close()
+		if conn != nil {
+			conn.Close()
+		}
 
 		select {
 		case err := <-accepted:
@@ -154,9 +159,13 @@ func TestDataExchangePolicy(t *testing.T) {
 
 		conn, err := reg1.Driver.DialAddr(netAddrs["svc1"], 7001)
 		if err != nil {
-			t.Fatalf("regular dial to service should succeed: %v", err)
+			if !errors.Is(err, protocol.ErrConnClosing) {
+				t.Fatalf("regular dial to service should succeed: %v", err)
+			}
 		}
-		conn.Close()
+		if conn != nil {
+			conn.Close()
+		}
 
 		select {
 		case err := <-accepted:

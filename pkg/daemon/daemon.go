@@ -2242,17 +2242,55 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 	if pkt.HasFlag(protocol.FlagFIN) {
 		conn := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort)
 		if conn != nil {
-			conn.CloseRecvBuf()
 			conn.Mu.Lock()
 			old := conn.State
 			wasFinWait := conn.State == StateFinWait
 			wasTimeWait := conn.State == StateTimeWait
+			sendSeq := conn.SendSeq
+			if !wasTimeWait {
+				conn.LastActivity = time.Now()
+				conn.KeepaliveUnacked = 0
+			}
+			conn.Mu.Unlock()
+
+			if pkt.Ack > 0 {
+				conn.RetxMu.Lock()
+				conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
+				conn.RetxMu.Unlock()
+				conn.ProcessAck(pkt.Ack, len(pkt.Payload) == 0)
+			}
+
+			if wasTimeWait {
+				// Duplicate FIN after the close handshake is complete. ACK it
+				// idempotently, but do not refresh LastActivity or emit another
+				// transition; otherwise retransmitted FINs keep TIME_WAIT alive.
+				ack := &protocol.Packet{
+					Version:  protocol.Version,
+					Flags:    protocol.FlagACK,
+					Protocol: protocol.ProtoStream,
+					Src:      conn.LocalAddr,
+					Dst:      pkt.Src,
+					SrcPort:  pkt.DstPort,
+					DstPort:  pkt.SrcPort,
+					Seq:      sendSeq,
+					Ack:      pkt.Seq + 1,
+					Window:   conn.RecvWindow(),
+				}
+				d.tunnels.Send(pkt.Src.Node, ack)
+				return
+			}
+
+			conn.CloseRecvBuf()
+			conn.Mu.Lock()
+			old = conn.State
 			conn.State = StateTimeWait
 			conn.LastActivity = time.Now()
 			conn.KeepaliveUnacked = 0
-			sendSeq := conn.SendSeq
+			sendSeq = conn.SendSeq
 			conn.Mu.Unlock()
-			d.traceStreamTransition(conn, old, StateTimeWait, "fin received")
+			if old != StateTimeWait {
+				d.traceStreamTransition(conn, old, StateTimeWait, "fin received")
+			}
 			d.traceStream("fin.recv", conn)
 			// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
 			if wasFinWait {
@@ -2268,10 +2306,15 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			}
 			// Connection will be reaped by idleSweepLoop after TimeWaitDuration
 
-			// Send FIN-ACK
+			flags := protocol.FlagFIN | protocol.FlagACK
+			if wasFinWait {
+				flags = protocol.FlagACK
+			}
+			// Send FIN-ACK for peer-initiated close. If we had already sent
+			// our FIN, an ACK-only response avoids a FIN echo loop.
 			finack := &protocol.Packet{
 				Version:  protocol.Version,
-				Flags:    protocol.FlagFIN | protocol.FlagACK,
+				Flags:    flags,
 				Protocol: protocol.ProtoStream,
 				Src:      conn.LocalAddr,
 				Dst:      pkt.Src,
@@ -2679,15 +2722,16 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 			conn.Mu.Lock()
 			st := conn.State
 			conn.Mu.Unlock()
-			if st == StateEstablished || st == StateFinWait || st == StateTimeWait {
-				// StateFinWait/StateTimeWait: the three-way handshake completed but
-				// the remote closed before we observed ESTABLISHED. The connection
-				// was successfully established — return it so the caller can handle
-				// the closed state normally.
-				if st == StateEstablished {
-					d.startRetxLoop(conn)
-				}
+			if st == StateEstablished {
+				d.startRetxLoop(conn)
 				return conn, nil
+			}
+			if st == StateFinWait || st == StateCloseWait || st == StateTimeWait {
+				d.traceStream("dial.closed", conn, "observed_state", st.String())
+				conn.CloseRecvBuf()
+				d.setConnState(conn, StateClosed, "dial observed closing connection")
+				d.removeConnection(conn, "dial observed closing connection")
+				return nil, protocol.ErrConnClosing
 			}
 			if st == StateClosed {
 				return nil, protocol.ErrConnRefused

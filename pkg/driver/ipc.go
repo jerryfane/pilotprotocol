@@ -302,7 +302,11 @@ func (c *ipcClient) sendAndWaitTimeout(data []byte, expectCmd byte, timeout time
 			return nil, fmt.Errorf("daemon disconnected")
 		}
 		if len(errResp) >= 2 {
-			return nil, fmt.Errorf("daemon: %s", string(errResp[2:]))
+			msg := string(errResp[2:])
+			if msg == protocol.ErrConnClosing.Error() {
+				return nil, fmt.Errorf("daemon: %w", protocol.ErrConnClosing)
+			}
+			return nil, fmt.Errorf("daemon: %s", msg)
 		}
 		return nil, fmt.Errorf("daemon error")
 	case <-c.doneCh:

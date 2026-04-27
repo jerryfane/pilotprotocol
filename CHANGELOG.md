@@ -10,6 +10,8 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.15] - 2026-04-27
+
 ### Changed
 
 - **Port-level stream diagnostics are now explicit and opt-in.** The daemon
@@ -44,6 +46,15 @@ Each entry is intended to be upstream-able as a discrete bug fix.
   When `-outbound-turn-only` is set, Pilot keeps cached TURN connections first
   but tries its own TURN allocation before consulting a peer-advertised TURN
   endpoint, keeping the route order aligned with the no-IP-leak mental model.
+
+### Fixed
+
+- **Port-1004 dials no longer receive already-closing Pilot streams.**
+  `DialConnection` now succeeds only for `ESTABLISHED` streams and returns the
+  typed `connection closing` error for streams that reach FIN/TIME_WAIT before
+  IPC receives `DialOK`. FIN+ACK processing now clears retransmit state before
+  close handling, and duplicate FINs in TIME_WAIT are idempotent ACK-only
+  responses that do not refresh cleanup timers or emit repeated transitions.
 
 ## [v1.9.0-jf.15.11] - 2026-04-27
 

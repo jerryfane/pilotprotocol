@@ -10,6 +10,7 @@ var (
 	ErrNodeNotFound     = errors.New("node not found")
 	ErrNetworkNotFound  = errors.New("network not found")
 	ErrConnClosed       = errors.New("connection closed")
+	ErrConnClosing      = errors.New("connection closing")
 	ErrConnRefused      = errors.New("connection refused")
 	ErrDialTimeout      = errors.New("dial timeout")
 	ErrChecksumMismatch = errors.New("checksum mismatch")

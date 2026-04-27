@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -94,6 +96,140 @@ func TestPortManagerStaleConnectionsFINWaitAndTIMEWAIT(t *testing.T) {
 	})
 }
 
+func TestDialConnectionRejectsClosingState(t *testing.T) {
+	d := New(Config{Email: "stream-cleanup@example.com", Public: true})
+	installCleanupTunnelConn(d, 99)
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := d.DialConnection(protocol.Addr{Node: 99}, protocol.PortManagedScore)
+		if conn != nil {
+			errCh <- errors.New("DialConnection returned a connection in closing state")
+			return
+		}
+		errCh <- err
+	}()
+
+	var conn *Connection
+	deadline := time.After(time.Second)
+	for conn == nil {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for DialConnection to allocate a conn")
+		default:
+		}
+		all := d.ports.AllConnections()
+		if len(all) > 0 {
+			conn = all[0]
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	conn.Mu.Lock()
+	conn.State = StateTimeWait
+	conn.Mu.Unlock()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, protocol.ErrConnClosing) {
+			t.Fatalf("DialConnection error = %v, want ErrConnClosing", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialConnection did not return after observing closing state")
+	}
+	if got := d.ports.GetConnection(conn.ID); got != nil {
+		t.Fatalf("closing dial conn still registered: id=%d state=%s", got.ID, got.State)
+	}
+}
+
+func TestDuplicateFINInTimeWaitIsIdempotent(t *testing.T) {
+	d := New(Config{Email: "stream-cleanup@example.com", Public: true})
+	rec := installRecordingTunnelConn(d, 2)
+	conn := d.ports.NewConnection(4000, protocol.Addr{Node: 2}, 49152)
+	conn.LocalAddr = protocol.Addr{Node: 1}
+	past := time.Now().Add(-time.Minute)
+	setConnStateAndActivity(conn, StateTimeWait, past)
+	conn.Mu.Lock()
+	conn.SendSeq = 77
+	conn.Mu.Unlock()
+
+	d.handleStreamPacket(&protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagFIN,
+		Protocol: protocol.ProtoStream,
+		Src:      protocol.Addr{Node: 2},
+		Dst:      protocol.Addr{Node: 1},
+		SrcPort:  49152,
+		DstPort:  4000,
+		Seq:      123,
+		Window:   512,
+	})
+
+	conn.Mu.Lock()
+	state := conn.State
+	lastActivity := conn.LastActivity
+	conn.Mu.Unlock()
+	if state != StateTimeWait {
+		t.Fatalf("state = %s, want TIME_WAIT", state)
+	}
+	if !lastActivity.Equal(past) {
+		t.Fatalf("LastActivity changed on duplicate FIN: got %v want %v", lastActivity, past)
+	}
+	pkts := rec.packets(t)
+	if len(pkts) != 1 {
+		t.Fatalf("sent packets = %d, want 1", len(pkts))
+	}
+	if pkts[0].HasFlag(protocol.FlagFIN) || !pkts[0].HasFlag(protocol.FlagACK) {
+		t.Fatalf("duplicate FIN response flags = 0x%x, want ACK-only", pkts[0].Flags)
+	}
+}
+
+func TestFINACKInFinWaitClearsRetransmitAndDoesNotEchoFIN(t *testing.T) {
+	d := New(Config{Email: "stream-cleanup@example.com", Public: true})
+	rec := installRecordingTunnelConn(d, 2)
+	conn := d.ports.NewConnection(4000, protocol.Addr{Node: 2}, 49152)
+	conn.LocalAddr = protocol.Addr{Node: 1}
+	conn.Mu.Lock()
+	conn.State = StateFinWait
+	conn.SendSeq = 101
+	conn.Mu.Unlock()
+	conn.TrackSend(100, []byte{0})
+
+	d.handleStreamPacket(&protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagFIN | protocol.FlagACK,
+		Protocol: protocol.ProtoStream,
+		Src:      protocol.Addr{Node: 2},
+		Dst:      protocol.Addr{Node: 1},
+		SrcPort:  49152,
+		DstPort:  4000,
+		Seq:      200,
+		Ack:      101,
+		Window:   512,
+	})
+
+	conn.Mu.Lock()
+	state := conn.State
+	conn.Mu.Unlock()
+	if state != StateTimeWait {
+		t.Fatalf("state = %s, want TIME_WAIT", state)
+	}
+	conn.RetxMu.Lock()
+	unacked := len(conn.Unacked)
+	conn.RetxMu.Unlock()
+	if unacked != 0 {
+		t.Fatalf("unacked segments = %d, want 0 after FIN-ACK", unacked)
+	}
+	pkts := rec.packets(t)
+	if len(pkts) != 1 {
+		t.Fatalf("sent packets = %d, want 1", len(pkts))
+	}
+	if pkts[0].HasFlag(protocol.FlagFIN) || !pkts[0].HasFlag(protocol.FlagACK) {
+		t.Fatalf("FIN_WAIT FIN response flags = 0x%x, want ACK-only", pkts[0].Flags)
+	}
+}
+
 func TestIPCClientDisconnectCleansOwnedPortAndConnection(t *testing.T) {
 	d := New(Config{Email: "ipc-cleanup@example.com"})
 	installCleanupTunnelConn(d, 99)
@@ -170,8 +306,18 @@ func inboundSYNPkt(srcNode uint32, srcPort uint16, seq uint32) *protocol.Packet 
 
 func installCleanupTunnelConn(d *Daemon, nodeID uint32) {
 	d.tunnels.mu.Lock()
+	d.tunnels.paths[nodeID] = &peerPath{direct: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(nodeID)}}
 	d.tunnels.peerConns[nodeID] = &cleanupDialedConn{}
 	d.tunnels.mu.Unlock()
+}
+
+func installRecordingTunnelConn(d *Daemon, nodeID uint32) *recordingDialedConn {
+	rec := &recordingDialedConn{}
+	d.tunnels.mu.Lock()
+	d.tunnels.paths[nodeID] = &peerPath{direct: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(nodeID)}}
+	d.tunnels.peerConns[nodeID] = rec
+	d.tunnels.mu.Unlock()
+	return rec
 }
 
 func setConnStateAndActivity(c *Connection, state ConnState, at time.Time) {
@@ -209,3 +355,42 @@ type cleanupEndpoint string
 
 func (e cleanupEndpoint) Network() string { return "test" }
 func (e cleanupEndpoint) String() string  { return string(e) }
+
+type recordingDialedConn struct {
+	mu     sync.Mutex
+	frames [][]byte
+}
+
+func (c *recordingDialedConn) Send(frame []byte) error {
+	cp := make([]byte, len(frame))
+	copy(cp, frame)
+	c.mu.Lock()
+	c.frames = append(c.frames, cp)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *recordingDialedConn) RemoteEndpoint() transport.Endpoint {
+	return cleanupEndpoint("recording")
+}
+
+func (c *recordingDialedConn) Close() error { return nil }
+
+func (c *recordingDialedConn) packets(t *testing.T) []*protocol.Packet {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*protocol.Packet, 0, len(c.frames))
+	for _, frame := range c.frames {
+		magicLen := len(protocol.TunnelMagic)
+		if len(frame) < magicLen || string(frame[:magicLen]) != string(protocol.TunnelMagic[:]) {
+			t.Fatalf("frame missing tunnel magic: %x", frame)
+		}
+		pkt, err := protocol.Unmarshal(frame[magicLen:])
+		if err != nil {
+			t.Fatalf("unmarshal packet: %v", err)
+		}
+		out = append(out, pkt)
+	}
+	return out
+}
