@@ -231,6 +231,121 @@ func TestFINACKInFinWaitClearsRetransmitAndDoesNotEchoFIN(t *testing.T) {
 	}
 }
 
+func TestStreamACKClearsUnackedSegment(t *testing.T) {
+	d := New(Config{Email: "stream-ack@example.com", Public: true, TraceStreams: true})
+	installRecordingTunnelConn(d, 2)
+	conn := d.ports.NewConnection(4000, protocol.Addr{Node: 2}, 49152)
+	conn.LocalAddr = protocol.Addr{Node: 1}
+	conn.Mu.Lock()
+	conn.State = StateEstablished
+	conn.SendSeq = 6
+	conn.RecvAck = 100
+	conn.Mu.Unlock()
+	conn.TrackSend(1, []byte("hello"))
+
+	d.handleStreamPacket(&protocol.Packet{
+		Version:  protocol.Version,
+		Flags:    protocol.FlagACK,
+		Protocol: protocol.ProtoStream,
+		Src:      protocol.Addr{Node: 2},
+		Dst:      protocol.Addr{Node: 1},
+		SrcPort:  49152,
+		DstPort:  4000,
+		Seq:      100,
+		Ack:      6,
+		Window:   512,
+	})
+
+	conn.RetxMu.Lock()
+	unacked := len(conn.Unacked)
+	lastAck := conn.LastAck
+	conn.RetxMu.Unlock()
+	if unacked != 0 {
+		t.Fatalf("unacked segments = %d, want 0 after ACK", unacked)
+	}
+	if lastAck != 6 {
+		t.Fatalf("last ACK = %d, want 6", lastAck)
+	}
+}
+
+func TestInboundStreamRecordsQueueAndAcceptLifecycle(t *testing.T) {
+	d := New(Config{
+		Email:        "stream-accept@example.com",
+		Public:       true,
+		TraceStreams: true,
+		SYNRateLimit: AcceptQueueLen * 4,
+	})
+	ln, err := d.ports.Bind(protocol.PortManagedScore)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	installCleanupTunnelConn(d, 2)
+
+	d.handleStreamPacket(inboundSYNPkt(2, 49152, 100))
+
+	var conn *Connection
+	select {
+	case conn = <-ln.AcceptCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for accepted connection")
+	}
+	conn.Mu.Lock()
+	queued := !conn.AcceptQueuedAt.IsZero()
+	acceptedBeforeIPC := !conn.AcceptedAt.IsZero()
+	conn.Mu.Unlock()
+	if !queued {
+		t.Fatalf("connection was not marked as queued for accept")
+	}
+	if acceptedBeforeIPC {
+		t.Fatalf("connection marked accepted before IPC notified")
+	}
+
+	d.markConnAccepted(conn)
+	conn.Mu.Lock()
+	accepted := !conn.AcceptedAt.IsZero()
+	conn.Mu.Unlock()
+	if !accepted {
+		t.Fatalf("connection was not marked accepted")
+	}
+	d.removeConnection(conn, "test cleanup")
+}
+
+func TestRetransmitMaxAttemptsClosesConnectionAndSendsRST(t *testing.T) {
+	d := New(Config{Email: "stream-retx@example.com", Public: true, TraceStreams: true})
+	rec := installRecordingTunnelConn(d, 2)
+	conn := d.ports.NewConnection(4000, protocol.Addr{Node: 2}, 49152)
+	conn.LocalAddr = protocol.Addr{Node: 1}
+	conn.Mu.Lock()
+	conn.State = StateEstablished
+	conn.SendSeq = 10
+	conn.Mu.Unlock()
+	conn.RTO = time.Millisecond
+	conn.RetxSend = func(pkt *protocol.Packet) {
+		_ = d.tunnels.Send(pkt.Dst.Node, pkt)
+	}
+	conn.TrackSend(1, []byte("stuck"))
+	conn.RetxMu.Lock()
+	conn.Unacked[0].attempts = MaxRetxAttempts
+	conn.Unacked[0].sentAt = time.Now().Add(-time.Second)
+	conn.RetxMu.Unlock()
+
+	d.retransmitUnacked(conn)
+
+	conn.Mu.Lock()
+	state := conn.State
+	conn.Mu.Unlock()
+	if state != StateClosed {
+		t.Fatalf("state = %s, want CLOSED after max retransmits", state)
+	}
+	pkts := rec.packets(t)
+	if len(pkts) != 1 {
+		t.Fatalf("sent packets = %d, want 1 RST", len(pkts))
+	}
+	if !pkts[0].HasFlag(protocol.FlagRST) {
+		t.Fatalf("packet flags = 0x%x, want RST", pkts[0].Flags)
+	}
+}
+
 func TestIPCClientDisconnectCleansOwnedPortAndConnection(t *testing.T) {
 	d := New(Config{Email: "ipc-cleanup@example.com"})
 	installCleanupTunnelConn(d, 99)

@@ -164,6 +164,9 @@ type Connection struct {
 	// Close
 	CloseOnce  sync.Once // ensures RecvBuf is closed exactly once
 	RecvClosed bool      // true after RecvBuf is closed (guarded by RecvMu)
+	// Listener / IPC ownership
+	AcceptQueuedAt time.Time // set when an inbound stream is queued to a listener
+	AcceptedAt     time.Time // set when an IPC client is notified about this stream
 	// Retransmit state
 	LastRetxTime time.Time // when last RTO retransmission fired (prevents cascading)
 	// Per-connection statistics
@@ -584,17 +587,40 @@ func (c *Connection) TrackSend(seq uint32, data []byte) {
 // If pureACK is true, duplicate ACK detection is enabled. Data packets
 // with piggybacked ACKs should pass pureACK=false to avoid false
 // fast retransmits (RFC 5681 Section 3.2).
-func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
+type AckResult struct {
+	Ack           uint32
+	BeforeLastAck uint32
+	AfterLastAck  uint32
+	BeforeUnacked int
+	AfterUnacked  int
+	Cleared       int
+	Duplicate     bool
+	Stale         bool
+	PureACK       bool
+}
+
+func (c *Connection) ProcessAck(ack uint32, pureACK bool) AckResult {
 	c.RetxMu.Lock()
 	defer c.RetxMu.Unlock()
 
+	res := AckResult{
+		Ack:           ack,
+		BeforeLastAck: c.LastAck,
+		AfterLastAck:  c.LastAck,
+		BeforeUnacked: len(c.Unacked),
+		AfterUnacked:  len(c.Unacked),
+		PureACK:       pureACK,
+	}
+
 	if seqAfter(c.LastAck, ack) {
-		return // ack is behind LastAck (wrapping-safe)
+		res.Stale = true
+		return res // ack is behind LastAck (wrapping-safe)
 	}
 
 	if ack == c.LastAck {
+		res.Duplicate = true
 		if !pureACK {
-			return // data packets don't count as dup ACKs
+			return res // data packets don't count as dup ACKs
 		}
 		// Duplicate ACK (pure ACK only)
 		c.DupAckCount++
@@ -620,7 +646,8 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 				c.CongWin = MaxCongWin
 			}
 		}
-		return
+		res.AfterUnacked = len(c.Unacked)
+		return res
 	}
 
 	// New ACK — advance
@@ -652,6 +679,9 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 		}
 	}
 	c.Unacked = remaining
+	res.AfterLastAck = c.LastAck
+	res.AfterUnacked = len(c.Unacked)
+	res.Cleared = res.BeforeUnacked - res.AfterUnacked
 
 	// Congestion window growth (Appropriate Byte Counting, RFC 3465)
 	// Grow based on bytes ACKed, not number of ACKs — avoids delayed ACK penalty.
@@ -685,6 +715,7 @@ func (c *Connection) ProcessAck(ack uint32, pureACK bool) {
 		default:
 		}
 	}
+	return res
 }
 
 // fastRetransmit resends the first unacked-and-not-SACKed segment immediately.

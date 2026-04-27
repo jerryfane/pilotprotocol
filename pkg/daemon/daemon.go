@@ -2125,10 +2125,10 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// multi-network connections (e.g. 1:0001.0000.0003 instead of
 		// the primary 0:0000.0000.0003).
 		conn.LocalAddr = pkt.Dst
-		conn.State = StateSynReceived
 		conn.RecvAck = pkt.Seq + 1
 		conn.ExpectedSeq = pkt.Seq + 1 // first data segment after SYN
 		conn.Mu.Unlock()
+		d.setConnState(conn, StateSynReceived, "syn received")
 		d.traceStream("syn.recv", conn, "new_state", StateSynReceived.String())
 		d.webhook.Emit("conn.syn_received", map[string]interface{}{
 			"src_addr": pkt.Src.String(), "src_port": pkt.SrcPort,
@@ -2167,11 +2167,9 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			return
 		}
 		conn.SendSeq++
-		old := conn.State
-		conn.State = StateEstablished
 		conn.Mu.Unlock()
 		d.traceStream("synack.sent", conn)
-		d.traceStreamTransition(conn, old, StateEstablished, "synack sent")
+		d.setConnState(conn, StateEstablished, "synack sent")
 		d.webhook.Emit("conn.established", map[string]interface{}{
 			"src_addr": pkt.Src.String(), "src_port": pkt.SrcPort,
 			"dst_port": pkt.DstPort, "conn_id": conn.ID,
@@ -2181,7 +2179,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Non-blocking push to accept queue — if full, clean up and RST
 		select {
 		case ln.AcceptCh <- conn:
-			d.traceStream("accept.queued", conn)
+			d.markConnAcceptQueued(conn)
 		default:
 			slog.Warn("accept queue full after SYN-ACK, closing connection", "port", pkt.DstPort, "src_addr", pkt.Src)
 			d.traceStream("accept.full", conn)
@@ -2204,12 +2202,10 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 			return
 		}
 		conn.RecvAck = pkt.Seq + 1
-		old := conn.State
-		conn.State = StateEstablished
 		sendSeq := conn.SendSeq
 		recvAck := conn.RecvAck
 		conn.Mu.Unlock()
-		d.traceStreamTransition(conn, old, StateEstablished, "synack received")
+		d.setConnState(conn, StateEstablished, "synack received")
 		d.traceStream("synack.recv", conn)
 
 		conn.RecvMu.Lock()
@@ -2243,7 +2239,6 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		conn := d.ports.FindConnection(pkt.DstPort, pkt.Src, pkt.SrcPort)
 		if conn != nil {
 			conn.Mu.Lock()
-			old := conn.State
 			wasFinWait := conn.State == StateFinWait
 			wasTimeWait := conn.State == StateTimeWait
 			sendSeq := conn.SendSeq
@@ -2257,7 +2252,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 				conn.RetxMu.Lock()
 				conn.PeerRecvWin = int(pkt.Window) * MaxSegmentSize
 				conn.RetxMu.Unlock()
-				conn.ProcessAck(pkt.Ack, len(pkt.Payload) == 0)
+				d.processConnAck(conn, pkt.Ack, len(pkt.Payload) == 0, "fin")
 			}
 
 			if wasTimeWait {
@@ -2282,15 +2277,11 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 
 			conn.CloseRecvBuf()
 			conn.Mu.Lock()
-			old = conn.State
-			conn.State = StateTimeWait
 			conn.LastActivity = time.Now()
 			conn.KeepaliveUnacked = 0
 			sendSeq = conn.SendSeq
 			conn.Mu.Unlock()
-			if old != StateTimeWait {
-				d.traceStreamTransition(conn, old, StateTimeWait, "fin received")
-			}
+			d.setConnState(conn, StateTimeWait, "fin received")
 			d.traceStream("fin.recv", conn)
 			// If we were in FIN_WAIT, this is a FIN-ACK — clear retx buffer
 			if wasFinWait {
@@ -2365,7 +2356,7 @@ func (d *Daemon) handleStreamPacket(pkt *protocol.Packet) {
 		// Only count as pure ACK for dup detection if no data payload
 		if pkt.Ack > 0 {
 			isPureACK := len(pkt.Payload) == 0
-			conn.ProcessAck(pkt.Ack, isPureACK)
+			d.processConnAck(conn, pkt.Ack, isPureACK, "packet")
 		}
 
 		// Check if payload is SACK info (not user data)
@@ -2606,8 +2597,8 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 	// (observed with the gossip Engine's 25 s loop).
 	conn.Mu.Lock()
 	conn.LocalAddr = protocol.Addr{Network: dstAddr.Network, Node: d.NodeID()}
-	conn.State = StateSynSent
 	conn.Mu.Unlock()
+	d.setConnState(conn, StateSynSent, "dial syn sent")
 	d.traceStream("syn.sent", conn, "new_state", StateSynSent.String())
 
 	// Send SYN with our receive window
@@ -3130,9 +3121,9 @@ func (d *Daemon) retxLoop(conn *Connection) {
 
 func (d *Daemon) retransmitUnacked(conn *Connection) {
 	conn.RetxMu.Lock()
-	defer conn.RetxMu.Unlock()
 
 	if len(conn.Unacked) == 0 {
+		conn.RetxMu.Unlock()
 		return
 	}
 
@@ -3140,6 +3131,7 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 
 	// Only retransmit one segment per RTO period (like real TCP).
 	if !conn.LastRetxTime.IsZero() && now.Sub(conn.LastRetxTime) < conn.RTO {
+		conn.RetxMu.Unlock()
 		return
 	}
 
@@ -3151,7 +3143,7 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 		if now.Sub(e.sentAt) > conn.RTO {
 			if e.attempts >= MaxRetxAttempts {
 				// Too many retransmissions — abandon connection
-				slog.Error("max retransmits exceeded, sending RST", "conn_id", conn.ID)
+				d.traceRetransmitFailure(conn, e, now)
 				// Send RST to notify the remote peer
 				rst := &protocol.Packet{
 					Version:  protocol.Version,
@@ -3165,6 +3157,7 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 				if conn.RetxSend != nil {
 					conn.RetxSend(rst)
 				}
+				conn.RetxMu.Unlock()
 				d.setConnState(conn, StateClosed, "max retransmits")
 				return
 			}
@@ -3220,6 +3213,7 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 				if conn.RetxSend != nil {
 					conn.RetxSend(pkt)
 				}
+				conn.RetxMu.Unlock()
 				return
 			}
 
@@ -3239,10 +3233,12 @@ func (d *Daemon) retransmitUnacked(conn *Connection) {
 			if conn.RetxSend != nil {
 				conn.RetxSend(pkt)
 			}
+			conn.RetxMu.Unlock()
 			return // only retransmit ONE segment per RTO
 		}
 		break // segments are ordered by time; if first hasn't timed out, none have
 	}
+	conn.RetxMu.Unlock()
 }
 
 // CloseConnection sends FIN and enters FIN_WAIT. The FIN is tracked in the
@@ -3275,11 +3271,9 @@ func (d *Daemon) CloseConnection(conn *Connection) {
 	}
 	conn.CloseRecvBuf()
 	conn.Mu.Lock()
-	old := conn.State
-	conn.State = StateFinWait
 	conn.LastActivity = time.Now()
 	conn.Mu.Unlock()
-	d.traceStreamTransition(conn, old, StateFinWait, "close requested")
+	d.setConnState(conn, StateFinWait, "close requested")
 }
 
 // SendDatagram sends an unreliable packet.

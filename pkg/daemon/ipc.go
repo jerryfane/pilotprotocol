@@ -351,6 +351,7 @@ func (s *IPCServer) handleBind(conn *ipcConn, payload []byte) {
 				slog.Debug("IPC accept notify failed", "conn_id", c.ID, "err", err)
 				return
 			}
+			s.daemon.markConnAccepted(c)
 
 			s.startRecvPusher(conn, c)
 		}

@@ -10,6 +10,23 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.17] - 2026-04-27
+
+### Changed
+
+- **Pilot stream lifecycle diagnostics now track ACK, accept, and retransmit
+  state explicitly.** Stream traces include accept queue / IPC accept state and
+  receive-buffer capacity, ACK handling reports whether unacked frames were
+  cleared or stale/duplicate, and max-retransmit RST logs now include the
+  oldest unacked segment, RTO, seq/ack counters, in-flight bytes, and peer/port
+  identity. This makes Entmoot `:1004` reconcile failures distinguishable as
+  handshake, listener, ACK-drain, retransmit, or IPC lifecycle issues.
+
+### Tests
+
+- Added Pilot daemon regressions for ACK-draining unacked data, inbound
+  listener accept lifecycle tracking, and max-retransmit RST closure.
+
 ## [v1.9.0-jf.15.16] - 2026-04-27
 
 ### Added
