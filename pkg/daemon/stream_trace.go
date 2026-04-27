@@ -76,10 +76,50 @@ func (d *Daemon) setConnState(conn *Connection, next ConnState, reason string) {
 	}
 	conn.Mu.Lock()
 	old := conn.State
+	valid := validConnTransition(old, next)
 	conn.State = next
 	conn.Mu.Unlock()
+	if !valid && d.config.TraceStreams {
+		slog.Warn("stream.invalid_transition",
+			"conn_id", conn.ID,
+			"peer_node", conn.RemoteAddr.Node,
+			"local_addr", conn.LocalAddr.String(),
+			"local_port", conn.LocalPort,
+			"remote_addr", conn.RemoteAddr.String(),
+			"remote_port", conn.RemotePort,
+			"old_state", old.String(),
+			"new_state", next.String(),
+			"reason", reason,
+		)
+	}
 	if old != next {
 		d.traceStreamTransition(conn, old, next, reason)
+	}
+}
+
+func validConnTransition(old, next ConnState) bool {
+	if old == next {
+		return true
+	}
+	switch old {
+	case StateClosed:
+		return next == StateSynSent || next == StateSynReceived || next == StateClosed
+	case StateListen:
+		return next == StateClosed
+	case StateSynSent:
+		return next == StateEstablished || next == StateClosed
+	case StateSynReceived:
+		return next == StateEstablished || next == StateClosed || next == StateTimeWait
+	case StateEstablished:
+		return next == StateFinWait || next == StateCloseWait || next == StateTimeWait || next == StateClosed
+	case StateFinWait:
+		return next == StateTimeWait || next == StateClosed
+	case StateCloseWait:
+		return next == StateClosed
+	case StateTimeWait:
+		return next == StateClosed
+	default:
+		return false
 	}
 }
 

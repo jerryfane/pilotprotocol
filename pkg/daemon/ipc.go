@@ -387,13 +387,16 @@ func (s *IPCServer) handleDial(conn *ipcConn, payload []byte) {
 	dstAddr := protocol.UnmarshalAddr(payload[0:protocol.AddrSize])
 	dstPort := binary.BigEndian.Uint16(payload[protocol.AddrSize:])
 
+	s.daemon.traceStreamPacket("ipc.dial.start", dstAddr.Node, 0, dstPort)
 	c, err := s.daemon.DialConnection(dstAddr, dstPort)
 	if err != nil {
+		s.daemon.traceStreamPacket("ipc.dial.failed", dstAddr.Node, 0, dstPort, "err", err.Error())
 		s.sendError(conn, err.Error())
 		return
 	}
 
 	conn.trackConn(c.ID)
+	s.daemon.traceStream("ipc.dial.ok", c)
 
 	// Send dial OK
 	resp := make([]byte, 5)
@@ -418,6 +421,7 @@ func (s *IPCServer) handleSend(conn *ipcConn, payload []byte) {
 	c := s.daemon.ports.GetConnection(connID)
 	if c == nil {
 		slog.Debug("IPC send on missing connection", "conn_id", connID)
+		s.daemon.traceStreamPacket("ipc.send.missing_connection", 0, 0, 0, "conn_id", connID)
 		s.sendError(conn, fmt.Sprintf("connection %d not found", connID))
 		return
 	}
@@ -440,6 +444,8 @@ func (s *IPCServer) handleClose(conn *ipcConn, payload []byte) {
 	if c != nil {
 		s.daemon.traceStream("ipc.close", c, "reason", "client close command")
 		s.daemon.CloseConnection(c)
+	} else {
+		s.daemon.traceStreamPacket("ipc.close.missing_connection", 0, 0, 0, "conn_id", connID)
 	}
 
 	resp := make([]byte, 5)
