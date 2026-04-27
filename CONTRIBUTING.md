@@ -20,10 +20,10 @@ go build ./...
 ### Running Tests
 
 ```bash
-go test -parallel 4 -count=1 ./tests/
+make test
 ```
 
-The `-parallel 4` flag is required. Unlimited parallelism exhausts ports and sockets, causing dial timeouts and flaky failures.
+`make test` runs the full Go package suite and excludes only the manual dashboard package (`tests/pilot_dashboard`), which is designed to run until interrupted.
 
 #### Integration Tests
 
@@ -109,7 +109,7 @@ make test
 2. Create a feature branch from `main`
 3. Write your changes
 4. Add or update tests as needed
-5. Ensure all tests pass: `go test -parallel 4 -count=1 ./tests/`
+5. Ensure all tests pass: `make test`
 6. Ensure the project builds: `go build ./...`
 7. Submit a pull request with a clear description
 
@@ -171,18 +171,20 @@ make coverage          # Run tests with coverage and update badge
 make coverage-html     # Generate HTML coverage report
 ```
 
-### Pre-commit hooks
+### Git hooks
 
-Set up automatic code quality checks before each commit:
+Set up automatic code quality checks before each commit and push:
 
 ```bash
 ./scripts/setup-hooks.sh
 ```
 
-This installs a git hook that automatically runs:
+This installs a pre-commit hook that automatically runs:
 - `go fmt` - Code formatting
 - `go vet` - Static analysis
 - `go test` - All tests
 - Coverage badge update
 
-To skip the hook temporarily: `git commit --no-verify`
+It also installs a pre-push hook that runs the full Go package test suite before each push, excluding only the manual dashboard package.
+
+To skip the hooks temporarily: `git commit --no-verify` or `git push --no-verify`

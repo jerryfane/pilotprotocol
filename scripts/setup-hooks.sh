@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# Setup pre-commit hooks for Pilot Protocol
+# Setup git hooks for Pilot Protocol
 # Run this script after cloning the repository
 
 HOOKS_DIR=".git/hooks"
-HOOK_FILE="$HOOKS_DIR/pre-commit"
+PRE_COMMIT_HOOK="$HOOKS_DIR/pre-commit"
+PRE_PUSH_HOOK="$HOOKS_DIR/pre-push"
 
-echo "Setting up pre-commit hooks..."
+echo "Setting up git hooks..."
 
 # Check if .git directory exists
 if [ ! -d ".git" ]; then
@@ -15,7 +16,7 @@ if [ ! -d ".git" ]; then
 fi
 
 # Create pre-commit hook
-cat > "$HOOK_FILE" << 'EOF'
+cat > "$PRE_COMMIT_HOOK" << 'EOF'
 #!/bin/sh
 
 # Pre-commit hook for Pilot Protocol
@@ -61,14 +62,23 @@ exit 0
 EOF
 
 # Make hook executable
-chmod +x "$HOOK_FILE"
+chmod +x "$PRE_COMMIT_HOOK"
 
-echo "✓ Pre-commit hook installed successfully!"
+# Install repo-managed pre-push hook.
+ln -sf ../../scripts/git-hooks/pre-push "$PRE_PUSH_HOOK"
+chmod +x scripts/git-hooks/pre-push
+
+echo "✓ Git hooks installed successfully!"
 echo ""
-echo "The hook will run on every commit and check:"
+echo "The pre-commit hook will run on every commit and check:"
 echo "  - Code formatting (go fmt)"
 echo "  - Static analysis (go vet)"
 echo "  - Tests (go test)"
 echo "  - Coverage badge update"
 echo ""
 echo "To skip the hook temporarily, use: git commit --no-verify"
+echo ""
+echo "The pre-push hook will run before every push and check:"
+echo "  - Full Go package tests, excluding the manual dashboard package"
+echo ""
+echo "To skip the pre-push hook temporarily, use: git push --no-verify"

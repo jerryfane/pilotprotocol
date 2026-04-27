@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+echo "Running pre-push tests..."
+
+if ! go test $(go list ./... | grep -v '/tests/pilot_dashboard$'); then
+    echo "pre-push tests failed; push aborted"
+    exit 1
+fi
+
+echo "pre-push tests passed"

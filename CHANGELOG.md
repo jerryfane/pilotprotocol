@@ -31,6 +31,9 @@ Each entry is intended to be upstream-able as a discrete bug fix.
   port 443 to bind before dialing. Test registry and beacon listeners now bind
   explicitly to IPv4 loopback so wildcard `:0` ports cannot be confused with
   unrelated IPv4 HTTP listeners on dual-stack hosts.
+- **CI and local push checks now use the full Go package test suite.** The
+  shared test command excludes only the manual dashboard package, and an
+  optional repo-managed pre-push hook runs the same suite before local pushes.
 
 ## [v1.9.0-jf.15.11] - 2026-04-27
 

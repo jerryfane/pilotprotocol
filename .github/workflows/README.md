@@ -85,7 +85,7 @@ make test
 cd tests/integration && make test
 
 # Run unit tests only
-go test -v ./tests/...
+go test $(go list ./... | grep -v '/tests/pilot_dashboard$')
 ```
 
 ## Workflow Dependencies

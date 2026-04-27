@@ -30,7 +30,7 @@ build:
 	go build -o $(BINDIR)/secure ./examples/go/secure
 
 test:
-	go test -parallel 4 -count=1 ./tests/ ./pkg/beacon/
+	go test $$(go list ./... | grep -v '/tests/pilot_dashboard$$')
 
 coverage:
 	@mkdir -p $(COVERDIR)

@@ -297,10 +297,10 @@ See the [Python SDK documentation](https://pilotprotocol.network/docs/python-sdk
 ## Testing
 
 ```bash
-go test -parallel 4 -count=1 ./tests/
+make test
 ```
 
-1047 tests pass. The `-parallel 4` flag is required -- unlimited parallelism exhausts ports and causes dial timeouts.
+The test target runs the full Go package suite and excludes only the manual dashboard package (`tests/pilot_dashboard`), which is designed to run until interrupted.
 
 ---
 
