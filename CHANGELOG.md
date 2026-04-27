@@ -19,6 +19,11 @@ Each entry is intended to be upstream-able as a discrete bug fix.
   `-outbound-turn-only` fail-closed behavior, blocks TCP/beacon fallback in
   that mode, and prefers direct UDP for non-TURN local peers when a peer TURN
   route would otherwise poison a known direct path.
+- **TURN route execution and peer endpoint state were split into focused
+  helpers.** `writeFrame` now snapshots state, asks the policy for candidates,
+  and delegates beacon/cached/TURN/direct sends to small executors.
+  `writeFrameToTURNEndpoint` keeps its explicit-endpoint semantics while
+  sharing the common send accounting and cached-conn eviction helpers.
 
 ## [v1.9.0-jf.15.11] - 2026-04-27
 

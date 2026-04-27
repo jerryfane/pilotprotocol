@@ -31,7 +31,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 		failClosed bool
 	}{
 		{
-			name: "outbound turn only uses cached turn then peer turn then own relay",
+			name: "outbound_turn_only_peer_turn_known_uses_cached_then_peer_turn_then_own_relay",
 			in: frameRoutePolicyInput{
 				outboundTURNOnly: true,
 				hasLocalTURN:     true,
@@ -47,7 +47,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 			failClosed: true,
 		},
 		{
-			name: "outbound turn only skips tcp beacon and direct",
+			name: "outbound_turn_only_blocks_tcp_and_beacon_fallback",
 			in: frameRoutePolicyInput{
 				outboundTURNOnly: true,
 				relay:            true,
@@ -59,7 +59,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 			failClosed: true,
 		},
 		{
-			name: "hide-ip peer turn suppresses beacon",
+			name: "peer_turn_suppresses_beacon_for_hide_ip",
 			in: frameRoutePolicyInput{
 				relay:       true,
 				hasBeacon:   true,
@@ -76,7 +76,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 			wantKinds: []routeCandidateKind{routeCandidateBeacon},
 		},
 		{
-			name: "non turn local peer with direct address prefers direct over peer turn",
+			name: "local_no_turn_peer_has_turn_direct_known",
 			in: frameRoutePolicyInput{
 				hasPeerTURN: true,
 				callerAddr:  direct,
@@ -84,7 +84,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 			wantKinds: []routeCandidateKind{routeCandidateDirectUDP},
 		},
 		{
-			name: "non turn local peer with stale turn relay cache still prefers direct",
+			name: "cached_turn_relay_failed_direct_available",
 			in: frameRoutePolicyInput{
 				hasPeerTURN:   true,
 				cachedConnNet: "turn-relay",
@@ -93,7 +93,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 			wantKinds: []routeCandidateKind{routeCandidateDirectUDP},
 		},
 		{
-			name: "local turn with peer turn prefers cached then peer turn",
+			name: "local_turn_peer_has_turn_prefers_cached_then_peer_turn",
 			in: frameRoutePolicyInput{
 				hasLocalTURN:  true,
 				hasPeerTURN:   true,
@@ -106,7 +106,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 			},
 		},
 		{
-			name: "normal peer uses cached then direct",
+			name: "normal_peer_uses_cached_then_direct",
 			in: frameRoutePolicyInput{
 				cachedConnNet: "tcp",
 				pathDirect:    direct,
@@ -115,6 +115,16 @@ func TestPlanFrameRoutes(t *testing.T) {
 				routeCandidateCachedConn,
 				routeCandidateDirectUDP,
 			},
+		},
+		{
+			name: "outbound_turn_only_peer_no_turn_known_direct",
+			in: frameRoutePolicyInput{
+				outboundTURNOnly: true,
+				hasLocalTURN:     true,
+				pathDirect:       direct,
+			},
+			wantKinds:  []routeCandidateKind{routeCandidateOwnTURNRelay},
+			failClosed: true,
 		},
 	}
 
