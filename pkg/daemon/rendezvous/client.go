@@ -32,6 +32,29 @@ const DefaultTimeout = 5 * time.Second
 // rotates.
 const DefaultPublishTTL = 30 * time.Minute
 
+// HTTPError preserves structured response metadata for callers
+// that need retry behavior. In particular, HTTP 429 can carry a
+// Retry-After hint that the daemon's publish loop should honor
+// instead of waiting for the next 15-minute refresh tick.
+type HTTPError struct {
+	Method     string
+	URL        string
+	StatusCode int
+	Body       string
+	RetryAfter time.Duration
+}
+
+func (e *HTTPError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Body == "" {
+		return fmt.Sprintf("rendezvous: %s %s: status %d", e.Method, e.URL, e.StatusCode)
+	}
+	return fmt.Sprintf("rendezvous: %s %s: status %d: %s",
+		e.Method, e.URL, e.StatusCode, e.Body)
+}
+
 // Client is the daemon's handle to a Pkarr-style rendezvous
 // service. Construct one per daemon at startup; all methods
 // are safe for concurrent use.
@@ -116,8 +139,13 @@ func (c *Client) Publish(id *crypto.Identity, nodeID uint32, turnEndpoint string
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("rendezvous: PUT %s: status %d: %s",
-			url, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return &HTTPError{
+			Method:     http.MethodPut,
+			URL:        url,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(respBody)),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
+		}
 	}
 	slog.Debug("rendezvous publish ok",
 		"url", url, "node_id", nodeID, "turn_endpoint", turnEndpoint)
@@ -152,8 +180,13 @@ func (c *Client) Lookup(nodeID uint32, expectedPubkey ed25519.PublicKey) (string
 	}
 	if resp.StatusCode/100 != 2 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return "", fmt.Errorf("rendezvous: GET %s: status %d: %s",
-			url, resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return "", &HTTPError{
+			Method:     http.MethodGet,
+			URL:        url,
+			StatusCode: resp.StatusCode,
+			Body:       strings.TrimSpace(string(respBody)),
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), c.now()),
+		}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
@@ -193,4 +226,26 @@ func (c *Client) now() time.Time {
 		return c.Now()
 	}
 	return time.Now()
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := time.ParseDuration(value + "s"); err == nil {
+		if seconds > 0 {
+			return seconds
+		}
+		return 0
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if now.IsZero() {
+			now = time.Now()
+		}
+		if delay := when.Sub(now); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }

@@ -52,6 +52,12 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server, *time.Time) {
 // Returns the response status code and body.
 func putBlob(t *testing.T, base string, blob *rendezvous.AnnounceBlob) (int, string) {
 	t.Helper()
+	code, body, _ := putBlobResponse(t, base, blob)
+	return code, body
+}
+
+func putBlobResponse(t *testing.T, base string, blob *rendezvous.AnnounceBlob) (int, string, http.Header) {
+	t.Helper()
 	body, err := json.Marshal(blob)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -67,7 +73,7 @@ func putBlob(t *testing.T, base string, blob *rendezvous.AnnounceBlob) (int, str
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, string(respBody)
+	return resp.StatusCode, string(respBody), resp.Header.Clone()
 }
 
 // TestServer_HealthEndpoint: trivial liveness probe.
@@ -206,9 +212,12 @@ func TestServer_PUT_RateLimit(t *testing.T) {
 	*clockPtr = clockPtr.Add(30 * time.Second)
 	srv.now = func() time.Time { return *clockPtr }
 	blob2, _ := rendezvous.Sign(id, 7, "1.1.1.1:1112", *clockPtr, 5*time.Minute)
-	code, body := putBlob(t, httpSrv.URL, blob2)
+	code, body, header := putBlobResponse(t, httpSrv.URL, blob2)
 	if code != http.StatusTooManyRequests {
 		t.Fatalf("second PUT in window: status=%d body=%q (want 429)", code, body)
+	}
+	if got := header.Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After=%q, want 30", got)
 	}
 	// Step past the floor; third PUT accepted.
 	*clockPtr = clockPtr.Add(31 * time.Second)

@@ -44,9 +44,12 @@ func (c *fakeDialedConn) Close() error {
 // server here because that would create a test-only import cycle
 // (this test lives in pkg/daemon, the server in cmd/pilot-rendezvous).
 type rendezvousStub struct {
-	mu        sync.Mutex
-	puts      []rendezvous.AnnounceBlob
-	getResult map[uint32]*rendezvous.AnnounceBlob
+	mu             sync.Mutex
+	puts           []rendezvous.AnnounceBlob
+	putAttempts    []rendezvous.AnnounceBlob
+	putStatuses    []int
+	putRetryAfters []string
+	getResult      map[uint32]*rendezvous.AnnounceBlob
 }
 
 func (s *rendezvousStub) handler() http.Handler {
@@ -59,8 +62,28 @@ func (s *rendezvousStub) handler() http.Handler {
 				return
 			}
 			s.mu.Lock()
-			s.puts = append(s.puts, blob)
+			s.putAttempts = append(s.putAttempts, blob)
+			status := http.StatusNoContent
+			if len(s.putStatuses) > 0 {
+				status = s.putStatuses[0]
+				s.putStatuses = s.putStatuses[1:]
+			}
+			retryAfter := ""
+			if len(s.putRetryAfters) > 0 {
+				retryAfter = s.putRetryAfters[0]
+				s.putRetryAfters = s.putRetryAfters[1:]
+			}
+			if status/100 == 2 {
+				s.puts = append(s.puts, blob)
+			}
 			s.mu.Unlock()
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+			if status/100 != 2 {
+				http.Error(w, http.StatusText(status), status)
+				return
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case http.MethodGet:
 			id := parseNodeIDFromPath(r.URL.Path)
@@ -86,6 +109,12 @@ func (s *rendezvousStub) putCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.puts)
+}
+
+func (s *rendezvousStub) putAttemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.putAttempts)
 }
 
 // TestRendezvous_DisabledByEmptyURL: when Config.RendezvousURL
@@ -266,6 +295,61 @@ func TestRendezvous_PublishLoop_LastValueWins(t *testing.T) {
 	final := stub.puts[len(stub.puts)-1]
 	if final.TURNEndpoint != "d:4" {
 		t.Fatalf("final published endpoint: %q, want %q", final.TURNEndpoint, "d:4")
+	}
+}
+
+func TestRendezvous_PublishLoop_Retries429AndKeepsLatest(t *testing.T) {
+	oldBase, oldCap, oldJitter := rendezvousPublishRetryBase, rendezvousPublishRetryCap, rendezvousPublishJitter
+	rendezvousPublishRetryBase = 200 * time.Millisecond
+	rendezvousPublishRetryCap = 200 * time.Millisecond
+	rendezvousPublishJitter = func(time.Duration) time.Duration { return 0 }
+	defer func() {
+		rendezvousPublishRetryBase = oldBase
+		rendezvousPublishRetryCap = oldCap
+		rendezvousPublishJitter = oldJitter
+	}()
+
+	stub := &rendezvousStub{
+		getResult:   map[uint32]*rendezvous.AnnounceBlob{},
+		putStatuses: []int{http.StatusTooManyRequests, http.StatusNoContent},
+	}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, _ := crypto.GenerateIdentity()
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.identity = id
+	d.setNodeIDForTest(7)
+
+	done := make(chan struct{})
+	go func() {
+		d.rendezvousPublishLoop()
+		close(done)
+	}()
+
+	d.rendezvousPublishCh <- "stale:1"
+	waitForCondition(t, 2*time.Second, func() bool {
+		return stub.putAttemptCount() >= 1
+	})
+	d.rendezvousPublishCh <- "fresh:2"
+
+	waitForCondition(t, 2*time.Second, func() bool {
+		return stub.putCount() >= 1
+	})
+	close(d.stopCh)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("rendezvousPublishLoop didn't exit after stopCh close")
+	}
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if len(stub.puts) != 1 {
+		t.Fatalf("accepted PUTs=%d, want 1", len(stub.puts))
+	}
+	if got := stub.puts[0].TURNEndpoint; got != "fresh:2" {
+		t.Fatalf("accepted endpoint=%q, want fresh:2", got)
 	}
 }
 
@@ -603,4 +687,3 @@ func parseNodeIDFromPath(path string) uint32 {
 	}
 	return uint32(n)
 }
-

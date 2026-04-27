@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -286,6 +287,17 @@ const DefaultPeerKeepaliveInterval = 25 * time.Second
 // ValidUntil and lookups return "expired" — defeating the
 // cold-start bootstrap purpose. (v1.9.0-jf.14.2)
 const DefaultRendezvousRefreshInterval = 15 * time.Minute
+
+var (
+	rendezvousPublishRetryBase = 1 * time.Second
+	rendezvousPublishRetryCap  = 1 * time.Minute
+	rendezvousPublishJitter    = func(max time.Duration) time.Duration {
+		if max <= 0 {
+			return 0
+		}
+		return time.Duration(rand.Int63n(int64(max)))
+	}
+)
 
 // EndpointCacheTTL is how long a cached endpoint is considered fresh.
 // After this, the entry is stale but still usable as a fallback.
@@ -4086,46 +4098,135 @@ func (d *Daemon) sendPeerKeepalive(nodeID uint32) {
 // the channel is nil in that case and the goroutine returns
 // immediately.
 //
-// We intentionally don't retry on failure inside the loop: every
-// rotation or restart re-publishes naturally, and the
-// peerKeepaliveLoop (jf.13) handles steady-state. The rendezvous
-// is a cold-start crowbar, not a transport.
+// Failed publishes are retried with capped jittered backoff. The
+// rendezvous server intentionally rate-limits PUTs per NodeID, and
+// a fast TURN rotation burst can otherwise strand peers on a stale
+// record until the next 15-minute refresh tick.
 func (d *Daemon) rendezvousPublishLoop() {
 	if d.rendezvousClient == nil || d.rendezvousPublishCh == nil {
 		return
 	}
+	var (
+		pending      string
+		retryAttempt int
+		retryTimer   *time.Timer
+		retryC       <-chan time.Time
+	)
+	stopRetryTimer := func() {
+		if retryTimer == nil {
+			return
+		}
+		if !retryTimer.Stop() {
+			select {
+			case <-retryTimer.C:
+			default:
+			}
+		}
+		retryTimer = nil
+		retryC = nil
+	}
+	defer stopRetryTimer()
+
 	for {
+		if pending == "" {
+			select {
+			case <-d.stopCh:
+				return
+			case addr := <-d.rendezvousPublishCh:
+				if addr == "" {
+					continue
+				}
+				pending = addr
+				retryAttempt = 0
+			}
+		}
+
+		nodeID, attempted, err := d.publishRendezvousEndpoint(pending)
+		if !attempted {
+			pending = ""
+			retryAttempt = 0
+			continue
+		}
+		if err == nil {
+			slog.Debug("rendezvous publish ok",
+				"url", d.config.RendezvousURL,
+				"node_id", nodeID,
+				"turn_endpoint", pending)
+			pending = ""
+			retryAttempt = 0
+			continue
+		}
+
+		delay := rendezvousPublishRetryDelay(err, retryAttempt)
+		slog.Debug("rendezvous publish failed",
+			"url", d.config.RendezvousURL,
+			"node_id", nodeID,
+			"turn_endpoint", pending,
+			"retry_after", delay,
+			"error", err)
+		retryAttempt++
+
+		stopRetryTimer()
+		retryTimer = time.NewTimer(delay)
+		retryC = retryTimer.C
+
 		select {
 		case <-d.stopCh:
 			return
 		case addr := <-d.rendezvousPublishCh:
-			if addr == "" || d.identity == nil {
+			if addr == "" {
 				continue
 			}
-			d.addrMu.RLock()
-			nodeID := d.nodeID
-			d.addrMu.RUnlock()
-			if nodeID == 0 {
-				// We get a rotation event before the daemon has
-				// registered (and therefore before nodeID is
-				// known). Drop — the next rotation, post-
-				// registration, will publish.
-				continue
-			}
-			if err := d.rendezvousClient.Publish(d.identity, nodeID, addr); err != nil {
-				slog.Debug("rendezvous publish failed",
-					"url", d.config.RendezvousURL,
-					"node_id", nodeID,
-					"turn_endpoint", addr,
-					"error", err)
-			} else {
-				slog.Debug("rendezvous publish ok",
-					"url", d.config.RendezvousURL,
-					"node_id", nodeID,
-					"turn_endpoint", addr)
-			}
+			stopRetryTimer()
+			pending = addr
+			retryAttempt = 0
+		case <-retryC:
+			stopRetryTimer()
 		}
 	}
+}
+
+func (d *Daemon) publishRendezvousEndpoint(addr string) (uint32, bool, error) {
+	if addr == "" || d.identity == nil {
+		return 0, false, nil
+	}
+	d.addrMu.RLock()
+	nodeID := d.nodeID
+	d.addrMu.RUnlock()
+	if nodeID == 0 {
+		// We get a rotation event before the daemon has
+		// registered (and therefore before nodeID is known). Drop
+		// — the next rotation or refresh after registration will
+		// publish.
+		return 0, false, nil
+	}
+	return nodeID, true, d.rendezvousClient.Publish(d.identity, nodeID, addr)
+}
+
+func rendezvousPublishRetryDelay(err error, attempt int) time.Duration {
+	var httpErr *rendezvous.HTTPError
+	if errors.As(err, &httpErr) && httpErr.RetryAfter > 0 {
+		if rendezvousPublishJitter == nil {
+			return httpErr.RetryAfter
+		}
+		return httpErr.RetryAfter + rendezvousPublishJitter(rendezvousPublishRetryBase)
+	}
+	delay := rendezvousPublishRetryBase
+	for i := 0; i < attempt && delay < rendezvousPublishRetryCap; i++ {
+		delay *= 2
+		if delay > rendezvousPublishRetryCap {
+			delay = rendezvousPublishRetryCap
+		}
+	}
+	if rendezvousPublishJitter != nil {
+		if jittered := rendezvousPublishJitter(delay); jittered > 0 {
+			delay = jittered
+		}
+	}
+	if delay < 10*time.Millisecond {
+		delay = 10 * time.Millisecond
+	}
+	return delay
 }
 
 // rendezvousRefreshLoop periodically re-publishes our current

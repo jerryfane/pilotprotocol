@@ -10,6 +10,26 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rendezvous publishes now retry after rate limits instead of waiting for
+  the next 15-minute refresh.** The client preserves HTTP status and
+  `Retry-After`, the server emits `Retry-After` on 429, and the daemon publish
+  loop retries with capped jittered backoff while keeping only the latest TURN
+  endpoint. This prevents a fast TURN rotation burst from leaving peers pinned
+  to a stale rendezvous record.
+- **Relay-marked peers no longer fall back to stale direct UDP when a peer TURN
+  endpoint is available.** Non-local-TURN peers still prefer direct UDP in
+  normal mode, but once a peer is explicitly marked for relay the route plan
+  uses cached TURN/peer TURN instead of returning after a local UDP write to a
+  NAT-dropped address.
+
+### Tests
+
+- Added rendezvous client/server coverage for structured 429 `Retry-After`
+  handling, daemon publish-loop retry/latest-wins behavior, and route-policy
+  coverage for relay-marked peer TURN routing.
+
 ## [v1.9.0-jf.15.19] - 2026-04-27
 
 ### Fixed

@@ -84,6 +84,28 @@ func TestPlanFrameRoutes(t *testing.T) {
 			wantKinds: []routeCandidateKind{routeCandidateDirectUDP},
 		},
 		{
+			name: "relay_marked_no_local_turn_peer_has_turn_skips_direct",
+			in: frameRoutePolicyInput{
+				relay:       true,
+				hasPeerTURN: true,
+				callerAddr:  direct,
+			},
+			wantKinds: []routeCandidateKind{routeCandidatePeerTURN},
+		},
+		{
+			name: "relay_marked_cached_turn_relay_reuses_cached_then_peer_turn",
+			in: frameRoutePolicyInput{
+				relay:         true,
+				hasPeerTURN:   true,
+				cachedConnNet: "turn-relay",
+				callerAddr:    direct,
+			},
+			wantKinds: []routeCandidateKind{
+				routeCandidateCachedConn,
+				routeCandidatePeerTURN,
+			},
+		},
+		{
 			name: "cached_turn_relay_failed_direct_available",
 			in: frameRoutePolicyInput{
 				hasPeerTURN:   true,

@@ -62,17 +62,33 @@ func planFrameRoutes(in frameRoutePolicyInput) frameRoutePlan {
 		return out
 	}
 
-	if in.relay && in.hasBeacon && !in.hasPeerTURN {
-		out.candidates = append(out.candidates, routeCandidate{
-			kind: routeCandidateBeacon,
-			tier: SendTierBeaconRelay,
-		})
-		return out
+	if in.relay {
+		if isTURNNetwork(in.cachedConnNet) {
+			out.candidates = append(out.candidates, routeCandidate{
+				kind: routeCandidateCachedConn,
+				tier: SendTierCachedConn,
+			})
+		}
+		if in.hasPeerTURN {
+			out.candidates = append(out.candidates, routeCandidate{
+				kind: routeCandidatePeerTURN,
+				tier: SendTierJF9Fallback,
+			})
+			return out
+		}
+		if in.hasBeacon {
+			out.candidates = append(out.candidates, routeCandidate{
+				kind: routeCandidateBeacon,
+				tier: SendTierBeaconRelay,
+			})
+			return out
+		}
 	}
 
 	// Non-TURN daemons can get stuck behind a stale peer TURN route even
-	// when a direct address is known. Prefer direct UDP in that mixed mode;
-	// hide-IP peers use outboundTURNOnly/local TURN and do not take this path.
+	// when a direct address is known. Prefer direct UDP in that mixed mode
+	// until the peer is explicitly relay-marked; hide-IP peers use
+	// outboundTURNOnly/local TURN and do not take this path.
 	if !in.hasLocalTURN && in.hasPeerTURN && udpAddr != nil {
 		out.candidates = append(out.candidates, routeCandidate{
 			kind: routeCandidateDirectUDP,

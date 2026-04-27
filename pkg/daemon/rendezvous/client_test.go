@@ -3,6 +3,7 @@ package rendezvous
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -241,6 +242,31 @@ func TestClient_PublishHandles5xx(t *testing.T) {
 	err := c.Publish(id, 1, "1.2.3.4:5")
 	if err == nil {
 		t.Fatalf("Publish accepted 500 response")
+	}
+}
+
+func TestClient_PublishReturnsHTTPErrorWithRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	id := freshIdentity(t)
+	c := New(srv.URL)
+	err := c.Publish(id, 1, "1.2.3.4:5")
+	if err == nil {
+		t.Fatalf("Publish accepted 429 response")
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("Publish error type %T, want *HTTPError", err)
+	}
+	if httpErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want 429", httpErr.StatusCode)
+	}
+	if httpErr.RetryAfter != 7*time.Second {
+		t.Fatalf("RetryAfter=%s, want 7s", httpErr.RetryAfter)
 	}
 }
 

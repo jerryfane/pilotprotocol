@@ -132,7 +132,12 @@ func (s *Server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePUT(w http.ResponseWriter, r *http.Request, nodeID uint32) {
-	if !s.rate.Allow(nodeID, s.now()) {
+	if ok, retryAfter := s.rate.Allow(nodeID, s.now()); !ok {
+		seconds := int((retryAfter + time.Second - time.Nanosecond) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
@@ -285,15 +290,17 @@ func newPutRateLimiter(interval time.Duration) *putRateLimiter {
 }
 
 // Allow returns true if a PUT for nodeID is permitted at `now`,
-// updating the per-NodeID last-allow timestamp on success.
-func (r *putRateLimiter) Allow(nodeID uint32, now time.Time) bool {
+// updating the per-NodeID last-allow timestamp on success. When
+// it returns false, the second return value is the remaining
+// interval callers should expose as Retry-After.
+func (r *putRateLimiter) Allow(nodeID uint32, now time.Time) (bool, time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if last, ok := r.last[nodeID]; ok {
 		if now.Sub(last) < r.interval {
-			return false
+			return false, r.interval - now.Sub(last)
 		}
 	}
 	r.last[nodeID] = now
-	return true
+	return true, 0
 }
