@@ -10,6 +10,16 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+### Changed
+
+- **TURN route selection is now centralized in a policy layer.**
+  `TunnelManager.writeFrame` and `Daemon.DialConnection` now delegate route
+  precedence to a shared policy helper instead of carrying separate
+  TURN/direct/TCP/beacon conditionals inline. The policy locks in
+  `-outbound-turn-only` fail-closed behavior, blocks TCP/beacon fallback in
+  that mode, and prefers direct UDP for non-TURN local peers when a peer TURN
+  route would otherwise poison a known direct path.
+
 ## [v1.9.0-jf.15.11] - 2026-04-27
 
 ### Fixed
