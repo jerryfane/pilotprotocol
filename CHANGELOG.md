@@ -23,12 +23,21 @@ Each entry is intended to be upstream-able as a discrete bug fix.
   normal mode, but once a peer is explicitly marked for relay the route plan
   uses cached TURN/peer TURN instead of returning after a local UDP write to a
   NAT-dropped address.
+- **IPC send failures are now reported as connection-scoped closes instead of
+  generic request errors.** `CmdSend` is fire-and-forget, so stale stream send
+  failures must not emit `CmdError` into the shared request queue where they can
+  be misattributed to an unrelated Entmoot dial. Missing stream IDs now receive
+  `CmdCloseOK`, and send failures abort the stream so the recv pusher delivers
+  the close on the owning connection.
 
 ### Tests
 
 - Added rendezvous client/server coverage for structured 429 `Retry-After`
   handling, daemon publish-loop retry/latest-wins behavior, and route-policy
   coverage for relay-marked peer TURN routing.
+- Added IPC send-failure coverage proving stale stream sends do not emit
+  generic daemon errors and missing stream sends return a connection-scoped
+  close notification.
 
 ## [v1.9.0-jf.15.19] - 2026-04-27
 

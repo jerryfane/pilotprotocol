@@ -422,14 +422,13 @@ func (s *IPCServer) handleSend(conn *ipcConn, payload []byte) {
 	if c == nil {
 		slog.Debug("IPC send on missing connection", "conn_id", connID)
 		s.daemon.traceStreamPacket("ipc.send.missing_connection", 0, 0, 0, "conn_id", connID)
-		s.sendError(conn, fmt.Sprintf("connection %d not found", connID))
+		s.sendCloseOK(conn, connID)
 		return
 	}
 
 	if err := s.daemon.SendData(c, data); err != nil {
 		s.daemon.traceStream("ipc.send.failed", c, "err", err.Error())
 		s.daemon.abortConnection(c)
-		s.sendError(conn, fmt.Sprintf("send: %v", err))
 	}
 }
 
@@ -448,12 +447,7 @@ func (s *IPCServer) handleClose(conn *ipcConn, payload []byte) {
 		s.daemon.traceStreamPacket("ipc.close.missing_connection", 0, 0, 0, "conn_id", connID)
 	}
 
-	resp := make([]byte, 5)
-	resp[0] = CmdCloseOK
-	binary.BigEndian.PutUint32(resp[1:5], connID)
-	if err := conn.ipcWrite(resp); err != nil {
-		slog.Debug("IPC close reply failed", "conn_id", connID, "err", err)
-	}
+	s.sendCloseOK(conn, connID)
 }
 
 func (s *IPCServer) handleSendTo(conn *ipcConn, payload []byte) {
@@ -1073,13 +1067,17 @@ func (s *IPCServer) startRecvPusher(conn *ipcConn, c *Connection) {
 			}
 		}
 		s.daemon.traceStream("ipc.recv.closed", c, "reason", "recv buffer closed")
-		closeMsg := make([]byte, 5)
-		closeMsg[0] = CmdCloseOK
-		binary.BigEndian.PutUint32(closeMsg[1:5], c.ID)
-		if err := conn.ipcWrite(closeMsg); err != nil {
-			slog.Debug("IPC close notify failed", "conn_id", c.ID, "err", err)
-		}
+		s.sendCloseOK(conn, c.ID)
 	}()
+}
+
+func (s *IPCServer) sendCloseOK(conn *ipcConn, connID uint32) {
+	msg := make([]byte, 5)
+	msg[0] = CmdCloseOK
+	binary.BigEndian.PutUint32(msg[1:5], connID)
+	if err := conn.ipcWrite(msg); err != nil {
+		slog.Debug("IPC close notify failed", "conn_id", connID, "err", err)
+	}
 }
 
 func (s *IPCServer) sendError(conn *ipcConn, msg string) {

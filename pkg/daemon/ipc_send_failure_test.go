@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TeoSlayer/pilotprotocol/internal/ipcutil"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
-func TestIPCHandleSendFailureAbortsConn(t *testing.T) {
+func TestIPCHandleSendFailureAbortsConnWithoutGenericError(t *testing.T) {
 	d := New(Config{Email: "test@example.com"})
 	s := &IPCServer{daemon: d}
 
@@ -40,8 +41,40 @@ func TestIPCHandleSendFailureAbortsConn(t *testing.T) {
 	}
 
 	w := ipc.Conn.(*recordingConn)
-	if w.buf.Len() == 0 {
-		t.Fatalf("handleSend did not emit an IPC error reply")
+	if w.buf.Len() != 0 {
+		msg, err := ipcutil.Read(&w.buf)
+		if err != nil {
+			t.Fatalf("read unexpected IPC reply: %v", err)
+		}
+		if len(msg) > 0 && msg[0] == CmdError {
+			t.Fatalf("handleSend emitted generic CmdError for connection-scoped send failure")
+		}
+	}
+}
+
+func TestIPCHandleSendMissingConnectionReturnsConnectionScopedClose(t *testing.T) {
+	d := New(Config{Email: "test@example.com"})
+	s := &IPCServer{daemon: d}
+	ipc := &ipcConn{Conn: &recordingConn{}}
+
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], 12345)
+
+	s.handleSend(ipc, payload[:])
+
+	w := ipc.Conn.(*recordingConn)
+	msg, err := ipcutil.Read(&w.buf)
+	if err != nil {
+		t.Fatalf("read IPC reply: %v", err)
+	}
+	if len(msg) != 5 {
+		t.Fatalf("reply length = %d, want 5", len(msg))
+	}
+	if msg[0] != CmdCloseOK {
+		t.Fatalf("reply command = 0x%02x, want CmdCloseOK", msg[0])
+	}
+	if got := binary.BigEndian.Uint32(msg[1:5]); got != 12345 {
+		t.Fatalf("close conn_id = %d, want 12345", got)
 	}
 }
 
