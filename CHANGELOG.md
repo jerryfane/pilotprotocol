@@ -34,6 +34,10 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 - **CI and local push checks now use the full Go package test suite.** The
   shared test command excludes only the manual dashboard package, and an
   optional repo-managed pre-push hook runs the same suite before local pushes.
+- **Strict TURN-only routing now prefers own-relay semantics before peer TURN.**
+  When `-outbound-turn-only` is set, Pilot keeps cached TURN connections first
+  but tries its own TURN allocation before consulting a peer-advertised TURN
+  endpoint, keeping the route order aligned with the no-IP-leak mental model.
 
 ## [v1.9.0-jf.15.11] - 2026-04-27
 

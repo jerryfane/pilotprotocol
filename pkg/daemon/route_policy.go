@@ -46,17 +46,17 @@ func planFrameRoutes(in frameRoutePolicyInput) frameRoutePlan {
 				tier: SendTierOutboundTurnOnlyCached,
 			})
 		}
-		if in.hasPeerTURN {
-			out.candidates = append(out.candidates, routeCandidate{
-				kind: routeCandidatePeerTURN,
-				tier: SendTierOutboundTurnOnlyJF9,
-			})
-		}
 		if in.hasLocalTURN && udpAddr != nil {
 			out.candidates = append(out.candidates, routeCandidate{
 				kind: routeCandidateOwnTURNRelay,
 				tier: SendTierOutboundTurnOnlyOwnRelay,
 				addr: udpAddr,
+			})
+		}
+		if in.hasPeerTURN {
+			out.candidates = append(out.candidates, routeCandidate{
+				kind: routeCandidatePeerTURN,
+				tier: SendTierOutboundTurnOnlyJF9,
 			})
 		}
 		return out

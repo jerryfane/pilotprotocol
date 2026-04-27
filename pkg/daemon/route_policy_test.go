@@ -31,7 +31,7 @@ func TestPlanFrameRoutes(t *testing.T) {
 		failClosed bool
 	}{
 		{
-			name: "outbound_turn_only_peer_turn_known_uses_cached_then_peer_turn_then_own_relay",
+			name: "outbound_turn_only_peer_turn_known_uses_cached_then_own_relay_then_peer_turn",
 			in: frameRoutePolicyInput{
 				outboundTURNOnly: true,
 				hasLocalTURN:     true,
@@ -41,8 +41,8 @@ func TestPlanFrameRoutes(t *testing.T) {
 			},
 			wantKinds: []routeCandidateKind{
 				routeCandidateCachedConn,
-				routeCandidatePeerTURN,
 				routeCandidateOwnTURNRelay,
+				routeCandidatePeerTURN,
 			},
 			failClosed: true,
 		},
