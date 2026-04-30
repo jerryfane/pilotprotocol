@@ -12,7 +12,7 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
 
-func TestIPCHandleSendFailureAbortsConnWithoutGenericError(t *testing.T) {
+func TestIPCHandleSendFailureReturnsConnectionScopedError(t *testing.T) {
 	d := New(Config{Email: "test@example.com"})
 	s := &IPCServer{daemon: d}
 
@@ -40,19 +40,10 @@ func TestIPCHandleSendFailureAbortsConnWithoutGenericError(t *testing.T) {
 		t.Fatalf("failed send did not close conn %d RecvBuf", conn.ID)
 	}
 
-	w := ipc.Conn.(*recordingConn)
-	if w.buf.Len() != 0 {
-		msg, err := ipcutil.Read(&w.buf)
-		if err != nil {
-			t.Fatalf("read unexpected IPC reply: %v", err)
-		}
-		if len(msg) > 0 && msg[0] == CmdError {
-			t.Fatalf("handleSend emitted generic CmdError for connection-scoped send failure")
-		}
-	}
+	assertSendResult(t, ipc.Conn.(*recordingConn), conn.ID, SendResultConnectionNotEstablished)
 }
 
-func TestIPCHandleSendMissingConnectionReturnsConnectionScopedClose(t *testing.T) {
+func TestIPCHandleSendMissingConnectionReturnsConnectionScopedErrorAndLegacyClose(t *testing.T) {
 	d := New(Config{Email: "test@example.com"})
 	s := &IPCServer{daemon: d}
 	ipc := &ipcConn{Conn: &recordingConn{}}
@@ -63,18 +54,81 @@ func TestIPCHandleSendMissingConnectionReturnsConnectionScopedClose(t *testing.T
 	s.handleSend(ipc, payload[:])
 
 	w := ipc.Conn.(*recordingConn)
+	assertSendResult(t, w, 12345, SendResultConnectionNotFound)
+	assertCloseOK(t, w, 12345)
+}
+
+func TestIPCHandleSendTrackedMissingConnectionReturnsTrackedError(t *testing.T) {
+	d := New(Config{Email: "test@example.com"})
+	s := &IPCServer{daemon: d}
+	ipc := &ipcConn{Conn: &recordingConn{}}
+
+	var payload [12]byte
+	binary.BigEndian.PutUint32(payload[0:4], 12345)
+	binary.BigEndian.PutUint64(payload[4:12], 67890)
+
+	s.handleSendTracked(ipc, payload[:])
+
+	assertTrackedSendResult(t, ipc.Conn.(*recordingConn), 12345, 67890, SendResultConnectionNotFound)
+}
+
+func assertSendResult(t *testing.T, w *recordingConn, wantID uint32, wantCode uint16) {
+	t.Helper()
 	msg, err := ipcutil.Read(&w.buf)
 	if err != nil {
 		t.Fatalf("read IPC reply: %v", err)
 	}
+	if len(msg) < 7 {
+		t.Fatalf("reply length = %d, want at least 7", len(msg))
+	}
+	if msg[0] != CmdSendResult {
+		t.Fatalf("reply command = 0x%02x, want CmdSendResult", msg[0])
+	}
+	if got := binary.BigEndian.Uint32(msg[1:5]); got != wantID {
+		t.Fatalf("send-result conn_id = %d, want %d", got, wantID)
+	}
+	if got := binary.BigEndian.Uint16(msg[5:7]); got != wantCode {
+		t.Fatalf("send-result code = %d, want %d (msg=%q)", got, wantCode, string(msg[7:]))
+	}
+}
+
+func assertTrackedSendResult(t *testing.T, w *recordingConn, wantID uint32, wantSendID uint64, wantCode uint16) {
+	t.Helper()
+	msg, err := ipcutil.Read(&w.buf)
+	if err != nil {
+		t.Fatalf("read IPC reply: %v", err)
+	}
+	if len(msg) < 15 {
+		t.Fatalf("reply length = %d, want at least 15", len(msg))
+	}
+	if msg[0] != CmdSendTrackedResult {
+		t.Fatalf("reply command = 0x%02x, want CmdSendTrackedResult", msg[0])
+	}
+	if got := binary.BigEndian.Uint32(msg[1:5]); got != wantID {
+		t.Fatalf("send-result conn_id = %d, want %d", got, wantID)
+	}
+	if got := binary.BigEndian.Uint64(msg[5:13]); got != wantSendID {
+		t.Fatalf("send-result send_id = %d, want %d", got, wantSendID)
+	}
+	if got := binary.BigEndian.Uint16(msg[13:15]); got != wantCode {
+		t.Fatalf("send-result code = %d, want %d (msg=%q)", got, wantCode, string(msg[15:]))
+	}
+}
+
+func assertCloseOK(t *testing.T, w *recordingConn, wantID uint32) {
+	t.Helper()
+	msg, err := ipcutil.Read(&w.buf)
+	if err != nil {
+		t.Fatalf("read IPC close reply: %v", err)
+	}
 	if len(msg) != 5 {
-		t.Fatalf("reply length = %d, want 5", len(msg))
+		t.Fatalf("close reply length = %d, want 5", len(msg))
 	}
 	if msg[0] != CmdCloseOK {
 		t.Fatalf("reply command = 0x%02x, want CmdCloseOK", msg[0])
 	}
-	if got := binary.BigEndian.Uint32(msg[1:5]); got != 12345 {
-		t.Fatalf("close conn_id = %d, want 12345", got)
+	if got := binary.BigEndian.Uint32(msg[1:5]); got != wantID {
+		t.Fatalf("close conn_id = %d, want %d", got, wantID)
 	}
 }
 

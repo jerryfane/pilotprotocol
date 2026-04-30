@@ -79,6 +79,26 @@ const (
 	CmdUnsubscribe   byte = 0x32
 	CmdUnsubscribeOK byte = 0x33
 	CmdNotify        byte = 0x34
+	// CmdSendResult is a connection-scoped acknowledgement for CmdSend.
+	// Payload: [conn_id:uint32][code:uint16][message:utf8].
+	// It makes local IPC Write success distinct from daemon-level stream
+	// send success, so clients can retry stale streams immediately instead
+	// of discovering drops later as read timeouts.
+	CmdSendResult byte = 0x35
+	// CmdSendTracked is CmdSend with an explicit client-generated send_id.
+	// Payload: [conn_id:uint32][send_id:uint64][data].
+	CmdSendTracked byte = 0x36
+	// CmdSendTrackedResult acknowledges CmdSendTracked.
+	// Payload: [conn_id:uint32][send_id:uint64][code:uint16][message:utf8].
+	CmdSendTrackedResult byte = 0x37
+)
+
+const (
+	SendResultOK uint16 = iota
+	SendResultConnectionNotFound
+	SendResultConnectionNotEstablished
+	SendResultConnectionClosing
+	SendResultFailed
 )
 
 // Network sub-commands (second byte of CmdNetwork payload)
@@ -272,6 +292,8 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 			s.handleDial(conn, payload)
 		case CmdSend:
 			s.handleSend(conn, payload)
+		case CmdSendTracked:
+			s.handleSendTracked(conn, payload)
 		case CmdClose:
 			s.handleClose(conn, payload)
 		case CmdSendTo:
@@ -422,14 +444,56 @@ func (s *IPCServer) handleSend(conn *ipcConn, payload []byte) {
 	if c == nil {
 		slog.Debug("IPC send on missing connection", "conn_id", connID)
 		s.daemon.traceStreamPacket("ipc.send.missing_connection", 0, 0, 0, "conn_id", connID)
+		s.sendSendResult(conn, connID, SendResultConnectionNotFound, fmt.Sprintf("connection %d not found", connID))
 		s.sendCloseOK(conn, connID)
 		return
 	}
 
 	if err := s.daemon.SendData(c, data); err != nil {
 		s.daemon.traceStream("ipc.send.failed", c, "err", err.Error())
+		code := SendResultFailed
+		switch {
+		case err.Error() == "connection not established":
+			code = SendResultConnectionNotEstablished
+		}
+		s.sendSendResult(conn, connID, code, err.Error())
 		s.daemon.abortConnection(c)
+		return
 	}
+	s.daemon.traceStream("ipc.send.result", c, "payload_len", len(data), "code", SendResultOK)
+	s.sendSendResult(conn, connID, SendResultOK, "")
+}
+
+func (s *IPCServer) handleSendTracked(conn *ipcConn, payload []byte) {
+	if len(payload) < 12 {
+		s.sendError(conn, "send_tracked: missing conn_id or send_id")
+		return
+	}
+	connID := binary.BigEndian.Uint32(payload[0:4])
+	sendID := binary.BigEndian.Uint64(payload[4:12])
+	data := payload[12:]
+
+	c := s.daemon.ports.GetConnection(connID)
+	if c == nil {
+		slog.Debug("IPC tracked send on missing connection", "conn_id", connID, "send_id", sendID)
+		s.daemon.traceStreamPacket("ipc.send.missing_connection", 0, 0, 0, "conn_id", connID, "send_id", sendID)
+		s.sendTrackedSendResult(conn, connID, sendID, SendResultConnectionNotFound, fmt.Sprintf("connection %d not found", connID))
+		return
+	}
+
+	if err := s.daemon.SendData(c, data); err != nil {
+		s.daemon.traceStream("ipc.send.failed", c, "send_id", sendID, "err", err.Error())
+		code := SendResultFailed
+		switch {
+		case err.Error() == "connection not established":
+			code = SendResultConnectionNotEstablished
+		}
+		s.sendTrackedSendResult(conn, connID, sendID, code, err.Error())
+		s.daemon.abortConnection(c)
+		return
+	}
+	s.daemon.traceStream("ipc.send.result", c, "send_id", sendID, "payload_len", len(data), "code", SendResultOK)
+	s.sendTrackedSendResult(conn, connID, sendID, SendResultOK, "")
 }
 
 func (s *IPCServer) handleClose(conn *ipcConn, payload []byte) {
@@ -554,6 +618,7 @@ func (s *IPCServer) handleInfo(conn *ipcConn) {
 		// yet (omitempty on the wire shape).
 		"pkts_sent_by_tier":  info.PktsSentByTier,
 		"bytes_sent_by_tier": info.BytesSentByTier,
+		"capabilities":       info.Capabilities,
 	})
 	if err != nil {
 		s.sendError(conn, fmt.Sprintf("info marshal: %v", err))
@@ -1077,6 +1142,29 @@ func (s *IPCServer) sendCloseOK(conn *ipcConn, connID uint32) {
 	binary.BigEndian.PutUint32(msg[1:5], connID)
 	if err := conn.ipcWrite(msg); err != nil {
 		slog.Debug("IPC close notify failed", "conn_id", connID, "err", err)
+	}
+}
+
+func (s *IPCServer) sendSendResult(conn *ipcConn, connID uint32, code uint16, msg string) {
+	resp := make([]byte, 1+4+2+len(msg))
+	resp[0] = CmdSendResult
+	binary.BigEndian.PutUint32(resp[1:5], connID)
+	binary.BigEndian.PutUint16(resp[5:7], code)
+	copy(resp[7:], msg)
+	if err := conn.ipcWrite(resp); err != nil {
+		slog.Debug("IPC send-result reply failed", "conn_id", connID, "code", code, "err", err)
+	}
+}
+
+func (s *IPCServer) sendTrackedSendResult(conn *ipcConn, connID uint32, sendID uint64, code uint16, msg string) {
+	resp := make([]byte, 1+4+8+2+len(msg))
+	resp[0] = CmdSendTrackedResult
+	binary.BigEndian.PutUint32(resp[1:5], connID)
+	binary.BigEndian.PutUint64(resp[5:13], sendID)
+	binary.BigEndian.PutUint16(resp[13:15], code)
+	copy(resp[15:], msg)
+	if err := conn.ipcWrite(resp); err != nil {
+		slog.Debug("IPC tracked send-result reply failed", "conn_id", connID, "send_id", sendID, "code", code, "err", err)
 	}
 }
 

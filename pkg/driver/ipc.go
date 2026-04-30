@@ -58,6 +58,16 @@ const (
 	cmdSetPeerEndpointsOK byte = 0x26
 	cmdUnbind             byte = 0x27
 	cmdUnbindOK           byte = 0x28
+	cmdSendResult         byte = 0x35
+	cmdSendTrackedResult  byte = 0x37
+)
+
+const (
+	sendResultOK uint16 = iota
+	sendResultConnectionNotFound
+	sendResultConnectionNotEstablished
+	sendResultConnectionClosing
+	sendResultFailed
 )
 
 // Network sub-commands (must match daemon SubNetwork* constants)
@@ -90,17 +100,18 @@ type Datagram struct {
 }
 
 type ipcClient struct {
-	conn      net.Conn
-	mu        sync.Mutex
-	handlers  map[byte][]chan []byte // command type → waiting channels
-	recvMu    sync.Mutex
-	recvChs   map[uint32]chan []byte // conn_id → data channel
-	pendRecv  map[uint32][][]byte    // conn_id → buffered data before recvCh registered
-	pendClose map[uint32]struct{}    // conn_id → CloseOK before recvCh registered
-	acceptMu  sync.Mutex
-	acceptChs map[uint16]chan []byte // H12 fix: per-port accept channels
-	dgCh      chan *Datagram         // incoming datagrams
-	doneCh    chan struct{}          // closed when readLoop exits
+	conn            net.Conn
+	mu              sync.Mutex
+	handlers        map[byte][]chan []byte // command type → waiting channels
+	recvMu          sync.Mutex
+	recvChs         map[uint32]chan []byte // conn_id → data channel
+	pendRecv        map[uint32][][]byte    // conn_id → buffered data before recvCh registered
+	pendClose       map[uint32]struct{}    // conn_id → CloseOK before recvCh registered
+	pendingRegister map[uint32]struct{}    // conn_id → DialOK/Accept delivered before recvCh registered
+	acceptMu        sync.Mutex
+	acceptChs       map[uint16]chan []byte // H12 fix: per-port accept channels
+	dgCh            chan *Datagram         // incoming datagrams
+	doneCh          chan struct{}          // closed when readLoop exits
 }
 
 func newIPCClient(socketPath string) (*ipcClient, error) {
@@ -110,14 +121,15 @@ func newIPCClient(socketPath string) (*ipcClient, error) {
 	}
 
 	c := &ipcClient{
-		conn:      conn,
-		handlers:  make(map[byte][]chan []byte),
-		recvChs:   make(map[uint32]chan []byte),
-		pendRecv:  make(map[uint32][][]byte),
-		pendClose: make(map[uint32]struct{}),
-		acceptChs: make(map[uint16]chan []byte),
-		dgCh:      make(chan *Datagram, 256),
-		doneCh:    make(chan struct{}),
+		conn:            conn,
+		handlers:        make(map[byte][]chan []byte),
+		recvChs:         make(map[uint32]chan []byte),
+		pendRecv:        make(map[uint32][][]byte),
+		pendClose:       make(map[uint32]struct{}),
+		pendingRegister: make(map[uint32]struct{}),
+		acceptChs:       make(map[uint16]chan []byte),
+		dgCh:            make(chan *Datagram, 256),
+		doneCh:          make(chan struct{}),
 	}
 
 	go c.readLoop()
@@ -144,32 +156,11 @@ func (c *ipcClient) readLoop() {
 
 		switch cmd {
 		case cmdRecv:
-			if len(payload) >= 4 {
-				connID := binary.BigEndian.Uint32(payload[0:4])
-				data := append([]byte(nil), payload[4:]...)
-				c.recvMu.Lock()
-				ch, ok := c.recvChs[connID]
-				if ok {
-					c.recvMu.Unlock()
-					ch <- data
-				} else {
-					// Buffer data that arrives before recvCh is registered
-					c.pendRecv[connID] = append(c.pendRecv[connID], data)
-					c.recvMu.Unlock()
-				}
-			}
+			c.handleRecvPayload(payload)
 		case cmdCloseOK:
 			if len(payload) >= 4 {
 				connID := binary.BigEndian.Uint32(payload[0:4])
-				c.recvMu.Lock()
-				ch, ok := c.recvChs[connID]
-				if ok {
-					delete(c.recvChs, connID)
-					close(ch)
-				} else {
-					c.pendClose[connID] = struct{}{}
-				}
-				c.recvMu.Unlock()
+				c.closeRecvCh(connID)
 			}
 			// Also dispatch to sendAndWait handlers (for Driver.Disconnect)
 			c.mu.Lock()
@@ -181,6 +172,10 @@ func (c *ipcClient) readLoop() {
 			} else {
 				c.mu.Unlock()
 			}
+		case cmdSendResult:
+			c.handleSendResultPayload(payload)
+		case cmdSendTrackedResult:
+			c.handleTrackedSendResultPayload(payload)
 		case cmdRecvFrom:
 			// Datagram: [6-byte src_addr][2-byte src_port][2-byte dst_port][data]
 			if len(payload) >= protocol.AddrSize+4 {
@@ -202,25 +197,154 @@ func (c *ipcClient) readLoop() {
 				ch, ok := c.acceptChs[port]
 				c.acceptMu.Unlock()
 				if ok {
+					var connID uint32
+					marked := false
+					if len(rest) >= 4 {
+						connID = binary.BigEndian.Uint32(rest[0:4])
+						c.markPendingRegister(connID)
+						marked = true
+					}
 					select {
 					case ch <- rest:
 					default:
+						if marked {
+							c.clearPendingRegister(connID)
+						}
 					}
 				}
 			}
+		case cmdDialOK:
+			delivered := false
+			if len(payload) >= 4 {
+				c.markPendingRegister(binary.BigEndian.Uint32(payload[0:4]))
+			}
+			delivered = c.deliverHandler(cmd, payload)
+			if !delivered && len(payload) >= 4 {
+				c.clearPendingRegister(binary.BigEndian.Uint32(payload[0:4]))
+			}
 		default:
 			// Response to a waiting request
-			c.mu.Lock()
-			if chs, ok := c.handlers[cmd]; ok && len(chs) > 0 {
-				ch := chs[0]
-				c.handlers[cmd] = chs[1:]
-				c.mu.Unlock()
-				ch <- append([]byte(nil), payload...)
-			} else {
-				c.mu.Unlock()
-			}
+			c.deliverHandler(cmd, payload)
 		}
 	}
+}
+
+func (c *ipcClient) deliverHandler(cmd byte, payload []byte) bool {
+	c.mu.Lock()
+	if chs, ok := c.handlers[cmd]; ok && len(chs) > 0 {
+		ch := chs[0]
+		c.handlers[cmd] = chs[1:]
+		c.mu.Unlock()
+		ch <- append([]byte(nil), payload...)
+		return true
+	}
+	c.mu.Unlock()
+	return false
+}
+
+func (c *ipcClient) handleRecvPayload(payload []byte) {
+	if len(payload) < 4 {
+		return
+	}
+	connID := binary.BigEndian.Uint32(payload[0:4])
+	data := append([]byte(nil), payload[4:]...)
+	c.recvMu.Lock()
+	ch, ok := c.recvChs[connID]
+	if ok {
+		c.recvMu.Unlock()
+		ch <- data
+		return
+	}
+	if _, pending := c.pendingRegister[connID]; !pending {
+		c.recvMu.Unlock()
+		return
+	}
+	// Buffer data that arrives before recvCh is registered.
+	c.pendRecv[connID] = append(c.pendRecv[connID], data)
+	c.recvMu.Unlock()
+}
+
+func (c *ipcClient) handleSendResultPayload(payload []byte) {
+	if connID, code, ok := decodeSendResult(payload); ok && code != sendResultOK {
+		c.handleSendResultFailure(connID)
+	}
+}
+
+func (c *ipcClient) handleTrackedSendResultPayload(payload []byte) {
+	if connID, code, ok := decodeTrackedSendResult(payload); ok && code != sendResultOK {
+		c.handleSendResultFailure(connID)
+	}
+}
+
+func decodeSendResult(payload []byte) (uint32, uint16, bool) {
+	if len(payload) < 6 {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint32(payload[0:4]), binary.BigEndian.Uint16(payload[4:6]), true
+}
+
+func decodeTrackedSendResult(payload []byte) (uint32, uint16, bool) {
+	if len(payload) < 14 {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint32(payload[0:4]), binary.BigEndian.Uint16(payload[12:14]), true
+}
+
+func (c *ipcClient) handleSendResultFailure(connID uint32) {
+	c.failRecvCh(connID)
+}
+
+func (c *ipcClient) closeRecvCh(connID uint32) {
+	c.recvMu.Lock()
+	ch, ok := c.recvChs[connID]
+	if ok {
+		delete(c.recvChs, connID)
+		delete(c.pendRecv, connID)
+		delete(c.pendClose, connID)
+		delete(c.pendingRegister, connID)
+		c.recvMu.Unlock()
+		close(ch)
+		return
+	}
+	if _, pending := c.pendingRegister[connID]; !pending {
+		c.recvMu.Unlock()
+		return
+	}
+	c.pendClose[connID] = struct{}{}
+	c.recvMu.Unlock()
+}
+
+func (c *ipcClient) failRecvCh(connID uint32) {
+	c.recvMu.Lock()
+	ch, ok := c.recvChs[connID]
+	if ok {
+		delete(c.recvChs, connID)
+		delete(c.pendRecv, connID)
+		delete(c.pendClose, connID)
+		delete(c.pendingRegister, connID)
+		c.recvMu.Unlock()
+		close(ch)
+		return
+	}
+	delete(c.pendRecv, connID)
+	delete(c.pendClose, connID)
+	delete(c.pendingRegister, connID)
+	c.recvMu.Unlock()
+}
+
+func (c *ipcClient) markPendingRegister(connID uint32) {
+	c.recvMu.Lock()
+	if c.pendingRegister == nil {
+		c.pendingRegister = make(map[uint32]struct{})
+	}
+	c.pendingRegister[connID] = struct{}{}
+	c.recvMu.Unlock()
+}
+
+func (c *ipcClient) clearPendingRegister(connID uint32) {
+	c.recvMu.Lock()
+	delete(c.pendingRegister, connID)
+	c.recvMu.Unlock()
 }
 
 // cleanup closes all pending channels when readLoop exits (daemon disconnect).
@@ -248,6 +372,9 @@ func (c *ipcClient) cleanup() {
 	}
 	for id := range c.pendClose {
 		delete(c.pendClose, id)
+	}
+	for id := range c.pendingRegister {
+		delete(c.pendingRegister, id)
 	}
 	c.recvMu.Unlock()
 
@@ -360,6 +487,7 @@ func (c *ipcClient) unbindPort(port uint16) error {
 func (c *ipcClient) registerRecvCh(connID uint32) chan []byte {
 	ch := make(chan []byte, 256)
 	c.recvMu.Lock()
+	delete(c.pendingRegister, connID)
 	// Drain any data that arrived before registration
 	pending := c.pendRecv[connID]
 	delete(c.pendRecv, connID)
@@ -384,4 +512,5 @@ func (c *ipcClient) unregisterRecvCh(connID uint32) {
 	delete(c.recvChs, connID)
 	delete(c.pendRecv, connID)
 	delete(c.pendClose, connID)
+	delete(c.pendingRegister, connID)
 }

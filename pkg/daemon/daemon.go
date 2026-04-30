@@ -1886,6 +1886,10 @@ type DaemonInfo struct {
 	// cleanly (the maps default to nil → omitted).
 	PktsSentByTier  map[string]uint64 `json:"pkts_sent_by_tier,omitempty"`
 	BytesSentByTier map[string]uint64 `json:"bytes_sent_by_tier,omitempty"`
+
+	// Capabilities advertises daemon IPC/application features that
+	// clients may require before enabling strict behavior.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // Info returns current daemon status.
@@ -1975,6 +1979,14 @@ func (d *Daemon) Info() *DaemonInfo {
 		NoRegistryEndpoint:    d.config.NoRegistryEndpoint,
 		PktsSentByTier:        d.tunnels.SnapshotPktsByTier(),
 		BytesSentByTier:       d.tunnels.SnapshotBytesByTier(),
+		Capabilities:          daemonCapabilities(),
+	}
+}
+
+func daemonCapabilities() []string {
+	return []string{
+		"stream_send_result",
+		"stream_send_result_v2",
 	}
 }
 

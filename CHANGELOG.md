@@ -10,6 +10,18 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.22] - 2026-04-30
+
+### Changed
+
+- **IPC stream sends are now explicitly acknowledged.** Added tracked
+  `CmdSendTracked` / `CmdSendTrackedResult` semantics and the
+  `stream_send_result_v2` daemon capability so clients can distinguish a local
+  IPC write from daemon-level stream send success. Missing, non-established,
+  closing, and failed stream sends now return connection-scoped errors instead
+  of being hidden behind `CloseOK`; the legacy driver also treats non-OK send
+  results as stream closes so reads do not hang.
+
 ## [v1.9.0-jf.15.21] - 2026-04-27
 
 ### Fixed
