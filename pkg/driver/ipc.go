@@ -60,6 +60,10 @@ const (
 	cmdUnbindOK           byte = 0x28
 	cmdSendResult         byte = 0x35
 	cmdSendTrackedResult  byte = 0x37
+	cmdLookupNode         byte = 0x38
+	cmdLookupNodeOK       byte = 0x39
+	cmdSignChallenge      byte = 0x3A
+	cmdSignChallengeOK    byte = 0x3B
 )
 
 const (

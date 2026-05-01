@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"sync"
 
+	pilotcrypto "github.com/TeoSlayer/pilotprotocol/internal/crypto"
 	"github.com/TeoSlayer/pilotprotocol/internal/ipcutil"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
@@ -91,7 +93,21 @@ const (
 	// CmdSendTrackedResult acknowledges CmdSendTracked.
 	// Payload: [conn_id:uint32][send_id:uint64][code:uint16][message:utf8].
 	CmdSendTrackedResult byte = 0x37
+	// CmdLookupNode asks the daemon to resolve a Pilot node identity binding.
+	// Payload: [node_id:uint32]. Reply is JSON with node_id, public_key, and
+	// source ("trusted" or "registry"). This exposes existing bindings to
+	// application layers without changing registry semantics.
+	CmdLookupNode   byte = 0x38
+	CmdLookupNodeOK byte = 0x39
+	// CmdSignChallenge asks the daemon to sign a bounded application challenge
+	// with the local Pilot identity. Payload is the exact bytes to sign; reply
+	// is JSON with node_id, public_key, and signature.
+	CmdSignChallenge   byte = 0x3A
+	CmdSignChallengeOK byte = 0x3B
 )
+
+const maxSignChallengePayload = 4096
+const signChallengeDomain = "pilot.ipc.sign_challenge.v1\x00"
 
 const (
 	SendResultOK uint16 = iota
@@ -328,6 +344,10 @@ func (s *IPCServer) handleClient(conn *ipcConn) {
 			s.handleSubscribe(conn, payload)
 		case CmdUnsubscribe:
 			s.handleUnsubscribe(conn, payload)
+		case CmdLookupNode:
+			s.handleLookupNode(conn, payload)
+		case CmdSignChallenge:
+			s.handleSignChallenge(conn, payload)
 		default:
 			s.sendError(conn, fmt.Sprintf("unknown command: 0x%02X", cmd))
 		}
@@ -679,6 +699,99 @@ func (s *IPCServer) handleResolveHostname(conn *ipcConn, payload []byte) {
 	if err := conn.ipcWrite(resp); err != nil {
 		slog.Debug("IPC resolve_hostname reply failed", "err", err)
 	}
+}
+
+func (s *IPCServer) handleLookupNode(conn *ipcConn, payload []byte) {
+	if len(payload) < 4 {
+		s.sendError(conn, "lookup_node: missing node_id")
+		return
+	}
+	nodeID := binary.BigEndian.Uint32(payload[0:4])
+	if nodeID == 0 {
+		s.sendError(conn, "lookup_node: node_id is required")
+		return
+	}
+
+	for _, t := range s.daemon.handshakes.TrustedPeers() {
+		if t.NodeID == nodeID && t.PublicKey != "" {
+			data, marshalErr := json.Marshal(map[string]interface{}{
+				"node_id":    nodeID,
+				"public_key": t.PublicKey,
+				"source":     "trusted",
+			})
+			if marshalErr != nil {
+				s.sendError(conn, fmt.Sprintf("lookup_node marshal: %v", marshalErr))
+				return
+			}
+			resp := make([]byte, 1+len(data))
+			resp[0] = CmdLookupNodeOK
+			copy(resp[1:], data)
+			if writeErr := conn.ipcWrite(resp); writeErr != nil {
+				slog.Debug("IPC lookup_node reply failed", "err", writeErr)
+			}
+			return
+		}
+	}
+
+	if s.daemon.regConn == nil {
+		s.sendError(conn, "lookup_node: registry unavailable")
+		return
+	}
+	result, err := s.daemon.regConn.Lookup(nodeID)
+	if err == nil {
+		result["source"] = "registry"
+		data, err := json.Marshal(result)
+		if err != nil {
+			s.sendError(conn, fmt.Sprintf("lookup_node marshal: %v", err))
+			return
+		}
+		resp := make([]byte, 1+len(data))
+		resp[0] = CmdLookupNodeOK
+		copy(resp[1:], data)
+		if err := conn.ipcWrite(resp); err != nil {
+			slog.Debug("IPC lookup_node reply failed", "err", err)
+		}
+		return
+	}
+
+	s.sendError(conn, fmt.Sprintf("lookup_node: %v", err))
+}
+
+func (s *IPCServer) handleSignChallenge(conn *ipcConn, payload []byte) {
+	if len(payload) == 0 {
+		s.sendError(conn, "sign_challenge: payload is required")
+		return
+	}
+	if len(payload) > maxSignChallengePayload {
+		s.sendError(conn, fmt.Sprintf("sign_challenge: payload exceeds %d bytes", maxSignChallengePayload))
+		return
+	}
+	if s.daemon.identity == nil {
+		s.sendError(conn, "sign_challenge: identity is unavailable")
+		return
+	}
+	respBody, err := json.Marshal(map[string]interface{}{
+		"node_id":    s.daemon.NodeID(),
+		"public_key": pilotcrypto.EncodePublicKey(s.daemon.identity.PublicKey),
+		"signature":  base64.StdEncoding.EncodeToString(s.daemon.identity.Sign(signChallengePayload(payload))),
+	})
+	if err != nil {
+		s.sendError(conn, fmt.Sprintf("sign_challenge marshal: %v", err))
+		return
+	}
+	resp := make([]byte, 1+len(respBody))
+	resp[0] = CmdSignChallengeOK
+	copy(resp[1:], respBody)
+	if err := conn.ipcWrite(resp); err != nil {
+		slog.Debug("IPC sign_challenge reply failed", "err", err)
+	}
+}
+
+func signChallengePayload(payload []byte) []byte {
+	out := make([]byte, 0, len(signChallengeDomain)+len(payload))
+	out = append(out, signChallengeDomain...)
+	out = append(out, payload...)
+	return out
 }
 
 func (s *IPCServer) handleSetHostname(conn *ipcConn, payload []byte) {

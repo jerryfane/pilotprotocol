@@ -10,6 +10,7 @@ import (
 )
 
 const DefaultSocketPath = "/tmp/pilot.sock"
+const maxSignChallengePayload = 4096
 
 // Handshake sub-commands (must match daemon SubHandshake* constants)
 const (
@@ -231,6 +232,33 @@ func (d *Driver) ResolveHostname(hostname string) (map[string]interface{}, error
 	msg[0] = cmdResolveHostname
 	copy(msg[1:], hostname)
 	return d.jsonRPC(msg, cmdResolveHostnameOK, "resolve_hostname")
+}
+
+// LookupNode resolves a Pilot node identity binding through the daemon.
+// The daemon returns existing trusted state when available, otherwise it
+// falls back to the registry lookup response. The returned map includes at
+// least node_id, public_key, and source.
+func (d *Driver) LookupNode(nodeID uint32) (map[string]interface{}, error) {
+	msg := make([]byte, 5)
+	msg[0] = cmdLookupNode
+	binary.BigEndian.PutUint32(msg[1:5], nodeID)
+	return d.jsonRPC(msg, cmdLookupNodeOK, "lookup_node")
+}
+
+// SignChallenge asks the local daemon to sign an application challenge with
+// the local Pilot identity. The daemon domain-separates the payload before
+// signing and returns node_id, public_key, and signature.
+func (d *Driver) SignChallenge(payload []byte) (map[string]interface{}, error) {
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("sign_challenge: payload is required")
+	}
+	if len(payload) > maxSignChallengePayload {
+		return nil, fmt.Errorf("sign_challenge: payload exceeds %d bytes", maxSignChallengePayload)
+	}
+	msg := make([]byte, 1+len(payload))
+	msg[0] = cmdSignChallenge
+	copy(msg[1:], payload)
+	return d.jsonRPC(msg, cmdSignChallengeOK, "sign_challenge")
 }
 
 // SetHostname sets or clears the daemon's hostname via the registry.

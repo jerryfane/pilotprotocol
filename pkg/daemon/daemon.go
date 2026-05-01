@@ -1985,6 +1985,8 @@ func (d *Daemon) Info() *DaemonInfo {
 
 func daemonCapabilities() []string {
 	return []string{
+		"lookup_node",
+		"sign_challenge",
 		"stream_send_result",
 		"stream_send_result_v2",
 	}
