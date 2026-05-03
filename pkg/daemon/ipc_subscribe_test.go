@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"net"
 	"sync"
 	"testing"
@@ -82,6 +83,38 @@ func decodeSubscribeReply(t *testing.T, frame []byte, wantOp byte) (topic string
 	return topic, payload
 }
 
+func waitFrame(t *testing.T, frames <-chan []byte) []byte {
+	t.Helper()
+	select {
+	case frame := <-frames:
+		return frame
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for IPC frame")
+		return nil
+	}
+}
+
+func assertPendingSnapshot(t *testing.T, payload []byte, wantNodeID uint32) {
+	t.Helper()
+	var out struct {
+		Pending []struct {
+			NodeID        uint32 `json:"node_id"`
+			PublicKey     string `json:"public_key"`
+			Justification string `json:"justification"`
+			ReceivedAt    int64  `json:"received_at"`
+		} `json:"pending"`
+	}
+	if err := json.Unmarshal(payload, &out); err != nil {
+		t.Fatalf("decode pending snapshot: %v", err)
+	}
+	for _, p := range out.Pending {
+		if p.NodeID == wantNodeID {
+			return
+		}
+	}
+	t.Fatalf("pending snapshot missing node %d: %+v", wantNodeID, out.Pending)
+}
+
 // TestSubscribe_RoundTripWithSnapshot validates the basic
 // Subscribe → SubscribeOK roundtrip carries the topic's current
 // snapshot value back to the caller. This is the core "fresh
@@ -124,6 +157,59 @@ func TestSubscribe_RoundTripWithSnapshot(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("client never received SubscribeOK")
 	}
+}
+
+func TestHandshakePendingTopicSnapshotAndNotify(t *testing.T) {
+	d := New(Config{})
+	d.handshakes.pending[45981] = &PendingHandshake{
+		NodeID:        45981,
+		PublicKey:     "pub",
+		Justification: "entmoot onboarding",
+		ReceivedAt:    time.Unix(1234, 0),
+	}
+	s := d.ipc
+
+	srvConn, cliConn := newTestIPCConn(t)
+	defer cliConn.Close()
+	defer srvConn.Close()
+
+	gotFrame := make(chan []byte, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			f, err := ipcutil.Read(cliConn)
+			if err != nil {
+				t.Errorf("client read: %v", err)
+				return
+			}
+			gotFrame <- f
+		}
+	}()
+
+	s.handleSubscribe(srvConn, encodeSubscribeFrame(handshakePendingTopic))
+	frame := waitFrame(t, gotFrame)
+	topic, payload := decodeSubscribeReply(t, frame, CmdSubscribeOK)
+	if topic != handshakePendingTopic {
+		t.Fatalf("topic = %q, want %q", topic, handshakePendingTopic)
+	}
+	assertPendingSnapshot(t, payload, 45981)
+
+	d.handshakes.mu.Lock()
+	d.handshakes.pending[45982] = &PendingHandshake{
+		NodeID:        45982,
+		PublicKey:     "pub2",
+		Justification: "second",
+		ReceivedAt:    time.Unix(1235, 0),
+	}
+	d.handshakes.mu.Unlock()
+	d.handshakes.publishPendingSnapshot()
+
+	frame = waitFrame(t, gotFrame)
+	topic, payload = decodeSubscribeReply(t, frame, CmdNotify)
+	if topic != handshakePendingTopic {
+		t.Fatalf("notify topic = %q, want %q", topic, handshakePendingTopic)
+	}
+	assertPendingSnapshot(t, payload, 45982)
+	d.handshakes.Stop()
 }
 
 // TestSubscribe_NoSnapshotReturnsEmpty: when no snapshot fn is
@@ -254,6 +340,113 @@ func TestPublishTopic_NoSubscribers_NoOp(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatalf("PublishTopic blocked with zero subscribers")
+	}
+}
+
+func TestPublishTopic_BlockedSubscriberIsBoundedAndEvicted(t *testing.T) {
+	s := newSubsTestServer()
+	conn, cli := newTestIPCConn(t)
+	defer cli.Close()
+	defer conn.Close()
+
+	s.subsMu.Lock()
+	s.subs["handshake_pending"] = map[*ipcConn]struct{}{conn: {}}
+	s.subsMu.Unlock()
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		s.PublishTopic("handshake_pending", []byte("snapshot"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("PublishTopic blocked on unread subscriber")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("PublishTopic took %s, want bounded below 1s", elapsed)
+	}
+
+	s.subsMu.RLock()
+	_, ok := s.subs["handshake_pending"]
+	s.subsMu.RUnlock()
+	if ok {
+		t.Fatal("blocked subscriber remained registered after notify write timeout")
+	}
+}
+
+func TestPublishTopic_NotifyTimeoutInterruptsExistingBlockedWriter(t *testing.T) {
+	s := newSubsTestServer()
+	conn, cli := newTestIPCConn(t)
+	defer cli.Close()
+	defer conn.Close()
+
+	s.subsMu.Lock()
+	s.subs["handshake_pending"] = map[*ipcConn]struct{}{conn: {}}
+	s.subsMu.Unlock()
+
+	blockedWriterDone := make(chan error, 1)
+	go func() {
+		blockedWriterDone <- conn.ipcWrite([]byte{CmdInfoOK})
+	}()
+	select {
+	case err := <-blockedWriterDone:
+		t.Fatalf("pre-existing writer returned before notify path: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.PublishTopic("handshake_pending", []byte("snapshot"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("PublishTopic waited indefinitely behind an existing blocked writer")
+	}
+	select {
+	case <-blockedWriterDone:
+	case <-time.After(time.Second):
+		t.Fatal("notify deadline did not interrupt existing blocked writer")
+	}
+
+	s.subsMu.RLock()
+	_, ok := s.subs["handshake_pending"]
+	s.subsMu.RUnlock()
+	if ok {
+		t.Fatal("blocked subscriber remained registered after existing writer timeout")
+	}
+}
+
+func TestHandshakePendingPublishDoesNotBlockHandshakeStop(t *testing.T) {
+	d := New(Config{})
+	conn, cli := newTestIPCConn(t)
+	defer cli.Close()
+	defer conn.Close()
+
+	d.ipc.subsMu.Lock()
+	d.ipc.subs[handshakePendingTopic] = map[*ipcConn]struct{}{conn: {}}
+	d.ipc.subsMu.Unlock()
+	d.handshakes.pending[45981] = &PendingHandshake{
+		NodeID:        45981,
+		PublicKey:     "pub",
+		Justification: "entmoot onboarding",
+		ReceivedAt:    time.Unix(1234, 0),
+	}
+
+	d.handshakes.publishPendingSnapshot()
+
+	done := make(chan struct{})
+	go func() {
+		d.handshakes.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("HandshakeManager.Stop waited for blocked IPC notify")
 	}
 }
 

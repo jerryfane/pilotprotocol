@@ -647,6 +647,7 @@ type NetworkInfo struct {
 // HandshakeRelayMsg is a handshake request stored in the registry's relay inbox.
 type HandshakeRelayMsg struct {
 	FromNodeID    uint32    `json:"from_node_id"`
+	PublicKey     string    `json:"public_key,omitempty"`
 	Justification string    `json:"justification"`
 	Timestamp     time.Time `json:"timestamp"`
 }
@@ -3916,6 +3917,7 @@ func (s *Server) handleRequestHandshake(msg map[string]interface{}) (map[string]
 
 	s.handshakeInbox[toNodeID] = append(s.handshakeInbox[toNodeID], &HandshakeRelayMsg{
 		FromNodeID:    fromNodeID,
+		PublicKey:     base64.StdEncoding.EncodeToString(fromPubKey),
 		Justification: justification,
 		Timestamp:     time.Now(),
 	})
@@ -3958,6 +3960,7 @@ func (s *Server) handlePollHandshakes(msg map[string]interface{}) (map[string]in
 	for i, req := range inbox {
 		requests[i] = map[string]interface{}{
 			"from_node_id":  req.FromNodeID,
+			"public_key":    req.PublicKey,
 			"justification": req.Justification,
 			"timestamp":     req.Timestamp.Unix(),
 		}

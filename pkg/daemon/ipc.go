@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	pilotcrypto "github.com/TeoSlayer/pilotprotocol/internal/crypto"
 	"github.com/TeoSlayer/pilotprotocol/internal/ipcutil"
@@ -108,6 +109,7 @@ const (
 
 const maxSignChallengePayload = 4096
 const signChallengeDomain = "pilot.ipc.sign_challenge.v1\x00"
+const ipcNotifyWriteTimeout = 250 * time.Millisecond
 
 const (
 	SendResultOK uint16 = iota
@@ -151,6 +153,23 @@ type ipcConn struct {
 func (c *ipcConn) ipcWrite(data []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	return ipcutil.Write(c.Conn, data)
+}
+
+func (c *ipcConn) ipcWriteNotify(data []byte, timeout time.Duration) error {
+	if timeout <= 0 {
+		return c.ipcWrite(data)
+	}
+	deadline := time.Now().Add(timeout)
+	if err := c.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	defer c.SetWriteDeadline(time.Time{})
+	if time.Now().After(deadline) {
+		return os.ErrDeadlineExceeded
+	}
 	return ipcutil.Write(c.Conn, data)
 }
 
@@ -1012,20 +1031,7 @@ func (s *IPCServer) handleHandshake(conn *ipcConn, payload []byte) {
 		s.ipcWriteHandshakeOK(conn, data)
 
 	case SubHandshakePending:
-		pending := s.daemon.handshakes.PendingRequests()
-		list := make([]map[string]interface{}, len(pending))
-		for i, p := range pending {
-			list[i] = map[string]interface{}{
-				"node_id":       p.NodeID,
-				"public_key":    p.PublicKey,
-				"justification": p.Justification,
-				"received_at":   p.ReceivedAt.Unix(),
-			}
-		}
-		data, _ := json.Marshal(map[string]interface{}{
-			"pending": list,
-		})
-		s.ipcWriteHandshakeOK(conn, data)
+		s.ipcWriteHandshakeOK(conn, s.daemon.handshakes.pendingSnapshotJSON())
 
 	case SubHandshakeTrusted:
 		trusted := s.daemon.handshakes.TrustedPeers()
@@ -1388,11 +1394,9 @@ func (s *IPCServer) handleUnsubscribe(conn *ipcConn, payload []byte) {
 // PublishTopic sends a CmdNotify frame to every subscriber of topic.
 // payload is opaque bytes; topic-specific encoding is the caller's
 // responsibility (e.g. "turn_endpoint" carries UTF-8 host:port).
-// Safe to call concurrently. Errors writing to a particular
-// subscriber are logged at Debug; the connection's handleClient
-// defer eventually removes it from the subs map via
-// removeSubsForConn, so PublishTopic does not eagerly evict (which
-// would race with concurrent Subscribe/Unsubscribe). (v1.9.0-jf.11b)
+// Safe to call concurrently. Notify writes are bounded and best-effort:
+// a blocked subscriber is removed and closed so a state-change producer
+// cannot hang behind an unread local IPC socket. (v1.9.0-jf.11b)
 func (s *IPCServer) PublishTopic(topic string, payload []byte) {
 	s.subsMu.RLock()
 	set := s.subs[topic]
@@ -1408,9 +1412,11 @@ func (s *IPCServer) PublishTopic(topic string, payload []byte) {
 
 	msg := encodeSubscribeReply(CmdNotify, topic, payload)
 	for _, c := range conns {
-		if err := c.ipcWrite(msg); err != nil {
+		if err := c.ipcWriteNotify(msg, ipcNotifyWriteTimeout); err != nil {
 			slog.Debug("IPC notify delivery failed",
 				"topic", topic, "err", err)
+			s.removeSubsForConn(c)
+			_ = c.Close()
 		}
 	}
 }

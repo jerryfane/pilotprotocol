@@ -59,6 +59,7 @@ func TestDaemonCapabilitiesAdvertiseLookupAndSigning(t *testing.T) {
 	for _, want := range []string{
 		"lookup_node",
 		"sign_challenge",
+		"handshake_pending_notifications",
 		"stream_send_result",
 		"stream_send_result_v2",
 	} {

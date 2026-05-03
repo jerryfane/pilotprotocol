@@ -24,6 +24,8 @@ const (
 	HandshakeRevoke  = "handshake_revoke"
 )
 
+const handshakePendingTopic = "handshake_pending"
+
 // HandshakeMsg is the wire format for handshake protocol messages on port 444.
 type HandshakeMsg struct {
 	Type          string `json:"type"`
@@ -75,6 +77,10 @@ type HandshakeManager struct {
 	reapStop  chan struct{}                // signals replay reaper to stop
 	stopOnce  sync.Once                    // ensures reapStop is closed only once
 
+	pendingNotifyCh   chan struct{}
+	pendingNotifyStop chan struct{}
+	pendingNotifyOnce sync.Once
+
 	// Webhook
 	webhook *WebhookClient
 
@@ -85,11 +91,13 @@ type HandshakeManager struct {
 
 func NewHandshakeManager(d *Daemon) *HandshakeManager {
 	hm := &HandshakeManager{
-		daemon:    d,
-		trusted:   make(map[uint32]*TrustRecord),
-		pending:   make(map[uint32]*PendingHandshake),
-		outgoing:  make(map[uint32]bool),
-		replaySet: make(map[[32]byte]time.Time),
+		daemon:            d,
+		trusted:           make(map[uint32]*TrustRecord),
+		pending:           make(map[uint32]*PendingHandshake),
+		outgoing:          make(map[uint32]bool),
+		replaySet:         make(map[[32]byte]time.Time),
+		pendingNotifyCh:   make(chan struct{}, 1),
+		pendingNotifyStop: make(chan struct{}),
 	}
 
 	// Derive trust store path from identity path if available
@@ -102,6 +110,67 @@ func NewHandshakeManager(d *Daemon) *HandshakeManager {
 	return hm
 }
 
+func (hm *HandshakeManager) pendingSnapshotJSON() []byte {
+	pending := hm.PendingRequests()
+	list := make([]map[string]interface{}, len(pending))
+	for i, p := range pending {
+		list[i] = map[string]interface{}{
+			"node_id":       p.NodeID,
+			"public_key":    p.PublicKey,
+			"justification": p.Justification,
+			"received_at":   p.ReceivedAt.Unix(),
+		}
+	}
+	data, err := json.Marshal(map[string]interface{}{"pending": list})
+	if err != nil {
+		slog.Warn("handshake pending snapshot marshal failed", "err", err)
+		return nil
+	}
+	return data
+}
+
+func (hm *HandshakeManager) publishPendingSnapshot() {
+	if hm == nil || hm.daemon == nil || hm.daemon.ipc == nil || hm.pendingNotifyCh == nil {
+		return
+	}
+	select {
+	case <-hm.pendingNotifyStop:
+		return
+	default:
+	}
+	hm.pendingNotifyOnce.Do(func() {
+		go hm.runPendingSnapshotNotifier()
+	})
+	select {
+	case hm.pendingNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (hm *HandshakeManager) runPendingSnapshotNotifier() {
+	for {
+		select {
+		case <-hm.pendingNotifyStop:
+			return
+		case <-hm.pendingNotifyCh:
+		}
+		for {
+			select {
+			case <-hm.pendingNotifyStop:
+				return
+			case <-hm.pendingNotifyCh:
+				continue
+			default:
+			}
+			break
+		}
+		if hm.daemon == nil || hm.daemon.ipc == nil {
+			continue
+		}
+		hm.daemon.ipc.PublishTopic(handshakePendingTopic, hm.pendingSnapshotJSON())
+	}
+}
+
 // SetWebhook configures the webhook client for event notifications.
 func (hm *HandshakeManager) SetWebhook(wc *WebhookClient) {
 	hm.webhook = wc
@@ -112,6 +181,9 @@ func (hm *HandshakeManager) Stop() {
 	hm.stopOnce.Do(func() {
 		if hm.reapStop != nil {
 			close(hm.reapStop)
+		}
+		if hm.pendingNotifyStop != nil {
+			close(hm.pendingNotifyStop)
 		}
 	})
 	hm.wg.Wait()
@@ -413,6 +485,7 @@ func (hm *HandshakeManager) handleRequest(conn *Connection, msg *HandshakeMsg) {
 		if hm.daemon.regConn != nil {
 			hm.goRPC(func() { hm.daemon.regConn.ReportTrust(hm.daemon.NodeID(), peerNodeID) })
 		}
+		hm.publishPendingSnapshot()
 		return
 	}
 
@@ -434,6 +507,7 @@ func (hm *HandshakeManager) handleRequest(conn *Connection, msg *HandshakeMsg) {
 		if hm.daemon.regConn != nil {
 			hm.goRPC(func() { hm.daemon.regConn.ReportTrust(hm.daemon.NodeID(), peerNodeID) })
 		}
+		hm.publishPendingSnapshot()
 		return
 	}
 
@@ -454,6 +528,7 @@ func (hm *HandshakeManager) handleRequest(conn *Connection, msg *HandshakeMsg) {
 		if hm.daemon.regConn != nil {
 			hm.goRPC(func() { hm.daemon.regConn.ReportTrust(hm.daemon.NodeID(), peerNodeID) })
 		}
+		hm.publishPendingSnapshot()
 		return
 	}
 
@@ -473,6 +548,7 @@ func (hm *HandshakeManager) handleRequest(conn *Connection, msg *HandshakeMsg) {
 	hm.webhook.Emit("handshake.pending", map[string]interface{}{
 		"peer_node_id": peerNodeID, "justification": msg.Justification,
 	})
+	hm.publishPendingSnapshot()
 }
 
 // handleAccept processes a handshake acceptance from a peer.
@@ -553,7 +629,7 @@ func (hm *HandshakeManager) SendRequest(peerNodeID uint32, justification string)
 }
 
 // processRelayedRequest handles a handshake request received via registry relay.
-func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justification string) {
+func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, publicKey, justification string) {
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
 
@@ -574,6 +650,7 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justificati
 		delete(hm.outgoing, fromNodeID)
 		hm.trusted[fromNodeID] = &TrustRecord{
 			NodeID:     fromNodeID,
+			PublicKey:  publicKey,
 			ApprovedAt: time.Now(),
 			Mutual:     true,
 		}
@@ -588,6 +665,7 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justificati
 				hm.backfillPeerKey(peerID)
 			})
 		}
+		hm.publishPendingSnapshot()
 		return
 	}
 
@@ -595,6 +673,7 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justificati
 	if hm.sameNetwork(fromNodeID) {
 		hm.trusted[fromNodeID] = &TrustRecord{
 			NodeID:     fromNodeID,
+			PublicKey:  publicKey,
 			ApprovedAt: time.Now(),
 			Network:    hm.sharedNetwork(fromNodeID),
 		}
@@ -609,6 +688,7 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justificati
 				hm.backfillPeerKey(peerID)
 			})
 		}
+		hm.publishPendingSnapshot()
 		return
 	}
 
@@ -616,6 +696,7 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justificati
 	if hm.daemon.config.TrustAutoApprove {
 		hm.trusted[fromNodeID] = &TrustRecord{
 			NodeID:     fromNodeID,
+			PublicKey:  publicKey,
 			ApprovedAt: time.Now(),
 			Mutual:     false,
 		}
@@ -633,17 +714,20 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, justificati
 				hm.backfillPeerKey(peerID)
 			})
 		}
+		hm.publishPendingSnapshot()
 		return
 	}
 
 	// Store as pending (for manual approval via pilotctl approve)
 	hm.pending[fromNodeID] = &PendingHandshake{
 		NodeID:        fromNodeID,
+		PublicKey:     publicKey,
 		Justification: justification,
 		ReceivedAt:    time.Now(),
 	}
 	hm.saveTrust()
 	slog.Info("relayed handshake request pending approval", "from_node_id", fromNodeID, "justification", justification)
+	hm.publishPendingSnapshot()
 }
 
 // processRelayedApproval handles a handshake approval received via registry relay.
@@ -730,6 +814,7 @@ func (hm *HandshakeManager) ApproveHandshake(peerNodeID uint32) error {
 	hm.webhook.Emit("handshake.approved", map[string]interface{}{
 		"peer_node_id": peerNodeID,
 	})
+	hm.publishPendingSnapshot()
 
 	// Report trust to registry (creates the trust pair for resolve authorization)
 	if hm.daemon.regConn != nil {
@@ -758,6 +843,7 @@ func (hm *HandshakeManager) RejectHandshake(peerNodeID uint32, reason string) er
 	hm.webhook.Emit("handshake.rejected", map[string]interface{}{
 		"peer_node_id": peerNodeID, "reason": reason,
 	})
+	hm.publishPendingSnapshot()
 
 	// Relay rejection via registry so the requester learns about it even behind NAT
 	if hm.daemon.regConn != nil {
@@ -801,6 +887,9 @@ func (hm *HandshakeManager) RevokeTrust(peerNodeID uint32) error {
 	hm.mu.Unlock()
 
 	if !wasTrusted {
+		if wasPending {
+			hm.publishPendingSnapshot()
+		}
 		return fmt.Errorf("node %d was not trusted", peerNodeID)
 	}
 
@@ -808,6 +897,7 @@ func (hm *HandshakeManager) RevokeTrust(peerNodeID uint32) error {
 	hm.webhook.Emit("trust.revoked", map[string]interface{}{
 		"peer_node_id": peerNodeID,
 	})
+	hm.publishPendingSnapshot()
 
 	// Tear down the tunnel to the revoked peer immediately
 	hm.daemon.tunnels.RemovePeer(peerNodeID)
@@ -854,6 +944,9 @@ func (hm *HandshakeManager) handleRevokeMsg(msg *HandshakeMsg) {
 		hm.saveTrust()
 	}
 	hm.mu.Unlock()
+	if wasPending {
+		hm.publishPendingSnapshot()
+	}
 
 	// Tear down the tunnel to the revoked peer immediately
 	hm.daemon.tunnels.RemovePeer(peerNodeID)

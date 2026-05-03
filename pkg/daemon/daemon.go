@@ -489,6 +489,7 @@ func New(cfg Config) *Daemon {
 	}
 	d.ipc = NewIPCServer(cfg.SocketPath, d)
 	d.handshakes = NewHandshakeManager(d)
+	d.ipc.SetTopicSnapshot(handshakePendingTopic, d.handshakes.pendingSnapshotJSON)
 	if cfg.RendezvousURL != "" {
 		d.rendezvousClient = rendezvous.New(cfg.RendezvousURL)
 		d.rendezvousPublishCh = make(chan string, 1)
@@ -1987,6 +1988,7 @@ func daemonCapabilities() []string {
 	return []string{
 		"lookup_node",
 		"sign_challenge",
+		"handshake_pending_notifications",
 		"stream_send_result",
 		"stream_send_result_v2",
 	}
@@ -3649,12 +3651,13 @@ func (d *Daemon) pollRelayedHandshakes() {
 			continue
 		}
 		fromNodeID := uint32(fromIDVal)
+		publicKey, _ := req["public_key"].(string)
 		justification, _ := req["justification"].(string)
 
 		slog.Info("relayed handshake request received", "from_node_id", fromNodeID, "justification", justification)
 
 		// Process through the handshake manager as if it were a direct request
-		d.handshakes.processRelayedRequest(fromNodeID, justification)
+		d.handshakes.processRelayedRequest(fromNodeID, publicKey, justification)
 	}
 
 	// Process handshake responses (approvals/rejections relayed back to us)
