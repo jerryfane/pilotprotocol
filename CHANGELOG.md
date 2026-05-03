@@ -10,6 +10,25 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.24] - 2026-05-03
+
+### Added
+
+- **Reliable pending-handshake notifications.** IPC clients can subscribe to
+  pending-handshake changes without polling, and the daemon publishes bounded,
+  ordered snapshots when requests arrive or are cleared. This lets Entmoot
+  approve group-member onboarding handshakes promptly without scanning all
+  pending requests on every loop.
+
+## [v1.9.0-jf.15.23] - 2026-05-03
+
+### Added
+
+- **Pilot identity lookup IPC.** Drivers can query a node's trusted or
+  registry identity binding and request domain-separated Pilot challenge
+  signatures, enabling Entmoot open-invite redemption to prove Pilot key
+  possession before roster mutation.
+
 ## [v1.9.0-jf.15.22] - 2026-04-30
 
 ### Changed
