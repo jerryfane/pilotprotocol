@@ -52,12 +52,13 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
-# Docs — only track .tex, .pdf, SPEC.md, SKILLS.md, media/, ietf/, and research/
+# Docs — only track .tex, .pdf, SPEC.md, SKILLS.md, curated reports, media/, ietf/, and research/
 docs/*
 !docs/*.tex
 !docs/*.pdf
 !docs/SPEC.md
 !docs/SKILLS.md
+!docs/upstream-integration-assessment.md
 !docs/media/
 !docs/research/
 !docs/ietf/
