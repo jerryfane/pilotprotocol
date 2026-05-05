@@ -636,16 +636,36 @@ func (d *Daemon) Start() error {
 		}
 	}
 
-	// 1. Discover our public endpoint via beacon using a temporary UDP socket.
-	// If -endpoint is set, skip STUN and use the fixed address (for cloud VMs).
+	// 1. Select our advertised endpoint. If -endpoint is set, skip
+	// discovery and use the fixed address. Otherwise, wait until the
+	// real tunnel socket is bound below, then discover through that same
+	// socket so -listen :0 cannot register a throwaway temp port.
 	var registrationAddr string
 	if d.config.Endpoint != "" {
 		registrationAddr = d.config.Endpoint
 		slog.Info("using fixed endpoint", "endpoint", registrationAddr)
-	} else {
-		registrationAddr = resolveLocalAddr(d.config.ListenAddr)
+	}
+
+	// 2. Enable tunnel encryption if configured
+	if d.config.Encrypt {
+		if err := d.tunnels.EnableEncryption(); err != nil {
+			return fmt.Errorf("tunnel encryption: %w", err)
+		}
+	}
+
+	// 3. Bind the UDP listener for tunnel traffic. The read loop starts
+	// after endpoint discovery so DiscoverEndpoint has sole ownership of
+	// the socket reads while it waits for the beacon reply.
+	if err := d.tunnels.ListenPaused(d.config.ListenAddr); err != nil {
+		return fmt.Errorf("tunnel listen: %w", err)
+	}
+	actualAddr := d.tunnels.LocalAddr().String()
+	slog.Info("tunnel listening", "addr", actualAddr)
+
+	if registrationAddr == "" {
+		registrationAddr = resolveLocalAddr(actualAddr)
 		if d.config.BeaconAddr != "" {
-			pubAddr, err := discoverWithTempSocket(d.config.BeaconAddr, d.config.ListenAddr)
+			pubAddr, err := discoverWithTunnelSocket(d.tunnels, d.config.BeaconAddr)
 			if err != nil {
 				slog.Warn("beacon discover failed, using local addr", "error", err)
 			} else if isPrivateAddr(pubAddr) {
@@ -657,19 +677,9 @@ func (d *Daemon) Start() error {
 		}
 	}
 
-	// 2. Enable tunnel encryption if configured
-	if d.config.Encrypt {
-		if err := d.tunnels.EnableEncryption(); err != nil {
-			return fmt.Errorf("tunnel encryption: %w", err)
-		}
+	if err := d.tunnels.StartUDPReadLoop(); err != nil {
+		return fmt.Errorf("tunnel read loop: %w", err)
 	}
-
-	// 3. Start UDP listener for tunnel traffic
-	if err := d.tunnels.Listen(d.config.ListenAddr); err != nil {
-		return fmt.Errorf("tunnel listen: %w", err)
-	}
-	actualAddr := d.tunnels.LocalAddr().String()
-	slog.Info("tunnel listening", "addr", actualAddr)
 
 	// 3b. Optional TCP listener for UDP-hostile peers. Starts alongside
 	// UDP; both feed the same dispatchLoop. Nothing pre-routes to TCP
@@ -735,6 +745,7 @@ func (d *Daemon) Start() error {
 	// writeFrame sees it on every subsequent outbound frame.
 	d.tunnels.SetOutboundTURNOnly(d.config.OutboundTURNOnly)
 	d.tunnels.SetOutboundTURNOnlyResolver(d.resolveOutboundTURNOnlyDestination)
+	d.tunnels.SetPeerTURNResolver(d.resolvePeerTURNEndpoint)
 	if d.config.OutboundTURNOnly {
 		slog.Info("outbound-turn-only enabled: all outbound tunnel " +
 			"traffic routes through local TURN allocation")
@@ -753,10 +764,9 @@ func (d *Daemon) Start() error {
 	}
 	d.lanAddrs = collectLANAddrs(actualPort)
 
-	// If STUN discovered a public endpoint, keep it. The temp socket and
-	// tunnel socket bind the same local port, so endpoint-independent NAT
-	// (like Cloud NAT) maps them to the same external IP:port.
-	// Only fall back to the local address if STUN didn't run or failed.
+	// If discovery found a public endpoint through the live tunnel
+	// socket, keep it. Only fall back to the local address if discovery
+	// didn't run or failed.
 	stunHost, _, splitErr := net.SplitHostPort(registrationAddr)
 	isLocalAddr := splitErr != nil || stunHost == "" || stunHost == "127.0.0.1" || stunHost == "::1" || stunHost == "0.0.0.0" || stunHost == "::"
 	if isLocalAddr {
@@ -1149,21 +1159,16 @@ func (d *Daemon) buildSelfGossipRecord() *gossip.GossipRecord {
 	return rec
 }
 
-// discoverWithTempSocket does STUN discovery on a temporary UDP socket
-// bound to the same port, then closes it so the tunnel can bind.
-func discoverWithTempSocket(beaconAddr, listenAddr string) (string, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", listenAddr)
-	if err != nil {
-		return "", err
+// discoverWithTunnelSocket does endpoint discovery through the live
+// tunnel socket. This is required for -listen :0: a temporary socket
+// would bind a different ephemeral port and register an unreachable
+// endpoint.
+func discoverWithTunnelSocket(tm *TunnelManager, beaconAddr string) (string, error) {
+	conn := tm.udp.Conn()
+	if conn == nil {
+		return "", fmt.Errorf("tunnel UDP socket is not listening")
 	}
-
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return "", fmt.Errorf("temp listen: %w", err)
-	}
-	defer conn.Close()
-
-	pub, err := DiscoverEndpoint(beaconAddr, 0, conn)
+	pub, err := discoverEndpoint(beaconAddr, 0, conn, tm.queueStartupInboundDatagram)
 	if err != nil {
 		return "", err
 	}
@@ -2322,8 +2327,10 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	if nodeID == d.NodeID() {
 		return protocol.ErrDialToSelf
 	}
-	if d.tunnels.HasPeer(nodeID) &&
-		(!d.config.OutboundTURNOnly || d.tunnels.HasOutboundTURNOnlyDestination(nodeID)) {
+	if d.config.OutboundTURNOnly {
+		return d.ensureOutboundTURNOnlyDestination(nodeID)
+	}
+	if d.tunnels.HasPeer(nodeID) {
 		return nil
 	}
 
@@ -2430,12 +2437,22 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	return nil
 }
 
+func (d *Daemon) ensureOutboundTURNOnlyDestination(nodeID uint32) error {
+	err := d.resolveOutboundTURNOnlyDestination(nodeID)
+	if err == nil {
+		return nil
+	}
+	if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
+		slog.Debug("outbound-turn-only resolve failed, keeping existing TURN-safe destination",
+			"node_id", nodeID, "error", err)
+		return nil
+	}
+	return err
+}
+
 func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
 	if nodeID == d.NodeID() {
 		return protocol.ErrDialToSelf
-	}
-	if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
-		return nil
 	}
 
 	resp, cached := d.cachedResolve(nodeID)
@@ -2478,6 +2495,18 @@ func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
 		}
 	}
 
+	realAddr, ok := resp["real_addr"].(string)
+	if ok && realAddr != "" {
+		udpAddr, err := resolveOutboundTURNOnlyUDPAddr(realAddr)
+		if err != nil {
+			return err
+		}
+		d.tunnels.ClearPeerTURNEndpoint(nodeID)
+		d.installResolvedOutboundTURNOnlyUDPDestination(nodeID, realAddr, udpAddr)
+		d.populateGossipViewFromResolve(nodeID, resp, realAddr, endpoints)
+		return nil
+	}
+
 	if installed, addr, err := d.installRegistryPinnedRendezvousTURNEndpoint(nodeID, resp, rendezvousKeyAllowLiveLookup); err != nil {
 		slog.Debug("outbound-turn-only resolve: pinned rendezvous install failed",
 			"node_id", nodeID, "error", err)
@@ -2487,28 +2516,43 @@ func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
 		return nil
 	}
 
-	realAddr, ok := resp["real_addr"].(string)
-	if !ok || realAddr == "" {
-		if ep, cached := d.cachedEndpoint(nodeID); cached {
-			return d.installOutboundTURNOnlyUDPDestination(nodeID, ep)
-		}
-		return fmt.Errorf("node %d has no peer UDP destination", nodeID)
+	if ep, cached := d.cachedEndpoint(nodeID); cached {
+		return d.installOutboundTURNOnlyUDPDestination(nodeID, ep)
 	}
-	if err := d.installOutboundTURNOnlyUDPDestination(nodeID, realAddr); err != nil {
-		return err
-	}
-	d.populateGossipViewFromResolve(nodeID, resp, realAddr, endpoints)
-	return nil
+	return fmt.Errorf("node %d has no peer UDP destination", nodeID)
 }
 
 func (d *Daemon) installOutboundTURNOnlyUDPDestination(nodeID uint32, addr string) error {
+	udpAddr, err := resolveOutboundTURNOnlyUDPAddr(addr)
+	if err != nil {
+		return err
+	}
+	d.installResolvedOutboundTURNOnlyUDPDestination(nodeID, addr, udpAddr)
+	return nil
+}
+
+func resolveOutboundTURNOnlyUDPAddr(addr string) (*net.UDPAddr, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
-		return fmt.Errorf("resolve %s: %w", addr, err)
+		return nil, fmt.Errorf("resolve %s: %w", addr, err)
 	}
+	return udpAddr, nil
+}
+
+func (d *Daemon) installResolvedOutboundTURNOnlyUDPDestination(nodeID uint32, addr string, udpAddr *net.UDPAddr) {
 	d.cacheEndpoint(nodeID, addr)
 	d.tunnels.InstallPeerUDPDestination(nodeID, udpAddr)
-	return nil
+}
+
+func (d *Daemon) resolvePeerTURNEndpoint(nodeID uint32) (string, error) {
+	addr, err := d.lookupRegistryPinnedRendezvousTURNEndpoint(nodeID, nil, rendezvousKeyAllowLiveLookup)
+	if err != nil {
+		return "", err
+	}
+	if addr == "" {
+		return "", fmt.Errorf("rendezvous: no turn endpoint for node %d", nodeID)
+	}
+	return addr, nil
 }
 
 // populateGossipViewFromResolve best-effort-mirrors a registry resolve
@@ -3310,23 +3354,24 @@ func (d *Daemon) rendezvousPeerRefreshLoop() {
 // of advertising a registry endpoint. The rendezvous blob must be signed
 // by the registry-bound key before the endpoint is installed.
 func (d *Daemon) installRendezvousTURNEndpoint(nodeID uint32, expectedPubkey ed25519.PublicKey) (bool, string, error) {
-	if d.rendezvousClient == nil {
-		return false, "", nil
-	}
-	if len(expectedPubkey) != ed25519.PublicKeySize {
-		return false, "", fmt.Errorf("rendezvous: registry public key required for node %d", nodeID)
-	}
-	fresh, err := d.rendezvousClient.Lookup(nodeID, expectedPubkey)
-	if err != nil {
-		return false, "", err
-	}
-	if fresh == "" {
-		return false, "", nil
+	fresh, err := d.lookupRendezvousTURNEndpoint(nodeID, expectedPubkey)
+	if err != nil || fresh == "" {
+		return false, fresh, err
 	}
 	if err := d.tunnels.AddPeerTURNEndpoint(nodeID, fresh); err != nil {
 		return false, fresh, err
 	}
 	return true, fresh, nil
+}
+
+func (d *Daemon) lookupRendezvousTURNEndpoint(nodeID uint32, expectedPubkey ed25519.PublicKey) (string, error) {
+	if d.rendezvousClient == nil {
+		return "", nil
+	}
+	if len(expectedPubkey) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("rendezvous: registry public key required for node %d", nodeID)
+	}
+	return d.rendezvousClient.Lookup(nodeID, expectedPubkey)
 }
 
 type rendezvousKeyLookupMode uint8
@@ -3342,18 +3387,29 @@ type rendezvousKeyCandidate struct {
 }
 
 func (d *Daemon) installRegistryPinnedRendezvousTURNEndpoint(nodeID uint32, resp map[string]interface{}, mode rendezvousKeyLookupMode) (bool, string, error) {
+	addr, err := d.lookupRegistryPinnedRendezvousTURNEndpoint(nodeID, resp, mode)
+	if err != nil || addr == "" {
+		return false, addr, err
+	}
+	if err := d.tunnels.AddPeerTURNEndpoint(nodeID, addr); err != nil {
+		return false, addr, err
+	}
+	return true, addr, nil
+}
+
+func (d *Daemon) lookupRegistryPinnedRendezvousTURNEndpoint(nodeID uint32, resp map[string]interface{}, mode rendezvousKeyLookupMode) (string, error) {
 	if d.rendezvousClient == nil {
-		return false, "", nil
+		return "", nil
 	}
 	if mode == rendezvousKeyCachedOnly {
 		candidates, err := d.cachedRendezvousKeyCandidates(nodeID, true)
 		if err != nil {
-			return false, "", err
+			return "", err
 		}
 		if len(candidates) == 0 {
-			return false, "", fmt.Errorf("rendezvous: cached registry public key unavailable for node %d", nodeID)
+			return "", fmt.Errorf("rendezvous: cached registry public key unavailable for node %d", nodeID)
 		}
-		return d.installRendezvousTURNEndpointFromCandidates(nodeID, candidates)
+		return d.lookupRendezvousTURNEndpointFromCandidates(nodeID, candidates)
 	}
 
 	var tried []rendezvousKeyCandidate
@@ -3361,13 +3417,13 @@ func (d *Daemon) installRegistryPinnedRendezvousTURNEndpoint(nodeID uint32, resp
 
 	primary, err := d.primaryRendezvousKeyCandidates(nodeID, resp)
 	if err != nil {
-		return false, "", err
+		return "", err
 	}
 	if len(primary) > 0 {
 		tried = appendNewRendezvousKeyCandidates(tried, primary)
-		installed, addr, installErr := d.installRendezvousTURNEndpointFromCandidates(nodeID, primary)
+		addr, installErr := d.lookupRendezvousTURNEndpointFromCandidates(nodeID, primary)
 		if installErr == nil {
-			return installed, addr, nil
+			return addr, nil
 		}
 		errs = append(errs, installErr)
 	}
@@ -3378,9 +3434,9 @@ func (d *Daemon) installRegistryPinnedRendezvousTURNEndpoint(nodeID uint32, resp
 		live = newRendezvousKeyCandidates(tried, live)
 		tried = appendNewRendezvousKeyCandidates(tried, live)
 		if len(live) > 0 {
-			installed, addr, installErr := d.installRendezvousTURNEndpointFromCandidates(nodeID, live)
+			addr, installErr := d.lookupRendezvousTURNEndpointFromCandidates(nodeID, live)
 			if installErr == nil {
-				return installed, addr, nil
+				return addr, nil
 			}
 			errs = append(errs, installErr)
 		}
@@ -3394,37 +3450,48 @@ func (d *Daemon) installRegistryPinnedRendezvousTURNEndpoint(nodeID uint32, resp
 	} else {
 		fallback = newRendezvousKeyCandidates(tried, fallback)
 		if len(fallback) > 0 {
-			installed, addr, installErr := d.installRendezvousTURNEndpointFromCandidates(nodeID, fallback)
+			addr, installErr := d.lookupRendezvousTURNEndpointFromCandidates(nodeID, fallback)
 			if installErr == nil {
-				return installed, addr, nil
+				return addr, nil
 			}
 			errs = append(errs, installErr)
 		}
 	}
 
 	if len(errs) > 0 {
-		return false, "", errors.Join(errs...)
+		return "", errors.Join(errs...)
 	}
-	return false, "", fmt.Errorf("rendezvous: registry public key unavailable for node %d", nodeID)
+	return "", fmt.Errorf("rendezvous: registry public key unavailable for node %d", nodeID)
 }
 
 func (d *Daemon) installRendezvousTURNEndpointFromCandidates(nodeID uint32, candidates []rendezvousKeyCandidate) (bool, string, error) {
+	addr, err := d.lookupRendezvousTURNEndpointFromCandidates(nodeID, candidates)
+	if err != nil || addr == "" {
+		return false, addr, err
+	}
+	if err := d.tunnels.AddPeerTURNEndpoint(nodeID, addr); err != nil {
+		return false, addr, err
+	}
+	return true, addr, nil
+}
+
+func (d *Daemon) lookupRendezvousTURNEndpointFromCandidates(nodeID uint32, candidates []rendezvousKeyCandidate) (string, error) {
 	var errs []error
 	for _, candidate := range candidates {
-		installed, addr, err := d.installRendezvousTURNEndpoint(nodeID, candidate.key)
+		addr, err := d.lookupRendezvousTURNEndpoint(nodeID, candidate.key)
 		if err == nil {
-			if installed {
-				slog.Debug("rendezvous installed peer turn endpoint",
+			if addr != "" {
+				slog.Debug("rendezvous found peer turn endpoint",
 					"node_id", nodeID, "addr", addr, "key_source", candidate.source)
 			}
-			return installed, addr, nil
+			return addr, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", candidate.source, err))
 	}
 	if len(errs) == 0 {
-		return false, "", nil
+		return "", nil
 	}
-	return false, "", errors.Join(errs...)
+	return "", errors.Join(errs...)
 }
 
 func (d *Daemon) primaryRendezvousKeyCandidates(nodeID uint32, resp map[string]interface{}) ([]rendezvousKeyCandidate, error) {

@@ -1,7 +1,9 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -10,6 +12,187 @@ import (
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 	"github.com/TeoSlayer/pilotprotocol/pkg/protocol"
 )
+
+func TestDiscoverEndpointQueuesFullSizeStrayDatagramBeforeReply(t *testing.T) {
+	client := listenLocalUDP(t)
+	defer client.Close()
+	beacon := listenLocalUDP(t)
+	defer beacon.Close()
+	stray := listenLocalUDP(t)
+	defer stray.Close()
+
+	wantFrame := make([]byte, 2048)
+	wantFrame[0] = protocol.BeaconMsgRelayDeliver
+	for i := 1; i < len(wantFrame); i++ {
+		wantFrame[i] = byte(i)
+	}
+
+	ignored := make(chan []byte, 1)
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, remote, err := beacon.ReadFromUDP(buf)
+		if err != nil {
+			done <- err
+			return
+		}
+		if _, err := stray.WriteToUDP(wantFrame, client.LocalAddr().(*net.UDPAddr)); err != nil {
+			done <- err
+			return
+		}
+		if _, err := beacon.WriteToUDP(discoverReply(net.IPv4(203, 0, 113, 98), 45677), remote); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	got, err := discoverEndpointResolved(beacon.LocalAddr().(*net.UDPAddr), 0, client, func(frame []byte, from *net.UDPAddr) {
+		ignored <- frame
+	})
+	if err != nil {
+		t.Fatalf("discoverEndpointResolved: %v", err)
+	}
+	if got.String() != "203.0.113.98:45677" {
+		t.Fatalf("discover endpoint = %v, want 203.0.113.98:45677", got)
+	}
+	select {
+	case gotFrame := <-ignored:
+		if !bytes.Equal(gotFrame, wantFrame) {
+			t.Fatalf("queued frame length/content mismatch: got len %d want len %d", len(gotFrame), len(wantFrame))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("large stray datagram was not queued")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("beacon goroutine: %v", err)
+	}
+}
+
+func TestDiscoverEndpointIgnoresStrayDatagramBeforeReply(t *testing.T) {
+	client := listenLocalUDP(t)
+	defer client.Close()
+	beacon := listenLocalUDP(t)
+	defer beacon.Close()
+	stray := listenLocalUDP(t)
+	defer stray.Close()
+
+	ignored := make(chan []byte, 1)
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, remote, err := beacon.ReadFromUDP(buf)
+		if err != nil {
+			done <- err
+			return
+		}
+		if _, err := stray.WriteToUDP([]byte{protocol.BeaconMsgRelayDeliver, 1, 2, 3, 4}, client.LocalAddr().(*net.UDPAddr)); err != nil {
+			done <- err
+			return
+		}
+		if _, err := beacon.WriteToUDP(discoverReply(net.IPv4(203, 0, 113, 99), 45678), remote); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	got, err := discoverEndpointResolved(beacon.LocalAddr().(*net.UDPAddr), 0, client, func(frame []byte, from *net.UDPAddr) {
+		ignored <- frame
+	})
+	if err != nil {
+		t.Fatalf("discoverEndpointResolved: %v", err)
+	}
+	if got.String() != "203.0.113.99:45678" {
+		t.Fatalf("discover endpoint = %v, want 203.0.113.99:45678", got)
+	}
+	select {
+	case frame := <-ignored:
+		if frame[0] != protocol.BeaconMsgRelayDeliver {
+			t.Fatalf("queued frame type = 0x%02x, want relay deliver", frame[0])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stray datagram was not queued")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("beacon goroutine: %v", err)
+	}
+}
+
+func TestDiscoverEndpointIgnoresMalformedBeaconReply(t *testing.T) {
+	client := listenLocalUDP(t)
+	defer client.Close()
+	beacon := listenLocalUDP(t)
+	defer beacon.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, remote, err := beacon.ReadFromUDP(buf)
+		if err != nil {
+			done <- err
+			return
+		}
+		if _, err := beacon.WriteToUDP([]byte{protocol.BeaconMsgDiscoverReply, 99, 1, 2}, remote); err != nil {
+			done <- err
+			return
+		}
+		if _, err := beacon.WriteToUDP(discoverReply(net.IPv4(203, 0, 113, 100), 45679), remote); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	queued := false
+	got, err := discoverEndpointResolved(beacon.LocalAddr().(*net.UDPAddr), 0, client, func(frame []byte, from *net.UDPAddr) {
+		queued = true
+	})
+	if err != nil {
+		t.Fatalf("discoverEndpointResolved: %v", err)
+	}
+	if got.String() != "203.0.113.100:45679" {
+		t.Fatalf("discover endpoint = %v, want 203.0.113.100:45679", got)
+	}
+	if queued {
+		t.Fatalf("malformed discover reply should not be requeued as startup traffic")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("beacon goroutine: %v", err)
+	}
+}
+
+func listenLocalUDP(t *testing.T) *net.UDPConn {
+	t.Helper()
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ResolveUDPAddr: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	return conn
+}
+
+func discoverReply(ip net.IP, port uint16) []byte {
+	ip4 := ip.To4()
+	if ip4 != nil {
+		out := make([]byte, 1+1+4+2)
+		out[0] = protocol.BeaconMsgDiscoverReply
+		out[1] = 4
+		copy(out[2:6], ip4)
+		binary.BigEndian.PutUint16(out[6:8], port)
+		return out
+	}
+	ip16 := ip.To16()
+	out := make([]byte, 1+1+16+2)
+	out[0] = protocol.BeaconMsgDiscoverReply
+	out[1] = 16
+	copy(out[2:18], ip16)
+	binary.BigEndian.PutUint16(out[18:20], port)
+	return out
+}
 
 // The tests below lock down the v1.9.0-jf.4 reply-on-ingress routing
 // invariants. They operate directly on a TunnelManager without
@@ -36,6 +219,45 @@ func TestPeerPath_SetRelayPeerFlipsViaRelay(t *testing.T) {
 	tm.SetRelayPeer(peer, false)
 	if tm.IsRelayPeer(peer) {
 		t.Fatalf("after SetRelayPeer(false), IsRelayPeer must be false")
+	}
+}
+
+func TestPeerPath_SetRelayPeerResolvesPeerTURN(t *testing.T) {
+	tm := NewTunnelManager()
+	const peer uint32 = 42
+	called := make(chan uint32, 1)
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		called <- nodeID
+		return "", nil
+	})
+
+	tm.SetRelayPeer(peer, true)
+
+	select {
+	case got := <-called:
+		if got != peer {
+			t.Fatalf("resolver called for node %d, want %d", got, peer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SetRelayPeer(true) did not trigger peer TURN resolver")
+	}
+}
+
+func TestPeerPath_SetRelayPeerDoesNotResolveInOutboundTURNOnly(t *testing.T) {
+	tm := NewTunnelManager()
+	tm.SetOutboundTURNOnly(true)
+	called := make(chan uint32, 1)
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		called <- nodeID
+		return "", nil
+	})
+
+	tm.SetRelayPeer(42, true)
+
+	select {
+	case got := <-called:
+		t.Fatalf("resolver called in outbound-turn-only mode for node %d", got)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -675,6 +897,291 @@ func TestWriteFrame_UsesBeaconWhenNoTURNAdvertised(t *testing.T) {
 		t.Fatalf("peerConns installed when it shouldn't have been: conn.Network=%q — "+
 			"beacon-relay tier (tier 1) was expected to fire since no TURN endpoint is known",
 			cc.RemoteEndpoint().Network())
+	}
+}
+
+func TestWriteFrame_PrefetchesPeerTURNWithoutBlockingBeacon(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+
+	const peer uint32 = 792
+	called := make(chan uint32, 1)
+	release := make(chan struct{})
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		if nodeID != peer {
+			t.Fatalf("resolver nodeID=%d, want %d", nodeID, peer)
+		}
+		called <- nodeID
+		<-release
+		return "127.0.0.1:37500", nil
+	})
+
+	tm.mu.Lock()
+	tm.paths[peer] = &peerPath{viaRelay: true}
+	tm.beaconAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}
+	tm.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tm.writeFrame(peer, nil, []byte("hidden-peer-reply"))
+	}()
+
+	select {
+	case got := <-called:
+		if got != peer {
+			t.Fatalf("resolver called for node %d, want %d", got, peer)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writeFrame did not start peer TURN resolver")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("writeFrame: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("writeFrame blocked on peer TURN resolver instead of using beacon")
+	}
+
+	close(release)
+	deadline := time.After(time.Second)
+	for {
+		if got := tm.PeerTURNEndpoint(peer); got == "127.0.0.1:37500" {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("peer TURN resolver did not install endpoint")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestWriteFrame_CachesPeerTURNResolveMiss(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	if err := tm.udp.Listen("127.0.0.1:0", tm.inbound); err != nil {
+		t.Fatalf("udp.Listen: %v", err)
+	}
+
+	const peer uint32 = 793
+	var calls atomic.Int32
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		calls.Add(1)
+		return "", nil
+	})
+
+	tm.mu.Lock()
+	tm.paths[peer] = &peerPath{viaRelay: true}
+	tm.beaconAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}
+	tm.mu.Unlock()
+
+	if err := tm.writeFrame(peer, nil, []byte("first-relay-send")); err != nil {
+		t.Fatalf("first writeFrame: %v", err)
+	}
+
+	deadline := time.After(time.Second)
+	for calls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("resolver was not called")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if err := tm.writeFrame(peer, nil, []byte("second-relay-send")); err != nil {
+		t.Fatalf("second writeFrame: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("resolver calls=%d, want 1 during negative cooldown", got)
+	}
+	tm.mu.RLock()
+	cc := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if cc != nil {
+		t.Fatalf("resolver miss unexpectedly installed cached conn")
+	}
+}
+
+func TestRemovePeerClearsPeerTURNResolveCooldown(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 794
+	var calls atomic.Int32
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		calls.Add(1)
+		return "", nil
+	})
+
+	tm.peerTURNResolve[peer] = &peerTURNResolveState{
+		nextAttempt: time.Now().Add(peerTURNResolveMissCooldown),
+	}
+	tm.RemovePeer(peer)
+	tm.SetRelayPeer(peer, true)
+
+	deadline := time.After(time.Second)
+	for calls.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("resolver was suppressed by stale peer TURN cooldown after RemovePeer")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+func TestPeerTURNResolveIgnoredAfterRemovePeer(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 795
+	called := make(chan struct{})
+	release := make(chan struct{})
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		if nodeID != peer {
+			t.Fatalf("resolver nodeID=%d, want %d", nodeID, peer)
+		}
+		close(called)
+		<-release
+		return "127.0.0.1:37501", nil
+	})
+
+	tm.SetRelayPeer(peer, true)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("resolver was not called")
+	}
+
+	tm.RemovePeer(peer)
+	close(release)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := tm.PeerTURNEndpoint(peer); got != "" {
+		t.Fatalf("PeerTURNEndpoint=%q, want no resurrected endpoint", got)
+	}
+	tm.mu.RLock()
+	_, hasResolve := tm.peerTURNResolve[peer]
+	tm.mu.RUnlock()
+	if hasResolve {
+		t.Fatalf("peer TURN resolve state resurrected after RemovePeer")
+	}
+}
+
+func TestPeerTURNResolveIgnoredAfterRelayClears(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 797
+	called := make(chan struct{})
+	release := make(chan struct{})
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		if nodeID != peer {
+			t.Fatalf("resolver nodeID=%d, want %d", nodeID, peer)
+		}
+		close(called)
+		<-release
+		return "127.0.0.1:37504", nil
+	})
+
+	tm.SetRelayPeer(peer, true)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("resolver was not called")
+	}
+
+	tm.SetRelayPeer(peer, false)
+	close(release)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := tm.PeerTURNEndpoint(peer); got != "" {
+		t.Fatalf("PeerTURNEndpoint=%q, want no relay-derived endpoint after relay cleared", got)
+	}
+	tm.mu.RLock()
+	p := tm.paths[peer]
+	_, hasResolve := tm.peerTURNResolve[peer]
+	tm.mu.RUnlock()
+	if p == nil || p.viaRelay {
+		t.Fatalf("relay path state was not cleared")
+	}
+	if hasResolve {
+		t.Fatalf("peer TURN resolve state remained after relay cleared")
+	}
+}
+
+func TestPeerTURNResolveOldGenerationCannotOverwriteReaddedPeer(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 796
+	firstCalled := make(chan struct{})
+	secondCalled := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	var calls atomic.Int32
+	tm.SetPeerTURNResolver(func(nodeID uint32) (string, error) {
+		call := calls.Add(1)
+		switch call {
+		case 1:
+			close(firstCalled)
+			<-firstRelease
+			return "127.0.0.1:37502", nil
+		case 2:
+			close(secondCalled)
+			<-secondRelease
+			return "127.0.0.1:37503", nil
+		default:
+			t.Fatalf("unexpected resolver call %d for node %d", call, nodeID)
+			return "", nil
+		}
+	})
+
+	tm.SetRelayPeer(peer, true)
+	select {
+	case <-firstCalled:
+	case <-time.After(time.Second):
+		t.Fatal("first resolver was not called")
+	}
+
+	tm.RemovePeer(peer)
+	tm.SetRelayPeer(peer, true)
+	select {
+	case <-secondCalled:
+	case <-time.After(time.Second):
+		t.Fatal("second resolver was not called")
+	}
+
+	close(firstRelease)
+	time.Sleep(50 * time.Millisecond)
+	if got := tm.PeerTURNEndpoint(peer); got != "" {
+		t.Fatalf("old generation installed endpoint %q", got)
+	}
+
+	close(secondRelease)
+	deadline := time.After(time.Second)
+	for {
+		if got := tm.PeerTURNEndpoint(peer); got == "127.0.0.1:37503" {
+			return
+		} else if got == "127.0.0.1:37502" {
+			t.Fatalf("old generation overwrote re-added peer endpoint")
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("new generation endpoint was not installed, got %q", tm.PeerTURNEndpoint(peer))
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 }
 

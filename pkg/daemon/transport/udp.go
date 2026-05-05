@@ -62,6 +62,7 @@ type UDPTransport struct {
 	done    chan struct{}
 	readWg  sync.WaitGroup
 	closed  bool
+	reading bool
 }
 
 // NewUDPTransport constructs an unlistened UDPTransport. Call Listen
@@ -76,6 +77,16 @@ func (t *UDPTransport) Name() string { return "udp" }
 // Listen binds the transport to addr and starts the read loop. Returns
 // once the socket is bound and the goroutine is live.
 func (t *UDPTransport) Listen(addr string, sink chan<- InboundFrame) error {
+	if err := t.ListenPaused(addr, sink); err != nil {
+		return err
+	}
+	return t.StartReadLoop()
+}
+
+// ListenPaused binds the UDP socket without starting the read loop.
+// It is used during daemon startup so endpoint discovery can use the
+// real tunnel socket before the transport read loop owns all reads.
+func (t *UDPTransport) ListenPaused(addr string, sink chan<- InboundFrame) error {
 	t.mu.Lock()
 	if t.conn != nil {
 		t.mu.Unlock()
@@ -99,7 +110,28 @@ func (t *UDPTransport) Listen(addr string, sink chan<- InboundFrame) error {
 	t.conn = conn
 	t.sink = sink
 	t.mu.Unlock()
+	return nil
+}
 
+// StartReadLoop starts receiving datagrams for a socket previously
+// bound by ListenPaused. It is idempotent after the first successful
+// start.
+func (t *UDPTransport) StartReadLoop() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return errors.New("udp transport: closed")
+	}
+	if t.conn == nil {
+		t.mu.Unlock()
+		return errors.New("udp transport: not listening")
+	}
+	if t.reading {
+		t.mu.Unlock()
+		return nil
+	}
+	t.reading = true
+	t.mu.Unlock()
 	t.readWg.Add(1)
 	go t.readLoop()
 	return nil

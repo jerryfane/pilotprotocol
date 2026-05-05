@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
+	"github.com/TeoSlayer/pilotprotocol/internal/pool"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/turncreds"
@@ -150,11 +151,17 @@ type TunnelManager struct {
 	// destination before failing closed. It must only install paths
 	// that writeFrame can use through local TURN.
 	outboundTURNResolver func(uint32) error
-	crypto               map[uint32]*peerCrypto // node_id → encryption state
-	recvCh               chan *IncomingPacket
-	done                 chan struct{}  // closed on Close() to stop dispatchLoop
-	readWg               sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
-	closeOnce            sync.Once
+	// peerTURNResolver is installed by Daemon so relay replies can
+	// learn a hidden peer's rendezvous-published TURN endpoint before
+	// falling back to the beacon relay.
+	peerTURNResolver   func(uint32) (string, error)
+	peerTURNResolveSeq uint64
+	peerTURNResolve    map[uint32]*peerTURNResolveState
+	crypto             map[uint32]*peerCrypto // node_id → encryption state
+	recvCh             chan *IncomingPacket
+	done               chan struct{}  // closed on Close() to stop dispatchLoop
+	readWg             sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
+	closeOnce          sync.Once
 
 	// Encryption config
 	encrypt bool             // if true, attempt encrypted tunnels
@@ -237,6 +244,14 @@ type TunnelManager struct {
 	// SetTraceSends.
 	traceSends bool
 }
+
+type peerTURNResolveState struct {
+	generation  uint64
+	inFlight    bool
+	nextAttempt time.Time
+}
+
+const peerTURNResolveMissCooldown = 30 * time.Second
 
 // Send-tier identifiers used by jf.15.2's per-tier counters and
 // gated trace logs. The index space MUST stay stable — operators
@@ -428,6 +443,7 @@ func NewTunnelManager() *TunnelManager {
 		peerTCP:             make(map[uint32]*transport.TCPEndpoint),
 		peerTURN:            make(map[uint32]*transport.TURNEndpoint),
 		peerConns:           make(map[uint32]transport.DialedConn),
+		peerTURNResolve:     make(map[uint32]*peerTURNResolveState),
 		turnPermittedPeers:  make(map[string]time.Time),
 		crypto:              make(map[uint32]*peerCrypto),
 		peerPubKeys:         make(map[uint32]ed25519.PublicKey),
@@ -649,6 +665,105 @@ func (tm *TunnelManager) SetOutboundTURNOnlyResolver(fn func(uint32) error) {
 	tm.outboundTURNResolver = fn
 }
 
+func (tm *TunnelManager) SetPeerTURNResolver(fn func(uint32) (string, error)) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.peerTURNResolver = fn
+}
+
+func (tm *TunnelManager) beginPeerTURNResolve(nodeID uint32) (func(uint32) (string, error), uint64, bool) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if tm.outboundTURNOnly || tm.peerTURNResolver == nil || tm.peerTURN[nodeID] != nil {
+		return nil, 0, false
+	}
+	state := tm.peerTURNResolve[nodeID]
+	if state == nil {
+		state = &peerTURNResolveState{}
+		tm.peerTURNResolve[nodeID] = state
+	}
+	if state.inFlight || time.Now().Before(state.nextAttempt) {
+		return nil, 0, false
+	}
+	tm.peerTURNResolveSeq++
+	state.generation = tm.peerTURNResolveSeq
+	state.inFlight = true
+	return tm.peerTURNResolver, state.generation, true
+}
+
+func (tm *TunnelManager) resolvePeerTURNForRelayAsync(nodeID uint32, reason string) {
+	resolver, generation, ok := tm.beginPeerTURNResolve(nodeID)
+	if !ok {
+		return
+	}
+	go func() {
+		addr, err := resolver(nodeID)
+		applied, installed, finishErr := tm.finishPeerTURNResolve(nodeID, generation, addr, err)
+		if !applied {
+			slog.Debug("relay peer turn endpoint resolve ignored after peer state changed",
+				"node_id", nodeID, "reason", reason)
+			return
+		}
+		tm.logPeerTURNResolveResult(nodeID, reason, installed, finishErr)
+	}()
+}
+
+func (tm *TunnelManager) finishPeerTURNResolve(nodeID uint32, generation uint64, addr string, resolveErr error) (applied bool, installed string, err error) {
+	var ep *transport.TURNEndpoint
+	if resolveErr == nil && addr != "" {
+		var epErr error
+		ep, epErr = transport.NewTURNEndpoint(addr)
+		if epErr != nil {
+			resolveErr = fmt.Errorf("turn endpoint %q: %w", addr, epErr)
+		}
+	}
+
+	var evicted transport.DialedConn
+	var oldAddr string
+	tm.mu.Lock()
+	state := tm.peerTURNResolve[nodeID]
+	if state == nil || state.generation != generation {
+		tm.mu.Unlock()
+		return false, "", nil
+	}
+	state.inFlight = false
+	if p := tm.paths[nodeID]; p == nil || !p.viaRelay {
+		delete(tm.peerTURNResolve, nodeID)
+		tm.mu.Unlock()
+		return false, "", nil
+	}
+	if resolveErr != nil || ep == nil {
+		state.nextAttempt = time.Now().Add(peerTURNResolveMissCooldown)
+		tm.mu.Unlock()
+		return true, "", resolveErr
+	}
+	oldAddr, installed, evicted = tm.storePeerTURNEndpointLocked(nodeID, ep)
+	tm.mu.Unlock()
+
+	if evicted != nil {
+		_ = evicted.Close()
+		slog.Debug("evicted stale peer conn after turn endpoint change",
+			"node_id", nodeID, "old_addr", oldAddr, "new_addr", installed)
+	}
+	if err := tm.permitPeerTURNEndpoint(installed); err != nil {
+		slog.Debug("permit turn peer on endpoint install failed",
+			"node_id", nodeID, "addr", installed, "error", err)
+	}
+	return true, installed, nil
+}
+
+func (tm *TunnelManager) logPeerTURNResolveResult(nodeID uint32, reason string, installed string, err error) {
+	if err != nil {
+		slog.Debug("relay peer turn endpoint resolve failed",
+			"node_id", nodeID, "reason", reason, "error", err)
+		return
+	}
+	if installed != "" {
+		slog.Info("relay peer turn endpoint resolved",
+			"node_id", nodeID, "reason", reason, "addr", installed)
+	}
+}
+
 // TURNLocalAddr returns the server-assigned relay address, or nil if
 // TURN is not enabled. Used by daemon code that wants to advertise the
 // relay endpoint in DaemonInfo / gossip.
@@ -699,11 +814,19 @@ func (tm *TunnelManager) storePeerTURNEndpoint(
 	nodeID uint32,
 	ep *transport.TURNEndpoint,
 ) (oldAddr string, newAddr string, evicted transport.DialedConn) {
-	newAddr = ep.String()
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	return tm.storePeerTURNEndpointLocked(nodeID, ep)
+}
+
+func (tm *TunnelManager) storePeerTURNEndpointLocked(
+	nodeID uint32,
+	ep *transport.TURNEndpoint,
+) (oldAddr string, newAddr string, evicted transport.DialedConn) {
+	newAddr = ep.String()
 	prevEp := tm.peerTURN[nodeID]
 	tm.peerTURN[nodeID] = ep
+	delete(tm.peerTURNResolve, nodeID)
 	if prevEp == nil {
 		return "", newAddr, nil
 	}
@@ -748,6 +871,21 @@ func (tm *TunnelManager) PeerTURNEndpoint(nodeID uint32) string {
 		return ""
 	}
 	return ep.String()
+}
+
+func (tm *TunnelManager) ClearPeerTURNEndpoint(nodeID uint32) {
+	var evicted transport.DialedConn
+	tm.mu.Lock()
+	delete(tm.peerTURN, nodeID)
+	delete(tm.peerTURNResolve, nodeID)
+	if cached := tm.peerConns[nodeID]; isTURNNetwork(dialedConnNetwork(cached)) {
+		evicted = cached
+		delete(tm.peerConns, nodeID)
+	}
+	tm.mu.Unlock()
+	if evicted != nil {
+		_ = evicted.Close()
+	}
 }
 
 // KnownTURNPeers returns the node IDs of every peer with a
@@ -1023,9 +1161,13 @@ func (tm *TunnelManager) SetRelayPeer(nodeID uint32, relay bool) {
 	tm.mu.Lock()
 	p := tm.getOrCreatePath(nodeID)
 	p.viaRelay = relay
+	if !relay {
+		delete(tm.peerTURNResolve, nodeID)
+	}
 	tm.mu.Unlock()
 	if relay {
 		slog.Info("peer marked for relay", "node_id", nodeID)
+		tm.resolvePeerTURNForRelayAsync(nodeID, "relay_mark")
 	}
 }
 
@@ -1206,6 +1348,10 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 			}
 		}
 
+		if !snap.turnOnly && snap.relay && !snap.hasPeerTURN && snap.turnResolver != nil {
+			tm.resolvePeerTURNForRelayAsync(nodeID, "relay_send")
+		}
+
 		for _, candidate := range plan.candidates {
 			done, err := tm.executeFrameRouteCandidate(nodeID, frame, candidate, frameRouteExecState{
 				relay:      snap.relay,
@@ -1248,6 +1394,7 @@ type frameRouteState struct {
 	hasLocalTURN bool
 	turnOnly     bool
 	resolver     func(uint32) error
+	turnResolver func(uint32) (string, error)
 }
 
 func (tm *TunnelManager) snapshotFrameRouteState(nodeID uint32) frameRouteState {
@@ -1271,6 +1418,7 @@ func (tm *TunnelManager) snapshotFrameRouteState(nodeID uint32) frameRouteState 
 		hasLocalTURN: tm.turn != nil,
 		turnOnly:     tm.outboundTURNOnly,
 		resolver:     tm.outboundTURNResolver,
+		turnResolver: tm.peerTURNResolver,
 	}
 }
 
@@ -1552,10 +1700,20 @@ func (tm *TunnelManager) getPeerPubKey(nodeID uint32) (ed25519.PublicKey, error)
 // method also starts the dispatchLoop goroutine that consumes frames
 // from every registered transport via the shared inbound sink.
 func (tm *TunnelManager) Listen(addr string) error {
-	if err := tm.udp.Listen(addr, tm.inbound); err != nil {
+	if err := tm.ListenPaused(addr); err != nil {
 		return err
 	}
+	return tm.StartUDPReadLoop()
+}
 
+func (tm *TunnelManager) ListenPaused(addr string) error {
+	return tm.udp.ListenPaused(addr, tm.inbound)
+}
+
+func (tm *TunnelManager) StartUDPReadLoop() error {
+	if err := tm.udp.StartReadLoop(); err != nil {
+		return err
+	}
 	tm.readWg.Add(1)
 	go tm.dispatchLoop()
 	return nil
@@ -2750,6 +2908,7 @@ func (tm *TunnelManager) RemovePeer(nodeID uint32) {
 	delete(tm.peerPubKeys, nodeID)
 	delete(tm.peerTCP, nodeID)
 	delete(tm.peerTURN, nodeID)
+	delete(tm.peerTURNResolve, nodeID)
 	delete(tm.lastRecoveryPILA, nodeID)
 	delete(tm.lastAuthKEXResponse, nodeID)
 	// peerConns owns a DialedConn — close before deleting so the
@@ -2992,11 +3151,18 @@ func (tm *TunnelManager) RecvCh() <-chan *IncomingPacket {
 
 // DiscoverEndpoint sends a STUN discover to the beacon and returns the observed public endpoint.
 func DiscoverEndpoint(beaconAddr string, nodeID uint32, conn *net.UDPConn) (*net.UDPAddr, error) {
+	return discoverEndpoint(beaconAddr, nodeID, conn, nil)
+}
+
+func discoverEndpoint(beaconAddr string, nodeID uint32, conn *net.UDPConn, ignored func([]byte, *net.UDPAddr)) (*net.UDPAddr, error) {
 	bAddr, err := net.ResolveUDPAddr("udp", beaconAddr)
 	if err != nil {
 		return nil, fmt.Errorf("resolve beacon: %w", err)
 	}
+	return discoverEndpointResolved(bAddr, nodeID, conn, ignored)
+}
 
+func discoverEndpointResolved(bAddr *net.UDPAddr, nodeID uint32, conn *net.UDPConn, ignored func([]byte, *net.UDPAddr)) (*net.UDPAddr, error) {
 	// Send discover message
 	msg := make([]byte, 5)
 	msg[0] = protocol.BeaconMsgDiscover
@@ -3006,24 +3172,43 @@ func DiscoverEndpoint(beaconAddr string, nodeID uint32, conn *net.UDPConn) (*net
 		return nil, fmt.Errorf("send discover: %w", err)
 	}
 
-	// Read reply
-	buf := make([]byte, 64)
+	bufPtr := pool.GetLarge()
+	defer pool.PutLarge(bufPtr)
+	buf := *bufPtr
 	conn.SetReadDeadline(fixedTimeout())
-	n, _, err := conn.ReadFromUDP(buf)
-	conn.SetReadDeadline(zeroTime())
-	if err != nil {
-		return nil, fmt.Errorf("discover reply: %w", err)
+	defer conn.SetReadDeadline(zeroTime())
+	for {
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return nil, fmt.Errorf("discover reply: %w", err)
+		}
+		pub, parseErr := parseDiscoverReply(buf[:n], from, bAddr)
+		if parseErr == nil {
+			return pub, nil
+		}
+		if ignored != nil && shouldQueueIgnoredDiscoveryDatagram(buf[:n], from, bAddr) {
+			frame := make([]byte, n)
+			copy(frame, buf[:n])
+			ignored(frame, from)
+		}
+		slog.Debug("ignoring non-discover datagram during endpoint discovery",
+			"from", from, "error", parseErr)
 	}
+}
 
+func parseDiscoverReply(buf []byte, from *net.UDPAddr, beacon *net.UDPAddr) (*net.UDPAddr, error) {
+	if !sameUDPAddr(from, beacon) {
+		return nil, fmt.Errorf("not from beacon")
+	}
 	// Format: [type(1)][iplen(1)][IP(4 or 16)][port(2)]
-	if n < 4 || buf[0] != protocol.BeaconMsgDiscoverReply {
+	if len(buf) < 4 || buf[0] != protocol.BeaconMsgDiscoverReply {
 		return nil, fmt.Errorf("invalid discover reply")
 	}
 	ipLen := int(buf[1])
 	if ipLen != 4 && ipLen != 16 {
 		return nil, fmt.Errorf("invalid discover reply: bad IP length %d", ipLen)
 	}
-	if n < 2+ipLen+2 {
+	if len(buf) < 2+ipLen+2 {
 		return nil, fmt.Errorf("invalid discover reply: too short")
 	}
 
@@ -3032,4 +3217,21 @@ func DiscoverEndpoint(beaconAddr string, nodeID uint32, conn *net.UDPConn) (*net
 	port := binary.BigEndian.Uint16(buf[2+ipLen : 2+ipLen+2])
 
 	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
+}
+
+func shouldQueueIgnoredDiscoveryDatagram(buf []byte, from *net.UDPAddr, beacon *net.UDPAddr) bool {
+	return len(buf) > 0 && (!sameUDPAddr(from, beacon) || buf[0] != protocol.BeaconMsgDiscoverReply)
+}
+
+func sameUDPAddr(a, b *net.UDPAddr) bool {
+	return a != nil && b != nil && a.Port == b.Port && a.IP.Equal(b.IP)
+}
+
+func (tm *TunnelManager) queueStartupInboundDatagram(frame []byte, from *net.UDPAddr) {
+	fromEP := transport.NewUDPEndpoint(from)
+	select {
+	case tm.inbound <- transport.InboundFrame{Frame: frame, From: fromEP}:
+	default:
+		slog.Debug("dropping startup datagram while discovery queue is full", "from", from)
+	}
 }
