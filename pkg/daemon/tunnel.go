@@ -145,11 +145,16 @@ type TunnelManager struct {
 	// flow. Read-mostly thereafter; guarded by tm.mu because
 	// writeFrame reads it under RLock alongside other fields. v1.9.0-jf.11a.
 	outboundTURNOnly bool
-	crypto           map[uint32]*peerCrypto // node_id → encryption state
-	recvCh           chan *IncomingPacket
-	done             chan struct{}  // closed on Close() to stop dispatchLoop
-	readWg           sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
-	closeOnce        sync.Once
+	// outboundTURNResolver is installed by Daemon so the low-level
+	// transport can ask the control plane to seed a strict-mode
+	// destination before failing closed. It must only install paths
+	// that writeFrame can use through local TURN.
+	outboundTURNResolver func(uint32) error
+	crypto               map[uint32]*peerCrypto // node_id → encryption state
+	recvCh               chan *IncomingPacket
+	done                 chan struct{}  // closed on Close() to stop dispatchLoop
+	readWg               sync.WaitGroup // tracks dispatchLoop goroutine for clean shutdown
+	closeOnce            sync.Once
 
 	// Encryption config
 	encrypt bool             // if true, attempt encrypted tunnels
@@ -638,6 +643,12 @@ func (tm *TunnelManager) SetOutboundTURNOnly(b bool) {
 	tm.outboundTURNOnly = b
 }
 
+func (tm *TunnelManager) SetOutboundTURNOnlyResolver(fn func(uint32) error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.outboundTURNResolver = fn
+}
+
 // TURNLocalAddr returns the server-assigned relay address, or nil if
 // TURN is not enabled. Used by daemon code that wants to advertise the
 // relay endpoint in DaemonInfo / gossip.
@@ -778,6 +789,8 @@ func (tm *TunnelManager) KnownTURNPeers() []uint32 {
 // Returns an error if no TURN endpoint is known for the node or if
 // building the conn fails (e.g. UDP transport not listening).
 func (tm *TunnelManager) DialTURNRelayForPeer(ctx context.Context, nodeID uint32) error {
+	tm.evictNonTURNCachedConn(nodeID)
+
 	tm.mu.RLock()
 	localTURN := tm.turn
 	ep := tm.peerTURN[nodeID]
@@ -801,14 +814,14 @@ func (tm *TunnelManager) DialTURNRelayForPeer(ctx context.Context, nodeID uint32
 	}
 
 	tm.mu.Lock()
-	if existing, ok := tm.peerConns[nodeID]; ok {
-		tm.mu.Unlock()
-		_ = conn.Close()
-		_ = existing
+	kept, closeConn := tm.commitTURNConnLocked(nodeID, conn)
+	tm.mu.Unlock()
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
+	if kept != conn {
 		return nil
 	}
-	tm.peerConns[nodeID] = conn
-	tm.mu.Unlock()
 	slog.Info("peer switched to turn-relay", "node_id", nodeID, "remote", ep.String())
 	return nil
 }
@@ -902,6 +915,8 @@ func (tm *TunnelManager) startTURNPermissionEviction() {
 // (or explicitly in hide-IP mode where TURN is the only advertised
 // path).
 func (tm *TunnelManager) DialTURNForPeer(ctx context.Context, nodeID uint32) error {
+	tm.evictNonTURNCachedConn(nodeID)
+
 	tm.mu.RLock()
 	t := tm.turn
 	ep := tm.peerTURN[nodeID]
@@ -919,15 +934,14 @@ func (tm *TunnelManager) DialTURNForPeer(ctx context.Context, nodeID uint32) err
 	}
 
 	tm.mu.Lock()
-	// Prefer any earlier winner (matches DialTCPForPeer's race handling).
-	if existing, ok := tm.peerConns[nodeID]; ok {
-		tm.mu.Unlock()
-		_ = conn.Close()
-		_ = existing
+	kept, closeConn := tm.commitTURNConnLocked(nodeID, conn)
+	tm.mu.Unlock()
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
+	if kept != conn {
 		return nil
 	}
-	tm.peerConns[nodeID] = conn
-	tm.mu.Unlock()
 	slog.Info("peer switched to turn", "node_id", nodeID, "remote", ep.String())
 	return nil
 }
@@ -1170,7 +1184,75 @@ func (tm *TunnelManager) RequestHolePunch(targetNodeID uint32) {
 // route_policy.go; this method snapshots tunnel state and executes the
 // selected candidates.
 func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []byte) error {
+	var resolveErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		snap := tm.snapshotFrameRouteState(nodeID)
+		plan := planFrameRoutes(frameRoutePolicyInput{
+			outboundTURNOnly: snap.turnOnly,
+			relay:            snap.relay,
+			hasBeacon:        snap.beaconAddr != nil,
+			hasLocalTURN:     snap.hasLocalTURN,
+			hasPeerTURN:      snap.hasPeerTURN,
+			cachedConnNet:    snap.cachedNet,
+			callerAddr:       addr,
+			pathDirect:       snap.pathDirect,
+		})
+
+		if len(plan.candidates) == 0 && plan.failClosed &&
+			snap.turnOnly && snap.hasLocalTURN && snap.resolver != nil && attempt == 0 {
+			resolveErr = snap.resolver(nodeID)
+			if resolveErr == nil {
+				continue
+			}
+		}
+
+		for _, candidate := range plan.candidates {
+			done, err := tm.executeFrameRouteCandidate(nodeID, frame, candidate, frameRouteExecState{
+				relay:      snap.relay,
+				beaconAddr: snap.beaconAddr,
+				cachedConn: snap.cachedConn,
+			})
+			if done {
+				return err
+			}
+		}
+
+		if plan.failClosed {
+			reason := "no known peer UDP endpoint or peer TURN endpoint"
+			if !snap.hasLocalTURN {
+				reason = "local TURN allocation missing"
+			} else if snap.pathDirect == nil && addr == nil && !snap.hasPeerTURN {
+				reason = "no peer destination installed for local TURN relay"
+			} else if snap.cachedNet != "" && !isTURNNetwork(snap.cachedNet) {
+				reason = "only non-TURN cached transport is available"
+			}
+			if resolveErr != nil {
+				reason = fmt.Sprintf("%s; resolve failed: %v", reason, resolveErr)
+			}
+			return fmt.Errorf("outbound-turn-only: no TURN-safe path for node %d "+
+				"(%s; tunnel traffic refused rather than use direct UDP, TCP, or beacon)",
+				nodeID, reason)
+		}
+		return fmt.Errorf("no address for node %d", nodeID)
+	}
+	return fmt.Errorf("no address for node %d", nodeID)
+}
+
+type frameRouteState struct {
+	relay        bool
+	pathDirect   *net.UDPAddr
+	beaconAddr   *net.UDPAddr
+	cachedConn   transport.DialedConn
+	cachedNet    string
+	hasPeerTURN  bool
+	hasLocalTURN bool
+	turnOnly     bool
+	resolver     func(uint32) error
+}
+
+func (tm *TunnelManager) snapshotFrameRouteState(nodeID uint32) frameRouteState {
 	tm.mu.RLock()
+	defer tm.mu.RUnlock()
 	p := tm.paths[nodeID]
 	var relay bool
 	var pathDirect *net.UDPAddr
@@ -1178,50 +1260,18 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 		relay = p.viaRelay
 		pathDirect = p.direct
 	}
-	bAddr := tm.beaconAddr
 	cachedConn := tm.peerConns[nodeID]
-	cachedNet := dialedConnNetwork(cachedConn)
-	hasPeerTURN := tm.peerTURN[nodeID] != nil
-	hasLocalTURN := tm.turn != nil
-	turnOnly := tm.outboundTURNOnly
-	tm.mu.RUnlock()
-
-	plan := planFrameRoutes(frameRoutePolicyInput{
-		outboundTURNOnly: turnOnly,
-		relay:            relay,
-		hasBeacon:        bAddr != nil,
-		hasLocalTURN:     hasLocalTURN,
-		hasPeerTURN:      hasPeerTURN,
-		cachedConnNet:    cachedNet,
-		callerAddr:       addr,
-		pathDirect:       pathDirect,
-	})
-
-	for _, candidate := range plan.candidates {
-		done, err := tm.executeFrameRouteCandidate(nodeID, frame, candidate, frameRouteExecState{
-			relay:      relay,
-			beaconAddr: bAddr,
-			cachedConn: cachedConn,
-		})
-		if done {
-			return err
-		}
+	return frameRouteState{
+		relay:        relay,
+		pathDirect:   pathDirect,
+		beaconAddr:   tm.beaconAddr,
+		cachedConn:   cachedConn,
+		cachedNet:    dialedConnNetwork(cachedConn),
+		hasPeerTURN:  tm.peerTURN[nodeID] != nil,
+		hasLocalTURN: tm.turn != nil,
+		turnOnly:     tm.outboundTURNOnly,
+		resolver:     tm.outboundTURNResolver,
 	}
-
-	if plan.failClosed {
-		reason := "no known peer UDP endpoint or peer TURN endpoint"
-		if !hasLocalTURN {
-			reason = "local TURN allocation missing"
-		} else if pathDirect == nil && addr == nil && !hasPeerTURN {
-			reason = "peer advertised no TURN endpoint and no peer UDP endpoint is known"
-		} else if cachedNet != "" && !isTURNNetwork(cachedNet) {
-			reason = "only non-TURN cached transport is available"
-		}
-		return fmt.Errorf("outbound-turn-only: no TURN-safe path for node %d "+
-			"(%s; tunnel traffic refused rather than use direct UDP, TCP, or beacon)",
-			nodeID, reason)
-	}
-	return fmt.Errorf("no address for node %d", nodeID)
 }
 
 type frameRouteExecState struct {
@@ -1307,6 +1357,8 @@ func (tm *TunnelManager) sendFrameViaPeerTURNRoute(
 	tier int,
 	relay bool,
 ) (bool, error) {
+	tm.evictNonTURNCachedConn(nodeID)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	dialErr := tm.DialTURNRelayForPeer(ctx, nodeID)
 	cancel()
@@ -1318,7 +1370,10 @@ func (tm *TunnelManager) sendFrameViaPeerTURNRoute(
 	tm.mu.RLock()
 	conn := tm.peerConns[nodeID]
 	tm.mu.RUnlock()
-	if conn == nil || conn.RemoteEndpoint() == nil || conn.RemoteEndpoint().Network() == "udp" {
+	if !isTURNDialedConn(conn) {
+		if conn != nil {
+			tm.evictCachedConnIfSame(nodeID, conn)
+		}
 		return false, nil
 	}
 	ok, _ := tm.sendFrameViaCachedConnRoute(nodeID, frame, tier, conn, relay)
@@ -1371,6 +1426,37 @@ func dialedConnNetwork(conn transport.DialedConn) string {
 		return ""
 	}
 	return conn.RemoteEndpoint().Network()
+}
+
+func isTURNDialedConn(conn transport.DialedConn) bool {
+	return isTURNNetwork(dialedConnNetwork(conn))
+}
+
+func (tm *TunnelManager) commitTURNConnLocked(
+	nodeID uint32,
+	conn transport.DialedConn,
+) (kept transport.DialedConn, closeConn transport.DialedConn) {
+	if existing := tm.peerConns[nodeID]; existing != nil {
+		if isTURNDialedConn(existing) {
+			return existing, conn
+		}
+		tm.peerConns[nodeID] = conn
+		return conn, existing
+	}
+	tm.peerConns[nodeID] = conn
+	return conn, nil
+}
+
+func (tm *TunnelManager) evictNonTURNCachedConn(nodeID uint32) {
+	tm.mu.Lock()
+	conn := tm.peerConns[nodeID]
+	if conn == nil || isTURNDialedConn(conn) {
+		tm.mu.Unlock()
+		return
+	}
+	delete(tm.peerConns, nodeID)
+	tm.mu.Unlock()
+	_ = conn.Close()
 }
 
 func (tm *TunnelManager) evictCachedConnIfSame(nodeID uint32, conn transport.DialedConn) {
@@ -2616,6 +2702,20 @@ func (tm *TunnelManager) sendPlaintextToNode(nodeID uint32, addr *net.UDPAddr, d
 // timeout fallback) persists through a subsequent AddPeer that was
 // supposed to install a fresh, known-good direct addr.
 func (tm *TunnelManager) AddPeer(nodeID uint32, addr *net.UDPAddr) {
+	tm.installPeerUDPDestination(nodeID, addr)
+	// If encryption is enabled, initiate key exchange (relay-aware).
+	// Caller-initiated; no inbound frame, so observedSrc is nil and
+	// the cached path.direct (which we just set above) is used (jf.12).
+	if tm.encrypt {
+		tm.sendKeyExchangeToNode(nodeID, nil)
+	}
+}
+
+func (tm *TunnelManager) InstallPeerUDPDestination(nodeID uint32, addr *net.UDPAddr) {
+	tm.installPeerUDPDestination(nodeID, addr)
+}
+
+func (tm *TunnelManager) installPeerUDPDestination(nodeID uint32, addr *net.UDPAddr) {
 	tm.mu.Lock()
 	p := tm.getOrCreatePath(nodeID)
 	p.direct = addr
@@ -2625,13 +2725,6 @@ func (tm *TunnelManager) AddPeer(nodeID uint32, addr *net.UDPAddr) {
 	// promote the entry to "seen live".
 	tm.mu.Unlock()
 	slog.Debug("added peer", "node_id", nodeID, "addr", addr)
-
-	// If encryption is enabled, initiate key exchange (relay-aware).
-	// Caller-initiated; no inbound frame, so observedSrc is nil and
-	// the cached path.direct (which we just set above) is used (jf.12).
-	if tm.encrypt {
-		tm.sendKeyExchangeToNode(nodeID, nil)
-	}
 }
 
 // RemovePeer removes a peer and wipes all per-peer state. Mirrors

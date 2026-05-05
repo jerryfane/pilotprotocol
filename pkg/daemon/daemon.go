@@ -734,6 +734,7 @@ func (d *Daemon) Start() error {
 	// v1.9.0-jf.11a: latch OutboundTURNOnly into the TunnelManager so
 	// writeFrame sees it on every subsequent outbound frame.
 	d.tunnels.SetOutboundTURNOnly(d.config.OutboundTURNOnly)
+	d.tunnels.SetOutboundTURNOnlyResolver(d.resolveOutboundTURNOnlyDestination)
 	if d.config.OutboundTURNOnly {
 		slog.Info("outbound-turn-only enabled: all outbound tunnel " +
 			"traffic routes through local TURN allocation")
@@ -2416,6 +2417,79 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	// prime the view for the Phase D tick loop and for offline
 	// fallback when the registry is later unreachable.
 	d.populateGossipViewFromResolve(nodeID, resp, realAddr, endpoints)
+	return nil
+}
+
+func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
+	if nodeID == d.NodeID() {
+		return protocol.ErrDialToSelf
+	}
+	if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
+		return nil
+	}
+
+	if fresh := d.rendezvousLookupForDial(nodeID); fresh != "" {
+		if err := d.tunnels.AddPeerTURNEndpoint(nodeID, fresh); err != nil {
+			slog.Debug("outbound-turn-only resolve: rendezvous install failed",
+				"node_id", nodeID, "addr", fresh, "error", err)
+		} else if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
+			return nil
+		}
+	}
+
+	resp, cached := d.cachedResolve(nodeID)
+	if !cached {
+		var err error
+		if d.regConn != nil {
+			resp, err = d.regConn.Resolve(nodeID, d.NodeID())
+		} else {
+			err = errors.New("registry client unavailable")
+		}
+		if err != nil {
+			if ep, ok := d.cachedEndpoint(nodeID); ok {
+				return d.installOutboundTURNOnlyUDPDestination(nodeID, ep)
+			}
+			return fmt.Errorf("resolve node %d: %w", nodeID, err)
+		}
+		d.cacheResolve(nodeID, resp)
+	}
+
+	endpoints := registry.EndpointsFromResponse(resp)
+	for _, ep := range endpoints {
+		if ep.Network != "turn" || ep.Addr == "" {
+			continue
+		}
+		if err := d.tunnels.AddPeerTURNEndpoint(nodeID, ep.Addr); err != nil {
+			slog.Debug("outbound-turn-only resolve: turn endpoint install failed",
+				"node_id", nodeID, "addr", ep.Addr, "error", err)
+			continue
+		}
+		if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
+			return nil
+		}
+	}
+
+	realAddr, ok := resp["real_addr"].(string)
+	if !ok || realAddr == "" {
+		if ep, cached := d.cachedEndpoint(nodeID); cached {
+			return d.installOutboundTURNOnlyUDPDestination(nodeID, ep)
+		}
+		return fmt.Errorf("node %d has no peer UDP destination", nodeID)
+	}
+	if err := d.installOutboundTURNOnlyUDPDestination(nodeID, realAddr); err != nil {
+		return err
+	}
+	d.populateGossipViewFromResolve(nodeID, resp, realAddr, endpoints)
+	return nil
+}
+
+func (d *Daemon) installOutboundTURNOnlyUDPDestination(nodeID uint32, addr string) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", addr, err)
+	}
+	d.cacheEndpoint(nodeID, addr)
+	d.tunnels.InstallPeerUDPDestination(nodeID, udpAddr)
 	return nil
 }
 

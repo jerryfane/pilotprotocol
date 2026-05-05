@@ -50,6 +50,48 @@ func TestEnsureTunnelOutboundTURNOnlyResolvesExistingPeerWithoutDestination(t *t
 	}
 }
 
+func TestResolveOutboundTURNOnlyDestinationUsesCachedResolveWithoutKeyExchange(t *testing.T) {
+	const peer uint32 = 45982
+	d := &Daemon{
+		config: Config{
+			OutboundTURNOnly: true,
+		},
+		nodeID:  133053,
+		tunnels: NewTunnelManager(),
+		epCache: make(map[uint32]*endpointEntry),
+		resolveCache: map[uint32]*resolveEntry{
+			peer: {
+				resp: map[string]interface{}{
+					"real_addr": "203.0.113.8:37737",
+				},
+				cachedAt: time.Now(),
+			},
+		},
+	}
+	defer d.tunnels.Close()
+
+	d.tunnels.mu.Lock()
+	d.tunnels.encrypt = true
+	d.tunnels.mu.Unlock()
+
+	if err := d.resolveOutboundTURNOnlyDestination(peer); err != nil {
+		t.Fatalf("resolveOutboundTURNOnlyDestination: %v", err)
+	}
+	d.tunnels.mu.RLock()
+	got := d.tunnels.paths[peer].direct
+	d.tunnels.mu.RUnlock()
+	d.tunnels.pendMu.Lock()
+	pending := len(d.tunnels.pending[peer])
+	d.tunnels.pendMu.Unlock()
+	want := &net.UDPAddr{IP: net.ParseIP("203.0.113.8"), Port: 37737}
+	if got == nil || !got.IP.Equal(want.IP) || got.Port != want.Port {
+		t.Fatalf("direct endpoint = %v, want %v", got, want)
+	}
+	if pending != 0 {
+		t.Fatalf("pending key exchange frames=%d, want 0", pending)
+	}
+}
+
 func TestHasOutboundTURNOnlyDestination(t *testing.T) {
 	tm := NewTunnelManager()
 	defer tm.Close()

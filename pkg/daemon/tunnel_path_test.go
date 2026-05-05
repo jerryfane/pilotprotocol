@@ -248,6 +248,7 @@ type stubDialedConn struct {
 	network string
 	remote  string
 	sends   atomic.Int32
+	closes  atomic.Int32
 	last    atomic.Value // []byte
 }
 
@@ -268,7 +269,10 @@ func (s *stubDialedConn) RemoteEndpoint() transport.Endpoint {
 	return &stubEndpoint{network: s.network, addr: s.remote}
 }
 
-func (s *stubDialedConn) Close() error { return nil }
+func (s *stubDialedConn) Close() error {
+	s.closes.Add(1)
+	return nil
+}
 
 // TestWriteFrame_UsesCachedTURNConn validates that once a TURN
 // DialedConn is installed in peerConns (as Part A2 does for TURN via

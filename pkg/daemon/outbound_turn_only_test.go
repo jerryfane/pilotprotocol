@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"errors"
 	"net"
 	"strings"
 	"testing"
+
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
 )
 
 // TestOutboundTURNOnly_StartupFailsWithoutTurnProvider pins the fail-closed
@@ -116,6 +119,213 @@ func TestWriteFrame_OutboundTURNOnly_SkipsNonTURNCachedConn(t *testing.T) {
 	}
 	if got := tcpStub.sends.Load(); got != 0 {
 		t.Fatalf("tcpStub.sends = %d; want 0 (TCP conn must be skipped under OutboundTURNOnly)", got)
+	}
+}
+
+func TestWriteFrame_OutboundTURNOnly_ResolvesMissingDestinationOnce(t *testing.T) {
+	tm := NewTunnelManager()
+	defer func() {
+		tm.mu.Lock()
+		tm.turn = nil
+		tm.mu.Unlock()
+		tm.Close()
+	}()
+	tm.SetOutboundTURNOnly(true)
+	const peer uint32 = 324
+	stub := &stubDialedConn{network: "turn", remote: "203.0.113.200:37500"}
+	calls := 0
+	tm.SetOutboundTURNOnlyResolver(func(nodeID uint32) error {
+		calls++
+		if nodeID != peer {
+			t.Fatalf("resolver nodeID=%d, want %d", nodeID, peer)
+		}
+		tm.mu.Lock()
+		tm.peerConns[peer] = stub
+		tm.mu.Unlock()
+		return nil
+	})
+	tm.mu.Lock()
+	tm.turn = &transport.TURNTransport{}
+	tm.mu.Unlock()
+
+	if err := tm.writeFrame(peer, nil, []byte("resolved-via-turn")); err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("resolver calls=%d, want 1", calls)
+	}
+	if got := stub.sends.Load(); got != 1 {
+		t.Fatalf("stub.sends=%d, want 1", got)
+	}
+}
+
+func TestWriteFrame_OutboundTURNOnly_ResolverFailureStillFailClosed(t *testing.T) {
+	tm := NewTunnelManager()
+	defer func() {
+		tm.mu.Lock()
+		tm.turn = nil
+		tm.mu.Unlock()
+		tm.Close()
+	}()
+	tm.SetOutboundTURNOnly(true)
+	const peer uint32 = 325
+	tcpStub := &stubDialedConn{network: "tcp", remote: "203.0.113.1:4443"}
+	tm.SetOutboundTURNOnlyResolver(func(uint32) error {
+		return errors.New("registry unavailable")
+	})
+	tm.mu.Lock()
+	tm.turn = &transport.TURNTransport{}
+	tm.peerConns[peer] = tcpStub
+	tm.beaconAddr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999}
+	tm.paths[peer] = &peerPath{viaRelay: true}
+	tm.mu.Unlock()
+
+	err := tm.writeFrame(peer, nil, []byte("must-not-leak"))
+	if err == nil {
+		t.Fatalf("writeFrame succeeded after resolver failure; want fail-closed error")
+	}
+	if !strings.Contains(err.Error(), "resolve failed: registry unavailable") {
+		t.Fatalf("writeFrame error = %q; want resolver failure", err)
+	}
+	if got := tcpStub.sends.Load(); got != 0 {
+		t.Fatalf("tcpStub.sends=%d, want 0", got)
+	}
+}
+
+func TestWriteFrame_OutboundTURNOnly_DoesNotUseStaleTCPAfterResolverInstallsTURN(t *testing.T) {
+	tm := NewTunnelManager()
+	defer func() {
+		tm.mu.Lock()
+		tm.turn = nil
+		tm.mu.Unlock()
+		tm.Close()
+	}()
+	tm.SetOutboundTURNOnly(true)
+
+	const peer uint32 = 326
+	tcpStub := &stubDialedConn{network: "tcp", remote: "203.0.113.1:4443"}
+	tm.SetOutboundTURNOnlyResolver(func(uint32) error {
+		if err := tm.AddPeerTURNEndpoint(peer, "203.0.113.200:37500"); err != nil {
+			return err
+		}
+		return nil
+	})
+	tm.mu.Lock()
+	tm.turn = &transport.TURNTransport{}
+	tm.peerConns[peer] = tcpStub
+	tm.mu.Unlock()
+
+	err := tm.writeFrame(peer, nil, []byte("must-not-use-tcp"))
+	if err == nil {
+		t.Fatalf("writeFrame succeeded with fake TURN transport; want fail-closed/no TCP send")
+	}
+	if got := tcpStub.sends.Load(); got != 0 {
+		t.Fatalf("tcpStub.sends=%d, want 0", got)
+	}
+	tm.mu.RLock()
+	gotConn := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if gotConn == tcpStub {
+		t.Fatalf("stale TCP connection was not evicted")
+	}
+}
+
+func TestSendFrameViaPeerTURNRoute_EvictsNonTURNCachedConn(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 327
+	tcpStub := &stubDialedConn{network: "tcp", remote: "203.0.113.1:4443"}
+	tm.mu.Lock()
+	tm.peerConns[peer] = tcpStub
+	tm.mu.Unlock()
+
+	ok, err := tm.sendFrameViaPeerTURNRoute(peer, []byte("must-not-use-tcp"), SendTierOutboundTurnOnlyJF9, false)
+	if err != nil {
+		t.Fatalf("sendFrameViaPeerTURNRoute err=%v, want nil", err)
+	}
+	if ok {
+		t.Fatalf("sendFrameViaPeerTURNRoute ok=true with stale TCP conn; want false")
+	}
+	if got := tcpStub.sends.Load(); got != 0 {
+		t.Fatalf("tcpStub.sends=%d, want 0", got)
+	}
+	tm.mu.RLock()
+	_, exists := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if exists {
+		t.Fatalf("stale TCP connection still cached")
+	}
+}
+
+func TestCommitTURNConnLocked_FirstTURNWinsAndLoserCloses(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 328
+	first := &stubDialedConn{network: "turn", remote: "203.0.113.10:37500"}
+	second := &stubDialedConn{network: "turn-relay", remote: "203.0.113.11:37500"}
+
+	tm.mu.Lock()
+	kept, closeConn := tm.commitTURNConnLocked(peer, first)
+	tm.mu.Unlock()
+	if kept != first || closeConn != nil {
+		t.Fatalf("first commit kept=%v close=%v, want first/nil", kept, closeConn)
+	}
+
+	tm.mu.Lock()
+	kept, closeConn = tm.commitTURNConnLocked(peer, second)
+	tm.mu.Unlock()
+	if kept != first || closeConn != second {
+		t.Fatalf("second commit kept=%v close=%v, want first/second", kept, closeConn)
+	}
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
+
+	tm.mu.RLock()
+	got := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if got != first {
+		t.Fatalf("cached conn=%v, want first", got)
+	}
+	if first.closes.Load() != 0 {
+		t.Fatalf("first.closes=%d, want 0", first.closes.Load())
+	}
+	if second.closes.Load() != 1 {
+		t.Fatalf("second.closes=%d, want 1", second.closes.Load())
+	}
+}
+
+func TestCommitTURNConnLocked_ReplacesNonTURNAndClosesOld(t *testing.T) {
+	tm := NewTunnelManager()
+	defer tm.Close()
+
+	const peer uint32 = 329
+	oldTCP := &stubDialedConn{network: "tcp", remote: "203.0.113.1:4443"}
+	newTURN := &stubDialedConn{network: "turn", remote: "203.0.113.10:37500"}
+	tm.mu.Lock()
+	tm.peerConns[peer] = oldTCP
+	kept, closeConn := tm.commitTURNConnLocked(peer, newTURN)
+	tm.mu.Unlock()
+	if kept != newTURN || closeConn != oldTCP {
+		t.Fatalf("commit kept=%v close=%v, want newTURN/oldTCP", kept, closeConn)
+	}
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
+
+	tm.mu.RLock()
+	got := tm.peerConns[peer]
+	tm.mu.RUnlock()
+	if got != newTURN {
+		t.Fatalf("cached conn=%v, want newTURN", got)
+	}
+	if oldTCP.closes.Load() != 1 {
+		t.Fatalf("oldTCP.closes=%d, want 1", oldTCP.closes.Load())
+	}
+	if newTURN.closes.Load() != 0 {
+		t.Fatalf("newTURN.closes=%d, want 0", newTURN.closes.Load())
 	}
 }
 
