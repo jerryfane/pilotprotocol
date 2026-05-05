@@ -2321,7 +2321,8 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	if nodeID == d.NodeID() {
 		return protocol.ErrDialToSelf
 	}
-	if d.tunnels.HasPeer(nodeID) {
+	if d.tunnels.HasPeer(nodeID) &&
+		(!d.config.OutboundTURNOnly || d.tunnels.HasOutboundTURNOnlyDestination(nodeID)) {
 		return nil
 	}
 
@@ -2356,13 +2357,15 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 	}
 
 	// Same-LAN detection: if peer has LAN addresses matching our subnet, use LAN directly.
-	// Skip if the registered address is already loopback (tests, same-host) or if our
-	// tunnel is bound to a different address family (e.g. IPv6 tunnel vs IPv4 LAN).
+	// Skip if the registered address is already loopback (tests, same-host), if our
+	// tunnel is bound to a different address family (e.g. IPv6 tunnel vs IPv4 LAN), or
+	// if outbound TURN-only is enabled. An external TURN relay cannot route to a peer's
+	// private LAN address, and strict mode must seed a public peer destination instead.
 	targetAddr := realAddr
 	realHost, _, _ := net.SplitHostPort(realAddr)
 	realIP := net.ParseIP(realHost)
 	isLoopback := realIP != nil && realIP.IsLoopback()
-	if !isLoopback {
+	if !isLoopback && !d.config.OutboundTURNOnly {
 		if lanAddrs, ok := resp["lan_addrs"].([]interface{}); ok && len(lanAddrs) > 0 {
 			d.addrMu.RLock()
 			ourPublic := d.registrationAddr

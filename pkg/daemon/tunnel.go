@@ -1209,11 +1209,17 @@ func (tm *TunnelManager) writeFrame(nodeID uint32, addr *net.UDPAddr, frame []by
 	}
 
 	if plan.failClosed {
-		return fmt.Errorf("outbound-turn-only: no TURN path for node %d "+
-			"(peer advertised no TURN endpoint, local TURN allocation "+
-			"missing or dial failed, and no known UDP-reachable address "+
-			"for this peer; tunnel traffic refused rather than leak "+
-			"source IP via direct UDP or beacon)", nodeID)
+		reason := "no known peer UDP endpoint or peer TURN endpoint"
+		if !hasLocalTURN {
+			reason = "local TURN allocation missing"
+		} else if pathDirect == nil && addr == nil && !hasPeerTURN {
+			reason = "peer advertised no TURN endpoint and no peer UDP endpoint is known"
+		} else if cachedNet != "" && !isTURNNetwork(cachedNet) {
+			reason = "only non-TURN cached transport is available"
+		}
+		return fmt.Errorf("outbound-turn-only: no TURN-safe path for node %d "+
+			"(%s; tunnel traffic refused rather than use direct UDP, TCP, or beacon)",
+			nodeID, reason)
 	}
 	return fmt.Errorf("no address for node %d", nodeID)
 }
@@ -2671,6 +2677,26 @@ func (tm *TunnelManager) HasPeer(nodeID uint32) bool {
 	defer tm.mu.RUnlock()
 	_, ok := tm.paths[nodeID]
 	return ok
+}
+
+// HasOutboundTURNOnlyDestination reports whether writeFrame has a peer
+// destination that can be used without leaking the local source IP when
+// OutboundTURNOnly is enabled. The local TURN allocation itself is checked by
+// writeFrame; this predicate is only about whether resolving the peer again
+// could add a missing destination.
+func (tm *TunnelManager) HasOutboundTURNOnlyDestination(nodeID uint32) bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	if p := tm.paths[nodeID]; p != nil && p.direct != nil {
+		return true
+	}
+	if tm.peerTURN[nodeID] != nil {
+		return true
+	}
+	if conn := tm.peerConns[nodeID]; isTURNNetwork(dialedConnNetwork(conn)) {
+		return true
+	}
+	return false
 }
 
 // HasCrypto returns true if we have an encryption context for a peer (proving prior key exchange).
