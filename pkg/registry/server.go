@@ -277,15 +277,14 @@ type Server struct {
 	// Network invite inbox: target nodeID -> pending invites
 	inviteInbox map[uint32][]*NetworkInvite
 
-
 	// Connection tracking
 	connCount      atomic.Int64
 	maxConnections int64
 
 	// Replication
-	replMgr    *replicationManager
-	replToken  string // H4 fix: required for subscribe_replication; empty = replication disabled
-	standby    bool   // if true, reject writes and receive snapshots from primary
+	replMgr        *replicationManager
+	replToken      string // H4 fix: required for subscribe_replication; empty = replication disabled
+	standby        bool   // if true, reject writes and receive snapshots from primary
 	adminToken     string // required for create_network; empty = creation disabled
 	dashboardToken string // token for per-network stats on dashboard; empty = public-only
 
@@ -1466,8 +1465,6 @@ func (s *Server) handleBinaryLookup(conn net.Conn, payload []byte, host string) 
 		s.metrics.requestDuration.WithLabel("lookup").Observe(time.Since(start).Seconds())
 	}()
 
-
-
 	// Brief global lock for map lookup
 	s.mu.RLock()
 	node, ok := s.nodes[nodeID]
@@ -1508,8 +1505,6 @@ func (s *Server) handleBinaryResolve(conn net.Conn, payload []byte, host string)
 	defer func() {
 		s.metrics.requestDuration.WithLabel("resolve").Observe(time.Since(start).Seconds())
 	}()
-
-
 
 	// Phase 1: copy pubkey for verification
 	s.mu.RLock()
@@ -1600,7 +1595,7 @@ func (s *Server) handleBinaryResolve(conn net.Conn, payload []byte, host string)
 		keyAgeDays = int(time.Since(keyStart).Hours() / 24)
 	}
 
-	resp := encodeResolveResp(node.ID, node.RealAddr, node.LANAddrs, keyAgeDays)
+	resp := encodeResolveResp(node.ID, node.RealAddr, node.LANAddrs, keyAgeDays, node.PublicKey)
 	tSh.RUnlock()
 
 	wireWriteFrame(conn, wireMsgResolveOK, resp)
@@ -3593,9 +3588,10 @@ func (s *Server) handleResolve(msg map[string]interface{}) (map[string]interface
 	defer tSh.RUnlock()
 
 	resp := map[string]interface{}{
-		"type":      "resolve_ok",
-		"node_id":   node.ID,
-		"real_addr": node.RealAddr,
+		"type":       "resolve_ok",
+		"node_id":    node.ID,
+		"real_addr":  node.RealAddr,
+		"public_key": crypto.EncodePublicKey(node.PublicKey),
 	}
 	// Multi-transport endpoints, if the peer registered any. Older
 	// clients treat this field as unknown/unparseable and ignore it —
@@ -5627,8 +5623,8 @@ type snapshot struct {
 	TaskExecutors int    `json:"task_executors,omitempty"`
 	StartTime     string `json:"start_time,omitempty"` // RFC3339 format
 	// Time-series history for dashboard charts
-	HourlyHistory    []StatsSample                      `json:"hourly_history,omitempty"`
-	DailyHistory     []StatsSample                      `json:"daily_history,omitempty"`
+	HourlyHistory    []StatsSample                   `json:"hourly_history,omitempty"`
+	DailyHistory     []StatsSample                   `json:"daily_history,omitempty"`
 	NetHourlyHistory map[string][]NetworkSampleEntry `json:"net_hourly_history,omitempty"`
 	NetDailyHistory  map[string][]NetworkSampleEntry `json:"net_daily_history,omitempty"`
 	// Audit log persistence (most recent entries, capped at maxAuditEntries)
@@ -6617,12 +6613,12 @@ type DashboardStats struct {
 
 // NetworkStats holds per-network statistics for the authenticated dashboard view.
 type NetworkStats struct {
-	ID         uint16              `json:"id"`
-	Name       string              `json:"name"`
-	Members    int                 `json:"members"`
-	Online     int                 `json:"online"`
-	Requests   int64               `json:"requests"`
-	TrustLinks int                 `json:"trust_links"`
+	ID         uint16               `json:"id"`
+	Name       string               `json:"name"`
+	Members    int                  `json:"members"`
+	Online     int                  `json:"online"`
+	Requests   int64                `json:"requests"`
+	TrustLinks int                  `json:"trust_links"`
 	Hourly     []NetworkSampleEntry `json:"hourly,omitempty"`
 	Daily      []NetworkSampleEntry `json:"daily,omitempty"`
 }

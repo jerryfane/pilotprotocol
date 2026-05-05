@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/TeoSlayer/pilotprotocol/internal/crypto"
+	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/gossip"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/rendezvous"
 	"github.com/TeoSlayer/pilotprotocol/pkg/daemon/transport"
+	"github.com/TeoSlayer/pilotprotocol/pkg/registry"
 )
 
 // fakeEndpoint and fakeDialedConn satisfy the transport-package
@@ -140,9 +142,12 @@ func TestRendezvous_DisabledByEmptyURL(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("rendezvousPublishLoop didn't return for empty URL")
 	}
-	// Lookup helper is a no-op:
-	if got := d.rendezvousLookupForDial(123); got != "" {
-		t.Fatalf("rendezvousLookupForDial returned %q with no client", got)
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(123, nil, rendezvousKeyAllowLiveLookup)
+	if err != nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint returned error with no client: %v", err)
+	}
+	if installed || got != "" {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint installed=%v addr=%q with no client", installed, got)
 	}
 }
 
@@ -353,11 +358,7 @@ func TestRendezvous_PublishLoop_Retries429AndKeepsLatest(t *testing.T) {
 	}
 }
 
-// TestRendezvous_LookupForDial_ReturnsFreshEndpoint: the dial-
-// side helper queries the rendezvous and returns a non-empty
-// endpoint when the rendezvous has a record that differs from
-// the cached path.
-func TestRendezvous_LookupForDial_ReturnsFreshEndpoint(t *testing.T) {
+func TestRendezvous_InstallPinnedEndpoint_ReturnsFreshEndpoint(t *testing.T) {
 	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()
@@ -373,14 +374,450 @@ func TestRendezvous_LookupForDial_ReturnsFreshEndpoint(t *testing.T) {
 	stub.mu.Unlock()
 
 	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
-	got := d.rendezvousLookupForDial(999)
-	if got != "11.22.33.44:443" {
-		t.Fatalf("rendezvousLookupForDial: %q, want 11.22.33.44:443", got)
+	installed, got, err := d.installRendezvousTURNEndpoint(999, id.PublicKey)
+	if err != nil {
+		t.Fatalf("installRendezvousTURNEndpoint: %v", err)
+	}
+	if !installed || got != "11.22.33.44:443" {
+		t.Fatalf("installRendezvousTURNEndpoint installed=%v addr=%q, want true 11.22.33.44:443", installed, got)
 	}
 }
 
-// TestRendezvous_LookupForDial_ReturnsFreshEvenWhenCacheEqual: the
-// jf.15.7 behaviour change. Previously, rendezvousLookupForDial
+func TestEnsureTunnelInstallsPinnedRendezvousForEndpointlessPeer(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	blob, err := rendezvous.Sign(id, 999, "11.22.33.44:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[999] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.setNodeIDForTest(7)
+	d.resolveCache[999] = &resolveEntry{
+		resp: map[string]interface{}{
+			"public_key": crypto.EncodePublicKey(id.PublicKey),
+		},
+		cachedAt: time.Now(),
+	}
+	defer d.tunnels.Close()
+
+	if err := d.ensureTunnel(999); err != nil {
+		t.Fatalf("ensureTunnel: %v", err)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(999); got != "11.22.33.44:443" {
+		t.Fatalf("PeerTURNEndpoint=%q, want 11.22.33.44:443", got)
+	}
+}
+
+func TestEnsureTunnelRejectsRendezvousKeyMismatchForEndpointlessPeer(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	signer, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity signer: %v", err)
+	}
+	expected, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity expected: %v", err)
+	}
+	blob, err := rendezvous.Sign(signer, 999, "11.22.33.44:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[999] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.setNodeIDForTest(7)
+	d.resolveCache[999] = &resolveEntry{
+		resp: map[string]interface{}{
+			"public_key": crypto.EncodePublicKey(expected.PublicKey),
+		},
+		cachedAt: time.Now(),
+	}
+	defer d.tunnels.Close()
+
+	if err := d.ensureTunnel(999); err == nil || !strings.Contains(err.Error(), "no real address") {
+		t.Fatalf("ensureTunnel err=%v, want no real address after rejected rendezvous blob", err)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(999); got != "" {
+		t.Fatalf("PeerTURNEndpoint=%q, want empty after rejected rendezvous blob", got)
+	}
+}
+
+func TestEnsureTunnelRejectsRendezvousWhenRegistryKeyMissing(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	blob, err := rendezvous.Sign(id, 999, "11.22.33.44:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[999] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.setNodeIDForTest(7)
+	d.resolveCache[999] = &resolveEntry{
+		resp:     map[string]interface{}{},
+		cachedAt: time.Now(),
+	}
+	defer d.tunnels.Close()
+
+	if err := d.ensureTunnel(999); err == nil || !strings.Contains(err.Error(), "no real address") {
+		t.Fatalf("ensureTunnel err=%v, want no real address after missing registry key", err)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(999); got != "" {
+		t.Fatalf("PeerTURNEndpoint=%q, want empty without registry key", got)
+	}
+}
+
+func TestEnsureTunnelUsesLookupKeyFallbackForEndpointlessPeer(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	reg := registry.New("")
+	go reg.ListenAndServe("127.0.0.1:0")
+	<-reg.Ready()
+	defer reg.Close()
+	rc, err := registry.Dial(reg.Addr().String())
+	if err != nil {
+		t.Fatalf("registry Dial: %v", err)
+	}
+	defer rc.Close()
+	resp, err := rc.RegisterWithKey("", crypto.EncodePublicKey(id.PublicKey), "rendezvous-test@example.com", nil)
+	if err != nil {
+		t.Fatalf("RegisterWithKey: %v", err)
+	}
+	nodeIDFloat, ok := resp["node_id"].(float64)
+	if !ok {
+		t.Fatalf("RegisterWithKey node_id response: %#v", resp["node_id"])
+	}
+	nodeID := uint32(nodeIDFloat)
+	blob, err := rendezvous.Sign(id, nodeID, "11.22.33.44:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[nodeID] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.regConn = rc
+	d.setNodeIDForTest(7)
+	d.resolveCache[nodeID] = &resolveEntry{
+		resp:     map[string]interface{}{},
+		cachedAt: time.Now(),
+	}
+	defer d.tunnels.Close()
+
+	if err := d.ensureTunnel(nodeID); err != nil {
+		t.Fatalf("ensureTunnel: %v", err)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(nodeID); got != "11.22.33.44:443" {
+		t.Fatalf("PeerTURNEndpoint=%q, want 11.22.33.44:443", got)
+	}
+}
+
+func TestRendezvousRetriesLiveRegistryKeyAfterCachedKeyMismatch(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	oldID, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity old: %v", err)
+	}
+	newID, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity new: %v", err)
+	}
+	reg := registry.New("")
+	go reg.ListenAndServe("127.0.0.1:0")
+	<-reg.Ready()
+	defer reg.Close()
+	rc, err := registry.Dial(reg.Addr().String())
+	if err != nil {
+		t.Fatalf("registry Dial: %v", err)
+	}
+	defer rc.Close()
+	resp, err := rc.RegisterWithKey("", crypto.EncodePublicKey(newID.PublicKey), "rendezvous-rotate@example.com", nil)
+	if err != nil {
+		t.Fatalf("RegisterWithKey: %v", err)
+	}
+	nodeIDFloat, ok := resp["node_id"].(float64)
+	if !ok {
+		t.Fatalf("RegisterWithKey node_id response: %#v", resp["node_id"])
+	}
+	nodeID := uint32(nodeIDFloat)
+	blob, err := rendezvous.Sign(newID, nodeID, "11.22.33.44:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[nodeID] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.regConn = rc
+	d.setNodeIDForTest(7)
+	d.resolveCache[nodeID] = &resolveEntry{
+		resp: map[string]interface{}{
+			"public_key": crypto.EncodePublicKey(oldID.PublicKey),
+		},
+		cachedAt: time.Now(),
+	}
+	defer d.tunnels.Close()
+
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(nodeID, nil, rendezvousKeyAllowLiveLookup)
+	if err != nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint: %v", err)
+	}
+	if !installed || got != "11.22.33.44:443" {
+		t.Fatalf("installed=%v addr=%q, want true 11.22.33.44:443", installed, got)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(nodeID); got != "11.22.33.44:443" {
+		t.Fatalf("PeerTURNEndpoint=%q, want 11.22.33.44:443", got)
+	}
+}
+
+func TestOutboundTURNOnlyResolveFailureUsesCachedKeyRendezvous(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	const nodeID uint32 = 555
+	blob, err := rendezvous.Sign(id, nodeID, "10.20.30.40:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[nodeID] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL, OutboundTURNOnly: true})
+	d.setNodeIDForTest(7)
+	d.resolveCache[nodeID] = &resolveEntry{
+		resp: map[string]interface{}{
+			"public_key": crypto.EncodePublicKey(id.PublicKey),
+		},
+		cachedAt: time.Now().Add(-2 * ResolveCacheTTL),
+	}
+	defer d.tunnels.Close()
+
+	if err := d.resolveOutboundTURNOnlyDestination(nodeID); err != nil {
+		t.Fatalf("resolveOutboundTURNOnlyDestination: %v", err)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(nodeID); got != "10.20.30.40:443" {
+		t.Fatalf("PeerTURNEndpoint=%q, want 10.20.30.40:443", got)
+	}
+}
+
+func TestRendezvousCachedOnlyRefreshUsesTunnelPeerKey(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	blob, err := rendezvous.Sign(id, 555, "10.20.30.40:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[555] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.tunnels.mu.Lock()
+	d.tunnels.peerPubKeys[555] = id.PublicKey
+	d.tunnels.mu.Unlock()
+	defer d.tunnels.Close()
+
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(555, nil, rendezvousKeyCachedOnly)
+	if err != nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint: %v", err)
+	}
+	if !installed || got != "10.20.30.40:443" {
+		t.Fatalf("installed=%v addr=%q, want true 10.20.30.40:443", installed, got)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(555); got != "10.20.30.40:443" {
+		t.Fatalf("PeerTURNEndpoint=%q, want 10.20.30.40:443", got)
+	}
+}
+
+func TestRendezvousCachedOnlyRefreshUsesStaleResolveKey(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	blob, err := rendezvous.Sign(id, 555, "10.20.30.40:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[555] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.resolveCache[555] = &resolveEntry{
+		resp: map[string]interface{}{
+			"public_key": crypto.EncodePublicKey(id.PublicKey),
+		},
+		cachedAt: time.Now().Add(-2 * ResolveCacheTTL),
+	}
+	defer d.tunnels.Close()
+
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(555, nil, rendezvousKeyCachedOnly)
+	if err != nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint: %v", err)
+	}
+	if !installed || got != "10.20.30.40:443" {
+		t.Fatalf("installed=%v addr=%q, want true 10.20.30.40:443", installed, got)
+	}
+}
+
+func TestRendezvousCachedOnlyRefreshUsesRegistryGossipKey(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	blob, err := rendezvous.Sign(id, 555, "10.20.30.40:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[555] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.tunnels.GossipView().ReplaceFromRegistry(&gossip.GossipRecord{
+		NodeID:    555,
+		PublicKey: id.PublicKey,
+		RealAddr:  "registry-only",
+		LastSeen:  time.Now().UnixMilli(),
+	})
+	defer d.tunnels.Close()
+
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(555, nil, rendezvousKeyCachedOnly)
+	if err != nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint: %v", err)
+	}
+	if !installed || got != "10.20.30.40:443" {
+		t.Fatalf("installed=%v addr=%q, want true 10.20.30.40:443", installed, got)
+	}
+}
+
+func TestRendezvousCachedOnlyRefreshFailsWithoutCachedKey(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	id, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity: %v", err)
+	}
+	blob, err := rendezvous.Sign(id, 555, "10.20.30.40:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[555] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	defer d.tunnels.Close()
+
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(555, nil, rendezvousKeyCachedOnly)
+	if err == nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint installed=%v addr=%q, want cached-key error", installed, got)
+	}
+	if installed || got != "" {
+		t.Fatalf("installed=%v addr=%q without cached key, want false empty", installed, got)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(555); got != "" {
+		t.Fatalf("PeerTURNEndpoint=%q, want empty", got)
+	}
+}
+
+func TestRendezvousCachedOnlyRefreshRejectsMismatchedSigner(t *testing.T) {
+	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	signer, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity signer: %v", err)
+	}
+	expected, err := crypto.GenerateIdentity()
+	if err != nil {
+		t.Fatalf("GenerateIdentity expected: %v", err)
+	}
+	blob, err := rendezvous.Sign(signer, 555, "10.20.30.40:443", time.Now(), 5*time.Minute)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	stub.mu.Lock()
+	stub.getResult[555] = blob
+	stub.mu.Unlock()
+
+	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
+	d.tunnels.mu.Lock()
+	d.tunnels.peerPubKeys[555] = expected.PublicKey
+	d.tunnels.mu.Unlock()
+	defer d.tunnels.Close()
+
+	installed, got, err := d.installRegistryPinnedRendezvousTURNEndpoint(555, nil, rendezvousKeyCachedOnly)
+	if err == nil {
+		t.Fatalf("installRegistryPinnedRendezvousTURNEndpoint installed=%v addr=%q, want signer mismatch error", installed, got)
+	}
+	if installed || got != "" {
+		t.Fatalf("installed=%v addr=%q after signer mismatch, want false empty", installed, got)
+	}
+	if got := d.tunnels.PeerTURNEndpoint(555); got != "" {
+		t.Fatalf("PeerTURNEndpoint=%q, want empty after signer mismatch", got)
+	}
+}
+
+// TestRendezvous_InstallPinnedEndpoint_ReturnsFreshEvenWhenCacheEqual: the
+// jf.15.7 behaviour change. Previously, the dial lookup helper
 // suppressed same-as-cached returns to skip a no-op
 // AddPeerTURNEndpoint. But the no-op was not really a no-op: it
 // gated PermitTURNPeer's CreatePermission re-issue — the only
@@ -390,7 +827,7 @@ func TestRendezvous_LookupForDial_ReturnsFreshEndpoint(t *testing.T) {
 // caller re-issues AddPeerTURNEndpoint, which re-PermitTURNPeers,
 // which refreshes the permission timestamp without evicting
 // cached conns (eviction still gates on actual address change).
-func TestRendezvous_LookupForDial_ReturnsFreshEvenWhenCacheEqual(t *testing.T) {
+func TestRendezvous_InstallPinnedEndpoint_ReturnsFreshEvenWhenCacheEqual(t *testing.T) {
 	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()
@@ -407,36 +844,45 @@ func TestRendezvous_LookupForDial_ReturnsFreshEvenWhenCacheEqual(t *testing.T) {
 	if err := d.tunnels.AddPeerTURNEndpoint(555, "10.20.30.40:443"); err != nil {
 		t.Fatalf("AddPeerTURNEndpoint: %v", err)
 	}
-	got := d.rendezvousLookupForDial(555)
-	if got != "10.20.30.40:443" {
-		t.Fatalf("rendezvousLookupForDial returned %q (want 10.20.30.40:443 — must return fresh even when cache-equal so caller can refresh PermitTURNPeer)", got)
+	installed, got, err := d.installRendezvousTURNEndpoint(555, id.PublicKey)
+	if err != nil {
+		t.Fatalf("installRendezvousTURNEndpoint: %v", err)
+	}
+	if !installed || got != "10.20.30.40:443" {
+		t.Fatalf("installRendezvousTURNEndpoint installed=%v addr=%q, want true 10.20.30.40:443", installed, got)
 	}
 }
 
-// TestRendezvous_LookupForDial_ReturnsEmptyOn404: a peer the
+// TestRendezvous_InstallPinnedEndpoint_ReturnsEmptyOn404: a peer the
 // rendezvous has never heard of yields empty return — exactly
 // what the dial loop expects ("no fresh data, fall back to
 // existing behaviour").
-func TestRendezvous_LookupForDial_ReturnsEmptyOn404(t *testing.T) {
+func TestRendezvous_InstallPinnedEndpoint_ReturnsEmptyOn404(t *testing.T) {
 	stub := &rendezvousStub{getResult: map[uint32]*rendezvous.AnnounceBlob{}}
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()
 
+	id, _ := crypto.GenerateIdentity()
 	d := New(Config{Email: "test@example.com", RendezvousURL: srv.URL})
-	if got := d.rendezvousLookupForDial(424242); got != "" {
-		t.Fatalf("rendezvousLookupForDial returned %q for 404 (want empty)", got)
+	installed, got, err := d.installRendezvousTURNEndpoint(424242, id.PublicKey)
+	if err != nil {
+		t.Fatalf("installRendezvousTURNEndpoint returned error for 404: %v", err)
+	}
+	if installed || got != "" {
+		t.Fatalf("installRendezvousTURNEndpoint installed=%v addr=%q for 404, want false empty", installed, got)
 	}
 }
 
-// TestRendezvous_LookupForDial_ReturnsEmptyOnTransportError:
+// TestRendezvous_InstallPinnedEndpoint_ReturnsErrorOnTransportError:
 // errors are swallowed at Debug; the dial loop continues.
-func TestRendezvous_LookupForDial_ReturnsEmptyOnTransportError(t *testing.T) {
+func TestRendezvous_InstallPinnedEndpoint_ReturnsErrorOnTransportError(t *testing.T) {
+	id, _ := crypto.GenerateIdentity()
 	d := New(Config{
 		Email:         "test@example.com",
 		RendezvousURL: "http://127.0.0.1:1", // unreachable
 	})
-	if got := d.rendezvousLookupForDial(1); got != "" {
-		t.Fatalf("rendezvousLookupForDial returned %q on transport error (want empty)", got)
+	if installed, got, err := d.installRendezvousTURNEndpoint(1, id.PublicKey); err == nil {
+		t.Fatalf("installRendezvousTURNEndpoint installed=%v addr=%q on transport error, want error", installed, got)
 	}
 }
 

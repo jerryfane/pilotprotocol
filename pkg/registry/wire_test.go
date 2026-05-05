@@ -275,16 +275,17 @@ func TestResolveRespRoundTrip(t *testing.T) {
 		realAddr   string
 		lanAddrs   []string
 		keyAgeDays int
+		pubKey     []byte
 	}{
-		{"basic", 42, "10.0.0.1:4000", nil, 30},
-		{"with LANs", 42, "10.0.0.1:4000", []string{"192.168.1.1:4000", "192.168.2.1:4000"}, 30},
-		{"unknown key age", 42, "10.0.0.1:4000", nil, -1},
-		{"zero key age", 42, "10.0.0.1:4000", nil, 0},
+		{"basic", 42, "10.0.0.1:4000", nil, 30, []byte("pubkey")},
+		{"with LANs", 42, "10.0.0.1:4000", []string{"192.168.1.1:4000", "192.168.2.1:4000"}, 30, []byte("pubkey")},
+		{"unknown key age", 42, "10.0.0.1:4000", nil, -1, nil},
+		{"zero key age", 42, "10.0.0.1:4000", nil, 0, []byte("pubkey")},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			payload := encodeResolveResp(tt.nodeID, tt.realAddr, tt.lanAddrs, tt.keyAgeDays)
+			payload := encodeResolveResp(tt.nodeID, tt.realAddr, tt.lanAddrs, tt.keyAgeDays, tt.pubKey)
 			result, err := decodeResolveResp(payload)
 			if err != nil {
 				t.Fatalf("decode: %v", err)
@@ -306,6 +307,9 @@ func TestResolveRespRoundTrip(t *testing.T) {
 			if result.KeyAgeDays != tt.keyAgeDays {
 				t.Fatalf("KeyAgeDays: got %d, want %d", result.KeyAgeDays, tt.keyAgeDays)
 			}
+			if !bytes.Equal(result.PubKey, tt.pubKey) {
+				t.Fatalf("PubKey: got %q, want %q", result.PubKey, tt.pubKey)
+			}
 		})
 	}
 }
@@ -314,7 +318,7 @@ func TestResolveRespMaxKeyAge(t *testing.T) {
 	t.Parallel()
 
 	// Verify math.MaxUint32 maps to -1
-	payload := encodeResolveResp(1, "addr", nil, -1)
+	payload := encodeResolveResp(1, "addr", nil, -1, nil)
 	result, err := decodeResolveResp(payload)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
@@ -324,13 +328,33 @@ func TestResolveRespMaxKeyAge(t *testing.T) {
 	}
 
 	// Verify large positive value round-trips
-	payload = encodeResolveResp(1, "addr", nil, int(math.MaxUint32-1))
+	payload = encodeResolveResp(1, "addr", nil, int(math.MaxUint32-1), nil)
 	result, err = decodeResolveResp(payload)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if result.KeyAgeDays != int(math.MaxUint32-1) {
 		t.Fatalf("KeyAgeDays: got %d, want %d", result.KeyAgeDays, math.MaxUint32-1)
+	}
+}
+
+func TestResolveRespDecodesLegacyPayloadWithoutPublicKey(t *testing.T) {
+	t.Parallel()
+
+	payload := encodeResolveResp(1, "addr", []string{"lan:1"}, 7, nil)
+	payload = payload[:len(payload)-1]
+	result, err := decodeResolveResp(payload)
+	if err != nil {
+		t.Fatalf("decode legacy payload: %v", err)
+	}
+	if result.NodeID != 1 || result.RealAddr != "addr" || result.KeyAgeDays != 7 {
+		t.Fatalf("legacy result = %+v", result)
+	}
+	if len(result.LANAddrs) != 1 || result.LANAddrs[0] != "lan:1" {
+		t.Fatalf("legacy LANAddrs = %v", result.LANAddrs)
+	}
+	if result.PubKey != nil {
+		t.Fatalf("legacy PubKey = %q, want nil", result.PubKey)
 	}
 }
 

@@ -256,8 +256,9 @@ func decodeResolveReq(payload []byte) (nodeID, requesterID uint32, sig []byte, e
 // Format: [4B node_id][2B addr_len][addr...][2B lan_count][for each: 2B len, addr...]
 //
 //	[4B key_age_days]  (math.MaxUint32 if unknown)
-func encodeResolveResp(nodeID uint32, realAddr string, lanAddrs []string, keyAgeDays int) []byte {
-	size := 4 + 2 + len(realAddr) + 2 + 4
+//	[1B public_key_len][public_key...] (optional, absent in older responses)
+func encodeResolveResp(nodeID uint32, realAddr string, lanAddrs []string, keyAgeDays int, publicKey []byte) []byte {
+	size := 4 + 2 + len(realAddr) + 2 + 4 + 1 + len(publicKey)
 	for _, la := range lanAddrs {
 		size += 2 + len(la)
 	}
@@ -279,6 +280,12 @@ func encodeResolveResp(nodeID uint32, realAddr string, lanAddrs []string, keyAge
 	} else {
 		buf = binary.BigEndian.AppendUint32(buf, uint32(keyAgeDays))
 	}
+
+	if len(publicKey) > 255 {
+		publicKey = publicKey[:255]
+	}
+	buf = append(buf, byte(len(publicKey)))
+	buf = append(buf, publicKey...)
 
 	return buf
 }
@@ -428,6 +435,7 @@ type WireResolveResult struct {
 	RealAddr   string
 	LANAddrs   []string
 	KeyAgeDays int // -1 if unknown
+	PubKey     []byte
 }
 
 func decodeResolveResp(payload []byte) (WireResolveResult, error) {
@@ -478,6 +486,20 @@ func decodeResolveResp(payload []byte) (WireResolveResult, error) {
 		r.KeyAgeDays = -1
 	} else {
 		r.KeyAgeDays = int(raw)
+	}
+	off += 4
+
+	if off >= len(payload) {
+		return r, nil
+	}
+	pkLen := int(payload[off])
+	off++
+	if off+pkLen > len(payload) {
+		return r, fmt.Errorf("truncated pubkey data")
+	}
+	if pkLen > 0 {
+		r.PubKey = make([]byte, pkLen)
+		copy(r.PubKey, payload[off:off+pkLen])
 	}
 
 	return r, nil

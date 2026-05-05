@@ -234,7 +234,7 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 			// gate was dead code in those modes since retries is always >=1
 			// after the increment above. Once the block fires (relayActive=true
 			// or TCP switched), subsequent ticks fall through unchanged.
-			if retries == fallbackTriggerAt && !relayActive {
+			if retries == fallbackTriggerAt {
 				fallbackAttempted = true
 				fallback := planDialFallback(dialFallbackPolicyInput{
 					outboundTURNOnly: d.config.OutboundTURNOnly,
@@ -252,46 +252,50 @@ func (d *Daemon) DialConnection(dstAddr protocol.Addr, dstPort uint16) (*Connect
 				if fallback.queryRendezvous && !rendezvousQueried {
 					rendezvousQueried = true
 					fallbackResult = "rendezvous_empty"
-					if fresh := d.rendezvousLookupForDial(dstAddr.Node); fresh != "" {
-						if err := d.tunnels.AddPeerTURNEndpoint(dstAddr.Node, fresh); err != nil {
-							slog.Debug("rendezvous fresh endpoint install failed",
-								"node_id", dstAddr.Node, "addr", fresh, "error", err)
-							fallbackResult = "rendezvous_install_failed"
+					if installed, fresh, err := d.installRegistryPinnedRendezvousTURNEndpoint(dstAddr.Node, nil, rendezvousKeyAllowLiveLookup); err != nil {
+						slog.Debug("rendezvous fresh endpoint install failed",
+							"node_id", dstAddr.Node, "error", err)
+						fallbackResult = "rendezvous_install_failed"
+					} else if installed {
+						slog.Info("rendezvous installed fresh turn endpoint, retrying dial",
+							"node_id", dstAddr.Node, "addr", fresh)
+						fallbackResult = "rendezvous_installed"
+					}
+				}
+				if relayActive {
+					if fallbackResult == "not_reached" {
+						fallbackResult = "none_allowed"
+					}
+				} else {
+					switched := false
+					if fallback.tryTCP {
+						dctx, cancel := context.WithTimeout(context.Background(), DialTCPFallbackTimeout)
+						err := d.tunnels.DialTCPForPeer(dctx, dstAddr.Node)
+						cancel()
+						if err == nil {
+							slog.Info("direct udp dial timed out, switched to tcp", "node_id", dstAddr.Node)
+							switched = true
+							fallbackResult = "tcp_switched"
+							rto = DialInitialRTO
 						} else {
-							slog.Info("rendezvous installed fresh turn endpoint, retrying dial",
-								"node_id", dstAddr.Node, "addr", fresh)
-							fallbackResult = "rendezvous_installed"
+							slog.Debug("tcp fallback dial failed", "node_id", dstAddr.Node, "error", err)
+							if fallbackResult == "not_reached" {
+								fallbackResult = "tcp_failed"
+							}
 						}
 					}
-				}
-				switched := false
-				if fallback.tryTCP {
-					dctx, cancel := context.WithTimeout(context.Background(), DialTCPFallbackTimeout)
-					err := d.tunnels.DialTCPForPeer(dctx, dstAddr.Node)
-					cancel()
-					if err == nil {
-						slog.Info("direct udp dial timed out, switched to tcp", "node_id", dstAddr.Node)
-						switched = true
-						fallbackResult = "tcp_switched"
-						rto = DialInitialRTO
-					} else {
-						slog.Debug("tcp fallback dial failed", "node_id", dstAddr.Node, "error", err)
-						if fallbackResult == "not_reached" {
-							fallbackResult = "tcp_failed"
-						}
+					if !switched && fallback.switchToBeacon {
+						slog.Info("direct dial timed out, switching to relay", "node_id", dstAddr.Node)
+						d.tunnels.SetRelayPeer(dstAddr.Node, true)
+						relayActive = true
+						fallbackResult = "beacon_relay"
+						// Reset backoff but use the larger relay-specific
+						// initial RTO since beacon-relay RTT is 2-3× direct.
+						rto = DialRelayInitialRTO
 					}
-				}
-				if !switched && fallback.switchToBeacon {
-					slog.Info("direct dial timed out, switching to relay", "node_id", dstAddr.Node)
-					d.tunnels.SetRelayPeer(dstAddr.Node, true)
-					relayActive = true
-					fallbackResult = "beacon_relay"
-					// Reset backoff but use the larger relay-specific
-					// initial RTO since beacon-relay RTT is 2-3× direct.
-					rto = DialRelayInitialRTO
-				}
-				if !switched && !fallback.switchToBeacon && fallbackResult == "not_reached" {
-					fallbackResult = "none_allowed"
+					if !switched && !fallback.switchToBeacon && fallbackResult == "not_reached" {
+						fallbackResult = "none_allowed"
+					}
 				}
 			}
 

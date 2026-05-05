@@ -2354,6 +2354,16 @@ func (d *Daemon) ensureTunnel(nodeID uint32) error {
 
 	realAddr, ok := resp["real_addr"].(string)
 	if !ok || realAddr == "" {
+		if installed, addr, err := d.installRegistryPinnedRendezvousTURNEndpoint(nodeID, resp, rendezvousKeyAllowLiveLookup); err != nil {
+			slog.Debug("rendezvous endpoint install failed for endpointless peer",
+				"node_id", nodeID, "error", err)
+		} else if installed {
+			slog.Info("rendezvous installed turn endpoint for endpointless peer",
+				"node_id", nodeID, "addr", addr)
+			endpoints := registry.EndpointsFromResponse(resp)
+			d.populateGossipViewFromResolve(nodeID, resp, "", endpoints)
+			return nil
+		}
 		return fmt.Errorf("node %d has no real address", nodeID)
 	}
 
@@ -2428,15 +2438,6 @@ func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
 		return nil
 	}
 
-	if fresh := d.rendezvousLookupForDial(nodeID); fresh != "" {
-		if err := d.tunnels.AddPeerTURNEndpoint(nodeID, fresh); err != nil {
-			slog.Debug("outbound-turn-only resolve: rendezvous install failed",
-				"node_id", nodeID, "addr", fresh, "error", err)
-		} else if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
-			return nil
-		}
-	}
-
 	resp, cached := d.cachedResolve(nodeID)
 	if !cached {
 		var err error
@@ -2446,6 +2447,14 @@ func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
 			err = errors.New("registry client unavailable")
 		}
 		if err != nil {
+			if installed, addr, rzErr := d.installRegistryPinnedRendezvousTURNEndpoint(nodeID, nil, rendezvousKeyCachedOnly); rzErr != nil {
+				slog.Debug("outbound-turn-only resolve: cached-key rendezvous install failed after registry error",
+					"node_id", nodeID, "error", rzErr)
+			} else if installed && d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
+				slog.Debug("outbound-turn-only resolve: cached-key rendezvous installed peer turn endpoint after registry error",
+					"node_id", nodeID, "addr", addr)
+				return nil
+			}
 			if ep, ok := d.cachedEndpoint(nodeID); ok {
 				return d.installOutboundTURNOnlyUDPDestination(nodeID, ep)
 			}
@@ -2467,6 +2476,15 @@ func (d *Daemon) resolveOutboundTURNOnlyDestination(nodeID uint32) error {
 		if d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
 			return nil
 		}
+	}
+
+	if installed, addr, err := d.installRegistryPinnedRendezvousTURNEndpoint(nodeID, resp, rendezvousKeyAllowLiveLookup); err != nil {
+		slog.Debug("outbound-turn-only resolve: pinned rendezvous install failed",
+			"node_id", nodeID, "error", err)
+	} else if installed && d.tunnels.HasOutboundTURNOnlyDestination(nodeID) {
+		slog.Debug("outbound-turn-only resolve: pinned rendezvous installed peer turn endpoint",
+			"node_id", nodeID, "addr", addr)
+		return nil
 	}
 
 	realAddr, ok := resp["real_addr"].(string)
@@ -3271,13 +3289,13 @@ func (d *Daemon) rendezvousPeerRefreshLoop() {
 					return
 				default:
 				}
-				fresh := d.rendezvousLookupForDial(nodeID)
-				if fresh == "" {
+				installed, fresh, err := d.installRegistryPinnedRendezvousTURNEndpoint(nodeID, nil, rendezvousKeyCachedOnly)
+				if err != nil {
+					slog.Debug("rendezvous peer refresh: install failed",
+						"node_id", nodeID, "error", err)
 					continue
 				}
-				if err := d.tunnels.AddPeerTURNEndpoint(nodeID, fresh); err != nil {
-					slog.Debug("rendezvous peer refresh: install failed",
-						"node_id", nodeID, "addr", fresh, "error", err)
+				if !installed {
 					continue
 				}
 				slog.Debug("rendezvous peer refresh: re-installed",
@@ -3287,47 +3305,282 @@ func (d *Daemon) rendezvousPeerRefreshLoop() {
 	}
 }
 
-// rendezvousLookupForDial is the cold-dial helper used by
-// DialConnection to refresh a stale path entry just before the
-// dial loop falls back to relay retries. Returns the freshly-
-// fetched TURN endpoint if the rendezvous has a more current
-// record than what the path table holds, or "" otherwise.
-//
-// Behaviour rules:
-//   - If RendezvousURL is empty: return "" immediately.
-//   - If Lookup returns no record (404): return "".
-//   - If Lookup returns the SAME endpoint we already have: return
-//     "" (no point reinstalling).
-//   - Otherwise: return the new endpoint. Caller installs via
-//     tm.AddPeerTURNEndpoint.
-//
-// All errors are logged at Debug and yield "". The dial loop
-// will continue regardless. (v1.9.0-jf.14)
-func (d *Daemon) rendezvousLookupForDial(nodeID uint32) string {
+// installRendezvousTURNEndpoint is the shared cold-dial bootstrap for
+// peers that publish their routable TURN allocation out-of-band instead
+// of advertising a registry endpoint. The rendezvous blob must be signed
+// by the registry-bound key before the endpoint is installed.
+func (d *Daemon) installRendezvousTURNEndpoint(nodeID uint32, expectedPubkey ed25519.PublicKey) (bool, string, error) {
 	if d.rendezvousClient == nil {
-		return ""
+		return false, "", nil
 	}
-	fresh, err := d.rendezvousClient.Lookup(nodeID, nil)
+	if len(expectedPubkey) != ed25519.PublicKeySize {
+		return false, "", fmt.Errorf("rendezvous: registry public key required for node %d", nodeID)
+	}
+	fresh, err := d.rendezvousClient.Lookup(nodeID, expectedPubkey)
 	if err != nil {
-		slog.Debug("rendezvous lookup failed",
-			"node_id", nodeID, "error", err)
-		return ""
+		return false, "", err
 	}
 	if fresh == "" {
-		return ""
+		return false, "", nil
 	}
-	// v1.9.0-jf.15.7: do NOT skip when fresh==current. Returning the
-	// address even on a no-change lookup lets the caller re-issue
-	// AddPeerTURNEndpoint → PermitTURNPeer, which refreshes the
-	// CreatePermission timestamp on our local allocation. Without
-	// that refresh, an entry that fell out of permittedAddrs (after
-	// allocation rotation, eviction, or bookkeeping race) never comes
-	// back into the refresh loop's working set and silently expires
-	// at the TURN server's 5-min permission TTL — even though we
-	// "still know" the address is current. Idempotent on the address
-	// side: AddPeerTURNEndpoint only evicts cached conns when the
-	// address actually changes, so same-address calls are cheap.
-	return fresh
+	if err := d.tunnels.AddPeerTURNEndpoint(nodeID, fresh); err != nil {
+		return false, fresh, err
+	}
+	return true, fresh, nil
+}
+
+type rendezvousKeyLookupMode uint8
+
+const (
+	rendezvousKeyCachedOnly rendezvousKeyLookupMode = iota
+	rendezvousKeyAllowLiveLookup
+)
+
+type rendezvousKeyCandidate struct {
+	key    ed25519.PublicKey
+	source string
+}
+
+func (d *Daemon) installRegistryPinnedRendezvousTURNEndpoint(nodeID uint32, resp map[string]interface{}, mode rendezvousKeyLookupMode) (bool, string, error) {
+	if d.rendezvousClient == nil {
+		return false, "", nil
+	}
+	if mode == rendezvousKeyCachedOnly {
+		candidates, err := d.cachedRendezvousKeyCandidates(nodeID, true)
+		if err != nil {
+			return false, "", err
+		}
+		if len(candidates) == 0 {
+			return false, "", fmt.Errorf("rendezvous: cached registry public key unavailable for node %d", nodeID)
+		}
+		return d.installRendezvousTURNEndpointFromCandidates(nodeID, candidates)
+	}
+
+	var tried []rendezvousKeyCandidate
+	var errs []error
+
+	primary, err := d.primaryRendezvousKeyCandidates(nodeID, resp)
+	if err != nil {
+		return false, "", err
+	}
+	if len(primary) > 0 {
+		tried = appendNewRendezvousKeyCandidates(tried, primary)
+		installed, addr, installErr := d.installRendezvousTURNEndpointFromCandidates(nodeID, primary)
+		if installErr == nil {
+			return installed, addr, nil
+		}
+		errs = append(errs, installErr)
+	}
+
+	liveKey, liveErr := d.liveRegistryPubKeyForRendezvous(nodeID)
+	if liveErr == nil {
+		live := []rendezvousKeyCandidate{{key: liveKey, source: "registry_lookup"}}
+		live = newRendezvousKeyCandidates(tried, live)
+		tried = appendNewRendezvousKeyCandidates(tried, live)
+		if len(live) > 0 {
+			installed, addr, installErr := d.installRendezvousTURNEndpointFromCandidates(nodeID, live)
+			if installErr == nil {
+				return installed, addr, nil
+			}
+			errs = append(errs, installErr)
+		}
+	} else {
+		errs = append(errs, liveErr)
+	}
+
+	fallback, err := d.cachedRendezvousKeyCandidates(nodeID, true)
+	if err != nil {
+		errs = append(errs, err)
+	} else {
+		fallback = newRendezvousKeyCandidates(tried, fallback)
+		if len(fallback) > 0 {
+			installed, addr, installErr := d.installRendezvousTURNEndpointFromCandidates(nodeID, fallback)
+			if installErr == nil {
+				return installed, addr, nil
+			}
+			errs = append(errs, installErr)
+		}
+	}
+
+	if len(errs) > 0 {
+		return false, "", errors.Join(errs...)
+	}
+	return false, "", fmt.Errorf("rendezvous: registry public key unavailable for node %d", nodeID)
+}
+
+func (d *Daemon) installRendezvousTURNEndpointFromCandidates(nodeID uint32, candidates []rendezvousKeyCandidate) (bool, string, error) {
+	var errs []error
+	for _, candidate := range candidates {
+		installed, addr, err := d.installRendezvousTURNEndpoint(nodeID, candidate.key)
+		if err == nil {
+			if installed {
+				slog.Debug("rendezvous installed peer turn endpoint",
+					"node_id", nodeID, "addr", addr, "key_source", candidate.source)
+			}
+			return installed, addr, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", candidate.source, err))
+	}
+	if len(errs) == 0 {
+		return false, "", nil
+	}
+	return false, "", errors.Join(errs...)
+}
+
+func (d *Daemon) primaryRendezvousKeyCandidates(nodeID uint32, resp map[string]interface{}) ([]rendezvousKeyCandidate, error) {
+	var out []rendezvousKeyCandidate
+	if key, present, err := rendezvousPubKeyFromResponse(resp); present || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		if err := appendRendezvousKeyCandidate(&out, key, "resolve_response"); err != nil {
+			return nil, err
+		}
+	}
+	if key, present, err := d.cachedResolvePubKeyForRendezvous(nodeID, false); present || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		if err := appendRendezvousKeyCandidate(&out, key, "fresh_resolve_cache"); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (d *Daemon) cachedRendezvousKeyCandidates(nodeID uint32, allowStaleResolve bool) ([]rendezvousKeyCandidate, error) {
+	var out []rendezvousKeyCandidate
+	resolveSource := "fresh_resolve_cache"
+	if allowStaleResolve {
+		resolveSource = "resolve_cache"
+	}
+	if key, present, err := d.cachedResolvePubKeyForRendezvous(nodeID, allowStaleResolve); present || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		if err := appendRendezvousKeyCandidate(&out, key, resolveSource); err != nil {
+			return nil, err
+		}
+	}
+	if key, ok := d.tunnels.PeerPubKey(nodeID); ok {
+		if err := appendRendezvousKeyCandidate(&out, key, "tunnel_peer_key"); err != nil {
+			return nil, err
+		}
+	}
+	if key, ok := d.registryGossipPubKeyForRendezvous(nodeID); ok {
+		if err := appendRendezvousKeyCandidate(&out, key, "registry_gossip"); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (d *Daemon) liveRegistryPubKeyForRendezvous(nodeID uint32) (ed25519.PublicKey, error) {
+	if d.regConn == nil {
+		return nil, fmt.Errorf("rendezvous: registry public key unavailable for node %d", nodeID)
+	}
+	lookupResp, err := d.regConn.Lookup(nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("rendezvous: lookup registry public key for node %d: %w", nodeID, err)
+	}
+	key, present, err := rendezvousPubKeyFromResponse(lookupResp)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		return nil, fmt.Errorf("rendezvous: registry public key missing for node %d", nodeID)
+	}
+	return key, nil
+}
+
+func appendRendezvousKeyCandidate(candidates *[]rendezvousKeyCandidate, key ed25519.PublicKey, source string) error {
+	if len(key) != ed25519.PublicKeySize {
+		return fmt.Errorf("rendezvous: invalid %s public key", source)
+	}
+	for _, candidate := range *candidates {
+		if candidate.key.Equal(key) {
+			return nil
+		}
+	}
+	copied := make(ed25519.PublicKey, len(key))
+	copy(copied, key)
+	*candidates = append(*candidates, rendezvousKeyCandidate{key: copied, source: source})
+	return nil
+}
+
+func appendNewRendezvousKeyCandidates(dst []rendezvousKeyCandidate, src []rendezvousKeyCandidate) []rendezvousKeyCandidate {
+	for _, candidate := range src {
+		if !hasRendezvousKeyCandidate(dst, candidate.key) {
+			dst = append(dst, candidate)
+		}
+	}
+	return dst
+}
+
+func newRendezvousKeyCandidates(existing []rendezvousKeyCandidate, candidates []rendezvousKeyCandidate) []rendezvousKeyCandidate {
+	var out []rendezvousKeyCandidate
+	for _, candidate := range candidates {
+		if !hasRendezvousKeyCandidate(existing, candidate.key) && !hasRendezvousKeyCandidate(out, candidate.key) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func hasRendezvousKeyCandidate(candidates []rendezvousKeyCandidate, key ed25519.PublicKey) bool {
+	for _, candidate := range candidates {
+		if candidate.key.Equal(key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Daemon) cachedResolvePubKeyForRendezvous(nodeID uint32, allowStale bool) (ed25519.PublicKey, bool, error) {
+	d.resolveCacheMu.RLock()
+	e, ok := d.resolveCache[nodeID]
+	d.resolveCacheMu.RUnlock()
+	if !ok || e == nil {
+		return nil, false, nil
+	}
+	if !allowStale && time.Since(e.cachedAt) > ResolveCacheTTL {
+		return nil, false, nil
+	}
+	return rendezvousPubKeyFromResponse(e.resp)
+}
+
+func (d *Daemon) registryGossipPubKeyForRendezvous(nodeID uint32) (ed25519.PublicKey, bool) {
+	view := d.tunnels.GossipView()
+	if view == nil {
+		return nil, false
+	}
+	rec, source, ok := view.Get(nodeID)
+	if !ok || source != gossip.SourceRegistry || len(rec.PublicKey) == 0 {
+		return nil, false
+	}
+	if len(rec.PublicKey) != ed25519.PublicKeySize {
+		return nil, false
+	}
+	return rec.PublicKey, true
+}
+
+func rendezvousPubKeyFromResponse(resp map[string]interface{}) (ed25519.PublicKey, bool, error) {
+	if resp == nil {
+		return nil, false, nil
+	}
+	raw, ok := resp["public_key"]
+	if !ok {
+		return nil, false, nil
+	}
+	pk, ok := raw.(string)
+	if !ok || pk == "" {
+		return nil, true, fmt.Errorf("rendezvous: invalid registry public key field")
+	}
+	decoded, err := crypto.DecodePublicKey(pk)
+	if err != nil {
+		return nil, true, fmt.Errorf("rendezvous: invalid registry public key: %w", err)
+	}
+	return decoded, true, nil
 }
 
 // ---------------------------------------------------------------------------
