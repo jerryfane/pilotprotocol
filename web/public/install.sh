@@ -216,6 +216,7 @@ fi
 if [ "$UPDATING" = true ]; then
     # Write version file for the auto-updater
     [ -n "$TAG" ] && echo "$TAG" > "$BIN_DIR/.pilot-version"
+    echo "$REPO" > "$BIN_DIR/.pilot-repo"
     echo ""
     echo "Updated to ${TAG:-source}:"
     echo "  pilot-daemon    ${BIN_DIR}/pilot-daemon"
@@ -278,7 +279,7 @@ ExecStart=${BIN_DIR}/pilot-daemon \\
   -identity ${PILOT_DIR}/identity.json \\
   -email ${EMAIL} \\
   -encrypt ${HOSTNAME_FLAG} ${PUBLIC_FLAG}
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
@@ -296,7 +297,8 @@ Wants=network-online.target
 Type=simple
 User=$(whoami)
 ExecStart=${BIN_DIR}/pilot-updater \\
-  -install-dir ${BIN_DIR}
+  -install-dir ${BIN_DIR} \\
+  -repo ${REPO}
 Restart=always
 RestartSec=30
 
@@ -382,6 +384,8 @@ PLIST
         <string>${BIN_DIR}/pilot-updater</string>
         <string>-install-dir</string>
         <string>${BIN_DIR}</string>
+        <string>-repo</string>
+        <string>${REPO}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -430,6 +434,7 @@ fi
 
 # Write version file for the auto-updater
 [ -n "$TAG" ] && echo "$TAG" > "$BIN_DIR/.pilot-version"
+echo "$REPO" > "$BIN_DIR/.pilot-repo"
 
 echo ""
 echo "Installed:"

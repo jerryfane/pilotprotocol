@@ -463,6 +463,7 @@ Environment:
 
 Version:
   pilotctl version
+  pilotctl update [--check] [--restart] [--json]
 
 Config file: ~/.pilot/config.json
 `)
@@ -493,6 +494,8 @@ func main() {
 	case "version":
 		fmt.Println(version)
 		return
+	case "update":
+		cmdUpdate(cmdArgs)
 
 	// Bootstrap
 	case "init":

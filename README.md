@@ -278,6 +278,17 @@ curl -fsSL https://pilotprotocol.network/install.sh | PILOT_EMAIL=user@example.c
 - Sets up system services (**Linux**: systemd, **macOS**: launchd) for daemon and auto-updater
 - The auto-updater runs in the background, checking for new releases every hour and applying updates automatically
 
+Manual update:
+
+```bash
+pilotctl update --check
+pilotctl update --restart
+```
+
+The update command downloads the latest GitHub Release archive for your
+platform, verifies it against `checksums.txt`, replaces the installed client
+binaries, and optionally restarts the daemon.
+
 **Uninstall:** `curl -fsSL https://pilotprotocol.network/install.sh | sh -s uninstall`
 
 **From source:** `git clone https://github.com/TeoSlayer/pilotprotocol.git && cd pilotprotocol && make build`

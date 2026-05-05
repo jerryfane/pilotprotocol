@@ -18,7 +18,7 @@ var version = "dev"
 
 func main() {
 	interval := flag.Duration("interval", 1*time.Hour, "check interval for new releases")
-	repo := flag.String("repo", "TeoSlayer/pilotprotocol", "GitHub owner/repo to check for releases")
+	repo := flag.String("repo", "", "GitHub owner/repo to check for releases")
 	installDir := flag.String("install-dir", "", "directory containing pilot binaries (required)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	logLevel := flag.String("log-level", "info", "log level (debug, info, warn, error)")
@@ -33,21 +33,23 @@ func main() {
 	if *installDir == "" {
 		log.Fatal("-install-dir is required")
 	}
+	resolvedRepo := updater.ResolveRepo(*installDir, *repo)
 
 	logging.Setup(*logLevel, *logFormat)
 
 	slog.Info("pilot-updater starting",
 		"version", version,
-		"repo", *repo,
+		"repo", resolvedRepo,
 		"install_dir", *installDir,
 		"interval", *interval,
 	)
 
 	u := updater.New(updater.Config{
 		CheckInterval: *interval,
-		Repo:          *repo,
+		Repo:          resolvedRepo,
 		InstallDir:    *installDir,
 		Version:       version,
+		Restart:       true,
 	})
 
 	u.Start()
