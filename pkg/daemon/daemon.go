@@ -4024,7 +4024,14 @@ func (d *Daemon) lookupPeerPubKey(nodeID uint32) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("node %d has no public key", nodeID)
 	}
 
-	return crypto.DecodePublicKey(pubKeyB64)
+	pubKey, err := crypto.DecodePublicKey(pubKeyB64)
+	if err != nil {
+		return nil, err
+	}
+	if d.handshakes != nil {
+		d.handshakes.updateTrustedPeerPublicKey(nodeID, pubKeyB64, "refreshed trusted peer public key from registry")
+	}
+	return pubKey, nil
 }
 
 // pollRelayedHandshakes checks the registry for handshake requests and

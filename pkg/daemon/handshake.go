@@ -590,6 +590,9 @@ func (hm *HandshakeManager) SendRequest(peerNodeID uint32, justification string)
 	hm.mu.Lock()
 	if _, ok := hm.trusted[peerNodeID]; ok {
 		hm.mu.Unlock()
+		if hm.daemon != nil && hm.daemon.regConn != nil {
+			hm.goRPC(func() { hm.backfillPeerKey(peerNodeID) })
+		}
 		return nil // already trusted
 	}
 	hm.outgoing[peerNodeID] = true
@@ -640,7 +643,10 @@ func (hm *HandshakeManager) processRelayedRequest(fromNodeID uint32, publicKey, 
 		if hm.daemon.regConn != nil {
 			nodeID, peerID := hm.daemon.NodeID(), fromNodeID
 			sig := hm.signHandshakeChallenge(fmt.Sprintf("respond:%d:%d", nodeID, peerID))
-			hm.goRPC(func() { hm.daemon.regConn.RespondHandshake(nodeID, peerID, true, sig) })
+			hm.goRPC(func() {
+				hm.daemon.regConn.RespondHandshake(nodeID, peerID, true, sig)
+				hm.backfillPeerKey(peerID)
+			})
 		}
 		return
 	}
@@ -740,6 +746,10 @@ func (hm *HandshakeManager) processRelayedApproval(fromNodeID uint32) {
 	// Already trusted? Nothing to do.
 	if _, ok := hm.trusted[fromNodeID]; ok {
 		slog.Debug("relayed approval from already-trusted node", "peer_node_id", fromNodeID)
+		if hm.daemon.regConn != nil {
+			peerID := fromNodeID
+			hm.goRPC(func() { hm.backfillPeerKey(peerID) })
+		}
 		return
 	}
 
@@ -776,13 +786,29 @@ func (hm *HandshakeManager) backfillPeerKey(peerNodeID uint32) {
 		return
 	}
 
+	hm.updateTrustedPeerPublicKey(peerNodeID, pubKeyB64, "backfilled peer public key")
+}
+
+func (hm *HandshakeManager) updateTrustedPeerPublicKey(peerNodeID uint32, pubKeyB64, logMessage string) bool {
+	if pubKeyB64 == "" {
+		return false
+	}
+	if _, err := crypto.DecodePublicKey(pubKeyB64); err != nil {
+		slog.Debug("trusted peer public key refresh ignored invalid key", "peer_node_id", peerNodeID, "error", err)
+		return false
+	}
 	hm.mu.Lock()
 	defer hm.mu.Unlock()
-	if rec, ok := hm.trusted[peerNodeID]; ok && rec.PublicKey == "" {
-		rec.PublicKey = pubKeyB64
-		hm.saveTrust()
-		slog.Debug("backfilled peer public key", "peer_node_id", peerNodeID)
+	rec, ok := hm.trusted[peerNodeID]
+	if !ok || rec.PublicKey == pubKeyB64 {
+		return false
 	}
+	rec.PublicKey = pubKeyB64
+	hm.saveTrust()
+	if logMessage != "" {
+		slog.Debug(logMessage, "peer_node_id", peerNodeID)
+	}
+	return true
 }
 
 // processRelayedRejection handles a handshake rejection received via registry relay.
