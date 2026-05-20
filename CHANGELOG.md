@@ -10,6 +10,15 @@ Each entry is intended to be upstream-able as a discrete bug fix.
 
 ## [Unreleased]
 
+## [v1.9.0-jf.15.29] - 2026-05-20
+
+### Fixed
+
+- **Trusted peer public-key backfill.** Trust records loaded from older
+  installs now opportunistically backfill missing peer public keys from known
+  identity sources, so existing trusted peers remain usable after daemon
+  restarts and Entmoot route checks no longer see trust rows with empty keys.
+
 ## [v1.9.0-jf.15.24] - 2026-05-03
 
 ### Added
